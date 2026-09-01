@@ -13,7 +13,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 
 class ConfigurationError(ValueError):
@@ -245,6 +245,7 @@ def execute_device(
     commands: Sequence[Command],
     failure_patterns: Sequence[re.Pattern[str]],
     netmiko_module: Any,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> DeviceResult:
     """Execute commands for one device and return its full transcript/result."""
 
@@ -264,24 +265,39 @@ def execute_device(
         }
         if settings.enable_secret:
             parameters["secret"] = settings.enable_secret
+        if progress:
+            progress(f"CONNECTING {address}")
         connection = netmiko_module.ConnectHandler(**parameters)
         if settings.enable_secret:
+            if progress:
+                progress(f"ENABLING {address}")
             _append_transcript(transcript, "=== enable ===\n", connection.enable())
+        if progress:
+            progress(f"DISABLING PAGER {address}")
         _append_transcript(transcript, "=== disable paging ===\n", connection.disable_paging())
 
         for current in commands:
             if current.section == "config" and not in_config_mode:
+                if progress:
+                    progress(f"ENTERING CONFIG MODE {address}")
                 _append_transcript(
                     transcript, "=== enter configuration mode ===\n", connection.config_mode()
                 )
                 in_config_mode = True
             elif current.section == "exec" and in_config_mode:
+                if progress:
+                    progress(f"EXITING CONFIG MODE {address}")
                 _append_transcript(
                     transcript, "=== exit configuration mode ===\n", connection.exit_config_mode()
                 )
                 in_config_mode = False
 
             label = f"=== [{current.section}] line {current.line_number} ===\n> {current.text}\n"
+            if progress:
+                progress(
+                    f"RUNNING {address} [{current.section}] line {current.line_number}: "
+                    f"{current.text}"
+                )
             if current.section == "exec":
                 response = connection.send_command(current.text)
             else:
@@ -306,12 +322,16 @@ def execute_device(
         if connection is not None:
             if in_config_mode:
                 try:
+                    if progress:
+                        progress(f"EXITING CONFIG MODE {address}")
                     _append_transcript(
                         transcript, "=== exit configuration mode ===\n", connection.exit_config_mode()
                     )
                 except Exception:
                     pass
             try:
+                if progress:
+                    progress(f"DISCONNECTING {address}")
                 connection.disconnect()
             except Exception:
                 pass
@@ -456,11 +476,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     results: list[DeviceResult] = []
     try:
-        for entry in entries:
+        for index, entry in enumerate(entries, 1):
             if entry.error:
                 result = DeviceResult(entry.address, "failed", "", error=entry.error)
             else:
-                result = execute_device(entry.address, settings, commands, patterns, netmiko_module)
+                print(f"STARTING {index}/{len(entries)} {entry.address}", flush=True)
+                result = execute_device(
+                    entry.address,
+                    settings,
+                    commands,
+                    patterns,
+                    netmiko_module,
+                    progress=lambda message: print(message, flush=True),
+                )
                 transcript_path = run_directory / f"{_safe_filename(entry.address)}.txt"
                 _atomic_write(transcript_path, result.transcript)
                 result.transcript_file = str(transcript_path)

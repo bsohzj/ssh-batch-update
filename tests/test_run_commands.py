@@ -141,6 +141,35 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.failed_command, "run restricted task")
 
+    def test_progress_reports_connection_mode_and_current_command(self):
+        connection = Mock()
+        connection.disable_paging.return_value = ""
+        connection.config_mode.return_value = ""
+        connection.send_command_timing.return_value = ""
+        connection.exit_config_mode.return_value = ""
+        progress = []
+
+        runner.execute_device(
+            "192.0.2.1",
+            self.settings(),
+            [runner.Command("config", "snmp-agent sys-info version v3", 4)],
+            [],
+            types.SimpleNamespace(ConnectHandler=Mock(return_value=connection)),
+            progress=progress.append,
+        )
+
+        self.assertEqual(
+            progress,
+            [
+                "CONNECTING 192.0.2.1",
+                "DISABLING PAGER 192.0.2.1",
+                "ENTERING CONFIG MODE 192.0.2.1",
+                "RUNNING 192.0.2.1 [config] line 4: snmp-agent sys-info version v3",
+                "EXITING CONFIG MODE 192.0.2.1",
+                "DISCONNECTING 192.0.2.1",
+            ],
+        )
+
     def test_dry_run_needs_no_credentials_or_netmiko(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

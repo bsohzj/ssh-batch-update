@@ -61,4 +61,7 @@ python3 run_commands.py devices.txt commands.txt --device-type huawei --apply \
 Each apply run creates an owner-only timestamped directory under `outputs/`
 (or `--output-dir`) containing one exact device transcript and `summary.csv`.
 The runner stops only the affected device after a command error and continues
-with remaining devices. It does not roll back partial configurations.
+with remaining devices. It does not roll back partial configurations. While it
+runs, the console shows the current device, section, source line, and command.
+Those progress messages include literal command-file passwords, so do not share
+or redirect that output where others can read it.

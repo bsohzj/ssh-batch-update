@@ -1,2 +1,5 @@
 netmiko>=4.4,<5
 python-dotenv>=1.0,<2
+# Current releases provide macOS wheels only for ARM64. This universal2 wheel
+# supports Intel macOS and CPython 3.14 without requiring a local Rust build.
+cryptography==46.0.7; sys_platform == "darwin" and platform_machine == "x86_64"
