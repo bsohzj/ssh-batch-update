@@ -1,0 +1,11 @@
+# Add commands under either section. Blank lines and lines beginning with # are ignored.
+# Every uncommented line is sent literally, so keep real passwords out of shared files.
+
+[exec]
+# exec command example: show version
+# Huawei example: display version
+
+[config]
+# config command example: snmp-agent sys-info version v3
+# Cisco IOS example: snmp-server community example RO
+# For interactive prompts, put each response on its own uncommented line.
