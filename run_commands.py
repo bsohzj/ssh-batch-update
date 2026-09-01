@@ -368,7 +368,7 @@ def create_run_directory(output_dir: Path) -> Path:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(output_dir, 0o700)
-    stem = f"run_{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+    stem = f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     for suffix in range(1000):
         candidate = output_dir / (stem if suffix == 0 else f"{stem}_{suffix}")
         try:

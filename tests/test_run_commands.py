@@ -3,6 +3,7 @@ import os
 import tempfile
 import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -185,6 +186,15 @@ class CommandRunnerTests(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 0)
+
+    def test_run_directory_uses_a_human_readable_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            runner, "datetime"
+        ) as mock_datetime:
+            mock_datetime.now.return_value = datetime(2026, 9, 1, 17, 4, 30)
+            run_directory = runner.create_run_directory(Path(directory))
+
+        self.assertEqual(run_directory.name, "run_2026-09-01_17-04-30")
 
     def test_apply_continues_after_connection_failure_and_writes_summary(self):
         with tempfile.TemporaryDirectory() as directory:
