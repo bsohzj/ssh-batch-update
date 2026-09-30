@@ -14,6 +14,20 @@ cp .env.example .env
 Set your SSH login in `.env`. The SSH password and optional enable secret never
 need to be placed in a command file. Keep `.env` private; it is gitignored.
 
+For the macOS desktop interface, install the GUI dependencies instead:
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-gui.txt
+python gui.py
+```
+
+The GUI selects existing inventory, command, and `.env` files; it does not edit
+their contents. Validate Files performs no SSH connections. Run Live requires a
+confirmation and displays per-device progress without displaying literal
+commands. Reports default to `~/Documents/SSH Batch Update/outputs`.
+
 ## Use
 
 Put one IP address or DNS hostname per line in an inventory file. Blank lines
@@ -65,3 +79,30 @@ with remaining devices. It does not roll back partial configurations. While it
 runs, the console shows the current device, section, source line, and command.
 Those progress messages include literal command-file passwords, so do not share
 or redirect that output where others can read it.
+
+## Build the internal macOS app
+
+Install the development dependencies and build the native app on a Mac:
+
+```sh
+python -m pip install -r requirements-dev.txt
+pyinstaller --noconfirm --clean ssh_batch_update.spec
+```
+
+The unsigned application is created at `dist/SSH Batch Update.app`. The GitHub
+Actions workflow builds separate Intel and Apple Silicon ZIP files and performs
+unit, GUI, packaging, and startup checks.
+
+For internal installation:
+
+1. Download the ZIP matching the Mac (`x86_64` for Intel or `arm64` for Apple Silicon).
+2. Extract it and move `SSH Batch Update.app` into Applications.
+3. On first launch, use macOS's explicit Open or Open Anyway flow when prompted.
+4. Select local inventory, command, and `.env` files in the app.
+
+If `.env` is hidden in the macOS file picker, press Command-Shift-Period to show
+hidden files, or paste its full path into the Credentials field.
+
+The app is intentionally unsigned. Gatekeeper warnings are expected, and a
+company security policy may prevent unsigned applications from running. The app
+bundle never includes `.env`, inventory, command, transcript, or output files.

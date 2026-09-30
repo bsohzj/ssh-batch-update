@@ -31,6 +31,7 @@ MANIFEST
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+!ssh_batch_update.spec
 
 # Installer logs
 pip-log.txt

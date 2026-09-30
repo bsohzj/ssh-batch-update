@@ -187,6 +187,141 @@ class CommandRunnerTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
 
+    def test_settings_do_not_retain_values_from_a_previous_env_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            first = base / "first.env"
+            second = base / "second.env"
+            first.write_text(
+                "SSH_USERNAME=first-user\nSSH_PASSWORD=first-password\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "SSH_USERNAME=second-user\nSSH_PASSWORD=second-password\n",
+                encoding="utf-8",
+            )
+
+            first_settings = runner.load_settings("huawei", first, environment={})
+            second_settings = runner.load_settings("huawei", second, environment={})
+
+        self.assertEqual(first_settings.username, "first-user")
+        self.assertEqual(second_settings.username, "second-user")
+        self.assertEqual(second_settings.password, "second-password")
+
+    def test_cancelled_batch_marks_unstarted_devices_and_writes_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            inventory = base / "devices.txt"
+            commands = base / "commands.txt"
+            env_file = base / ".env"
+            inventory.write_text("192.0.2.1\n192.0.2.2\n", encoding="utf-8")
+            commands.write_text("[exec]\nshow version\n", encoding="utf-8")
+            env_file.write_text("SSH_USERNAME=admin\nSSH_PASSWORD=secret\n", encoding="utf-8")
+            prepared = runner.prepare_run(
+                runner.RunRequest(
+                    inventory,
+                    commands,
+                    "cisco_ios",
+                    output_dir=base / "outputs",
+                    env_file=env_file,
+                    apply=True,
+                ),
+                require_credentials=True,
+                environment={},
+            )
+            token = runner.CancellationToken()
+            token.cancel()
+            netmiko = types.SimpleNamespace(ConnectHandler=Mock())
+
+            result = runner.run_batch(
+                prepared,
+                cancellation_token=token,
+                netmiko_module=netmiko,
+            )
+
+            with result.summary_path.open(encoding="utf-8", newline="") as summary:
+                rows = list(csv.DictReader(summary))
+
+        self.assertEqual([item.status for item in result.results], ["cancelled", "cancelled"])
+        self.assertEqual([row["status"] for row in rows], ["cancelled", "cancelled"])
+        netmiko.ConnectHandler.assert_not_called()
+
+    def test_batch_emits_structured_progress_in_device_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            inventory = base / "devices.txt"
+            commands = base / "commands.txt"
+            env_file = base / ".env"
+            inventory.write_text("192.0.2.1\n", encoding="utf-8")
+            commands.write_text("[exec]\nshow version\n", encoding="utf-8")
+            env_file.write_text("SSH_USERNAME=admin\nSSH_PASSWORD=secret\n", encoding="utf-8")
+            prepared = runner.prepare_run(
+                runner.RunRequest(
+                    inventory,
+                    commands,
+                    "cisco_ios",
+                    output_dir=base / "outputs",
+                    env_file=env_file,
+                    apply=True,
+                ),
+                require_credentials=True,
+                environment={},
+            )
+            connection = Mock()
+            connection.disable_paging.return_value = ""
+            connection.send_command.return_value = "version output"
+            events = []
+
+            result = runner.run_batch(
+                prepared,
+                progress_callback=events.append,
+                netmiko_module=types.SimpleNamespace(
+                    ConnectHandler=Mock(return_value=connection)
+                ),
+            )
+
+        self.assertEqual(result.successes, 1)
+        self.assertEqual(events[0].kind, "run_started")
+        self.assertEqual(events[-1].kind, "run_finished")
+        self.assertLess(
+            [event.kind for event in events].index("device_started"),
+            [event.kind for event in events].index("command_started"),
+        )
+        command_event = next(event for event in events if event.kind == "command_started")
+        self.assertEqual(command_event.message, "[exec] line 2")
+        self.assertNotIn("show version", command_event.message)
+
+    def test_cancellation_between_commands_disconnects_and_preserves_transcript(self):
+        connection = Mock()
+        connection.disable_paging.return_value = ""
+        connection.config_mode.return_value = ""
+        connection.send_command_timing.return_value = "first response"
+        connection.exit_config_mode.return_value = "quit"
+        token = runner.CancellationToken()
+
+        def on_event(event):
+            if event.kind == "command_started":
+                token.cancel()
+
+        result = runner.execute_device(
+            "192.0.2.1",
+            self.settings(),
+            [
+                runner.Command("config", "first command", 2),
+                runner.Command("config", "second command", 3),
+            ],
+            [],
+            types.SimpleNamespace(ConnectHandler=Mock(return_value=connection)),
+            event_callback=on_event,
+            cancellation_token=token,
+        )
+
+        self.assertEqual(result.status, "cancelled")
+        self.assertIn("first command", result.transcript)
+        self.assertNotIn("second command", result.transcript)
+        connection.exit_config_mode.assert_called_once_with()
+        connection.disconnect.assert_called_once_with()
+
     def test_run_directory_uses_a_human_readable_timestamp(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(
             runner, "datetime"

@@ -10,10 +10,11 @@ import os
 import re
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 
 class ConfigurationError(ValueError):
@@ -22,6 +23,10 @@ class ConfigurationError(ValueError):
 
 class CommandRejected(RuntimeError):
     """Raised when device output matches a configured failure pattern."""
+
+
+class RunCancelled(RuntimeError):
+    """Raised at a safe checkpoint after cancellation is requested."""
 
 
 @dataclass(frozen=True)
@@ -59,6 +64,84 @@ class DeviceResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class RunRequest:
+    inventory: Path
+    command_file: Path
+    device_type: str
+    output_dir: Path = Path("outputs")
+    env_file: Path = Path(".env")
+    failure_patterns: tuple[str, ...] = ()
+    apply: bool = False
+
+
+@dataclass(frozen=True)
+class PreparedRun:
+    request: RunRequest
+    entries: tuple[DeviceEntry, ...]
+    commands: tuple[Command, ...]
+    failure_patterns: tuple[re.Pattern[str], ...]
+    settings: Optional[Settings] = None
+
+    @property
+    def valid_entries(self) -> tuple[DeviceEntry, ...]:
+        return tuple(entry for entry in self.entries if not entry.error)
+
+    @property
+    def invalid_entries(self) -> tuple[DeviceEntry, ...]:
+        return tuple(entry for entry in self.entries if entry.error)
+
+
+@dataclass(frozen=True)
+class ProgressEvent:
+    kind: str
+    address: str = ""
+    index: int = 0
+    total: int = 0
+    section: str = ""
+    line_number: int = 0
+    status: str = ""
+    message: str = ""
+    transcript_file: str = ""
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    results: tuple[DeviceResult, ...]
+    run_directory: Path
+    summary_path: Path
+
+    @property
+    def successes(self) -> int:
+        return sum(result.status == "success" for result in self.results)
+
+    @property
+    def cancelled(self) -> int:
+        return sum(result.status == "cancelled" for result in self.results)
+
+    @property
+    def failures(self) -> int:
+        return len(self.results) - self.successes - self.cancelled
+
+
+class CancellationToken:
+    """Thread-safe cooperative cancellation flag."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+    def raise_if_cancelled(self) -> None:
+        if self.cancelled:
+            raise RunCancelled("cancelled by user")
+
+
 HOSTNAME_RE = re.compile(
     r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
@@ -74,11 +157,12 @@ DEFAULT_FAILURE_PATTERNS = {
 }
 
 
-# Load basic KEY=VALUE entries if python-dotenv is unavailable.
-def _load_dotenv_fallback(env_path: Path) -> None:
+# Read basic KEY=VALUE entries if python-dotenv is unavailable.
+def _dotenv_values_fallback(env_path: Path) -> dict[str, str]:
 
+    values: dict[str, str] = {}
     if not env_path.is_file():
-        return
+        return values
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -93,33 +177,37 @@ def _load_dotenv_fallback(env_path: Path) -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         if key:
-            os.environ.setdefault(key, value)
+            values[key] = value
+    return values
 
 
-# Load an env file without replacing values already in the environment.
-def load_environment(env_path: Path) -> None:
+# Read an env file without modifying the process environment.
+def load_environment(env_path: Path) -> dict[str, str]:
 
     try:
-        from dotenv import load_dotenv
+        from dotenv import dotenv_values
     except ImportError:
-        _load_dotenv_fallback(env_path)
-    else:
-        load_dotenv(dotenv_path=env_path, override=False)
+        return _dotenv_values_fallback(env_path)
+    return {
+        key: value
+        for key, value in dotenv_values(dotenv_path=env_path).items()
+        if value is not None
+    }
 
 
 # Return a required environment value, or explain which value is missing.
-def _required_environment(name: str) -> str:
+def _required_environment(name: str, values: Mapping[str, str]) -> str:
 
-    value = os.getenv(name, "").strip()
+    value = values.get(name, "").strip()
     if not value:
         raise ConfigurationError(f"Missing required environment variable: {name}")
     return value
 
 
 # Read a positive integer setting from the environment, using a default when absent.
-def _integer_environment(name: str, default: int) -> int:
+def _integer_environment(name: str, default: int, values: Mapping[str, str]) -> int:
 
-    raw_value = os.getenv(name, str(default)).strip()
+    raw_value = values.get(name, str(default)).strip()
     try:
         value = int(raw_value)
     except ValueError as exc:
@@ -129,16 +217,21 @@ def _integer_environment(name: str, default: int) -> int:
     return value
 
 
-# Load SSH credentials and connection settings into one validated object.
-def load_settings(device_type: str, env_path: Path) -> Settings:
+# Load SSH settings without retaining values from an earlier env file.
+def load_settings(
+    device_type: str,
+    env_path: Path,
+    environment: Optional[Mapping[str, str]] = None,
+) -> Settings:
 
-    load_environment(env_path)
+    values = load_environment(env_path)
+    values.update(os.environ if environment is None else environment)
     return Settings(
-        username=_required_environment("SSH_USERNAME"),
-        password=_required_environment("SSH_PASSWORD"),
-        enable_secret=os.getenv("ENABLE_SECRET", "").strip() or None,
-        port=_integer_environment("SSH_PORT", 22),
-        timeout=_integer_environment("SSH_TIMEOUT", 15),
+        username=_required_environment("SSH_USERNAME", values),
+        password=_required_environment("SSH_PASSWORD", values),
+        enable_secret=values.get("ENABLE_SECRET", "").strip() or None,
+        port=_integer_environment("SSH_PORT", 22, values),
+        timeout=_integer_environment("SSH_TIMEOUT", 15, values),
         device_type=device_type,
     )
 
@@ -261,6 +354,8 @@ def execute_device(
     failure_patterns: Sequence[re.Pattern[str]],
     netmiko_module: Any,
     progress: Optional[Callable[[str], None]] = None,
+    event_callback: Optional[Callable[[ProgressEvent], None]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
 ) -> DeviceResult:
 
     transcript: list[str] = [f"Device: {address}\n", f"Device type: {settings.device_type}\n\n"]
@@ -269,6 +364,8 @@ def execute_device(
     current: Optional[Command] = None
     result: Optional[DeviceResult] = None
     try:
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
         parameters: dict[str, Any] = {
             "device_type": settings.device_type,
             "host": address,
@@ -281,16 +378,29 @@ def execute_device(
             parameters["secret"] = settings.enable_secret
         if progress:
             progress(f"CONNECTING {address}")
+        if event_callback:
+            event_callback(ProgressEvent("device_status", address=address, status="connecting"))
         connection = netmiko_module.ConnectHandler(**parameters)
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
         if settings.enable_secret:
             if progress:
                 progress(f"ENABLING {address}")
+            if event_callback:
+                event_callback(ProgressEvent("device_status", address=address, status="enabling"))
             _append_transcript(transcript, "=== enable ===\n", connection.enable())
         if progress:
             progress(f"DISABLING PAGER {address}")
+        if event_callback:
+            event_callback(
+                ProgressEvent("device_status", address=address, status="preparing session")
+            )
         _append_transcript(transcript, "=== disable paging ===\n", connection.disable_paging())
 
-        for current in commands:
+        for next_command in commands:
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
+            current = next_command
             if current.section == "config" and not in_config_mode:
                 if progress:
                     progress(f"ENTERING CONFIG MODE {address}")
@@ -312,6 +422,17 @@ def execute_device(
                     f"RUNNING {address} [{current.section}] line {current.line_number}: "
                     f"{current.text}"
                 )
+            if event_callback:
+                event_callback(
+                    ProgressEvent(
+                        "command_started",
+                        address=address,
+                        section=current.section,
+                        line_number=current.line_number,
+                        status="running",
+                        message=f"[{current.section}] line {current.line_number}",
+                    )
+                )
             if current.section == "exec":
                 response = connection.send_command(current.text)
             else:
@@ -320,8 +441,17 @@ def execute_device(
             pattern = _rejected(response, failure_patterns)
             if pattern:
                 raise CommandRejected(f"device response matched failure pattern: {pattern}")
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
 
         result = DeviceResult(address=address, status="success", transcript="")
+    except RunCancelled as exc:
+        result = DeviceResult(
+            address=address,
+            status="cancelled",
+            transcript="",
+            error=str(exc),
+        )
     except Exception as exc:
         result = DeviceResult(
             address=address,
@@ -346,6 +476,10 @@ def execute_device(
             try:
                 if progress:
                     progress(f"DISCONNECTING {address}")
+                if event_callback:
+                    event_callback(
+                        ProgressEvent("device_status", address=address, status="disconnecting")
+                    )
                 connection.disconnect()
             except Exception:
                 pass
@@ -448,6 +582,120 @@ def _load_netmiko() -> Any:
     return netmiko
 
 
+# Validate a run request and prepare immutable inputs for execution.
+def prepare_run(
+    request: RunRequest,
+    require_credentials: bool = False,
+    environment: Optional[Mapping[str, str]] = None,
+) -> PreparedRun:
+
+    device_type = request.device_type.strip()
+    if not device_type:
+        raise ConfigurationError("device type is required")
+    entries = tuple(read_device_entries(request.inventory))
+    commands = tuple(read_commands(request.command_file))
+    patterns = tuple(compile_failure_patterns(device_type, request.failure_patterns))
+    settings = None
+    if require_credentials:
+        settings = load_settings(device_type, request.env_file, environment=environment)
+    return PreparedRun(request, entries, commands, patterns, settings)
+
+
+# Execute a prepared run sequentially, emitting structured progress events.
+def run_batch(
+    prepared: PreparedRun,
+    progress_callback: Optional[Callable[[ProgressEvent], None]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
+    netmiko_module: Any = None,
+    message_callback: Optional[Callable[[str], None]] = None,
+) -> BatchResult:
+
+    if not prepared.request.apply:
+        raise ConfigurationError("run_batch requires a request with apply enabled")
+    if prepared.settings is None:
+        raise ConfigurationError("connection settings were not prepared")
+
+    token = cancellation_token or CancellationToken()
+    run_directory = create_run_directory(prepared.request.output_dir)
+    valid_entries = prepared.valid_entries
+    if valid_entries and netmiko_module is None:
+        netmiko_module = _load_netmiko()
+
+    total = len(prepared.entries)
+    results: list[DeviceResult] = []
+    if progress_callback:
+        progress_callback(ProgressEvent("run_started", total=total, status="running"))
+
+    for index, entry in enumerate(prepared.entries, 1):
+        if progress_callback:
+            progress_callback(
+                ProgressEvent(
+                    "device_started",
+                    address=entry.address,
+                    index=index,
+                    total=total,
+                    status="starting",
+                )
+            )
+
+        if token.cancelled:
+            result = DeviceResult(
+                entry.address,
+                "cancelled",
+                "",
+                error="cancelled before device started",
+            )
+        elif entry.error:
+            result = DeviceResult(entry.address, "failed", "", error=entry.error)
+        else:
+            result = execute_device(
+                entry.address,
+                prepared.settings,
+                prepared.commands,
+                prepared.failure_patterns,
+                netmiko_module,
+                progress=message_callback,
+                event_callback=progress_callback,
+                cancellation_token=token,
+            )
+            transcript_path = run_directory / f"{_safe_filename(entry.address)}.txt"
+            _atomic_write(transcript_path, result.transcript)
+            result.transcript_file = str(transcript_path)
+
+        results.append(result)
+        if progress_callback:
+            progress_callback(
+                ProgressEvent(
+                    "device_finished",
+                    address=entry.address,
+                    index=index,
+                    total=total,
+                    status=result.status,
+                    message=result.error,
+                    transcript_file=result.transcript_file,
+                    section=result.failed_section,
+                    line_number=int(result.failed_line) if result.failed_line.isdigit() else 0,
+                )
+            )
+
+    summary_path = run_directory / "summary.csv"
+    write_summary(summary_path, results)
+    batch_result = BatchResult(tuple(results), run_directory, summary_path)
+    if progress_callback:
+        progress_callback(
+            ProgressEvent(
+                "run_finished",
+                total=total,
+                status="cancelled" if batch_result.cancelled else "finished",
+                message=(
+                    f"{batch_result.successes} succeeded, {batch_result.failures} failed, "
+                    f"{batch_result.cancelled} cancelled"
+                ),
+            )
+        )
+    return batch_result
+
+
 # Create the command-line interface and its defaults.
 def build_parser() -> argparse.ArgumentParser:
 
@@ -471,66 +719,61 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = build_parser().parse_args(argv)
+    request = RunRequest(
+        inventory=args.inventory,
+        command_file=args.command_file,
+        device_type=args.device_type,
+        output_dir=args.output_dir,
+        env_file=args.env_file,
+        failure_patterns=tuple(args.failure_pattern),
+        apply=args.apply,
+    )
     try:
-        entries = read_device_entries(args.inventory)
-        commands = read_commands(args.command_file)
-        patterns = compile_failure_patterns(args.device_type, args.failure_pattern)
+        prepared = prepare_run(request, require_credentials=args.apply)
     except (ConfigurationError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    valid_entries = [entry for entry in entries if not entry.error]
-    invalid_entries = [entry for entry in entries if entry.error]
+    valid_entries = prepared.valid_entries
+    invalid_entries = prepared.invalid_entries
     if not args.apply:
         print(
             f"DRY RUN: {len(valid_entries)} valid device(s), {len(invalid_entries)} invalid "
-            f"device entry/entries, {len(commands)} command(s); no SSH sessions opened."
+            f"device entry/entries, {len(prepared.commands)} command(s); no SSH sessions opened."
         )
         for entry in invalid_entries:
             print(f"INVALID {entry.address}: {entry.error}", file=sys.stderr)
         return 1 if invalid_entries else 0
 
+    invalid_addresses = {entry.address for entry in invalid_entries}
+
+    def report_event(event: ProgressEvent) -> None:
+        if event.kind == "device_started" and event.address not in invalid_addresses:
+            print(f"STARTING {event.index}/{event.total} {event.address}", flush=True)
+        elif event.kind == "device_finished":
+            if event.status == "success":
+                print(f"SUCCESS {event.address} -> {event.transcript_file}")
+            elif event.status == "cancelled":
+                print(f"CANCELLED {event.address}: {event.message}", file=sys.stderr)
+            else:
+                print(f"FAILED  {event.address}: {event.message}", file=sys.stderr)
+
     try:
-        settings = load_settings(args.device_type, args.env_file)
-        run_directory = create_run_directory(args.output_dir)
-        netmiko_module = _load_netmiko() if valid_entries else None
+        batch_result = run_batch(
+            prepared,
+            progress_callback=report_event,
+            message_callback=lambda message: print(message, flush=True),
+        )
     except (ConfigurationError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    results: list[DeviceResult] = []
-    try:
-        for index, entry in enumerate(entries, 1):
-            if entry.error:
-                result = DeviceResult(entry.address, "failed", "", error=entry.error)
-            else:
-                print(f"STARTING {index}/{len(entries)} {entry.address}", flush=True)
-                result = execute_device(
-                    entry.address,
-                    settings,
-                    commands,
-                    patterns,
-                    netmiko_module,
-                    progress=lambda message: print(message, flush=True),
-                )
-                transcript_path = run_directory / f"{_safe_filename(entry.address)}.txt"
-                _atomic_write(transcript_path, result.transcript)
-                result.transcript_file = str(transcript_path)
-            results.append(result)
-            if result.status == "success":
-                print(f"SUCCESS {entry.address} -> {result.transcript_file}")
-            else:
-                print(f"FAILED  {entry.address}: {result.error}", file=sys.stderr)
-        write_summary(run_directory / "summary.csv", results)
-    except OSError as exc:
-        print(f"ERROR: could not write report: {exc}", file=sys.stderr)
-        return 2
-
-    successes = sum(result.status == "success" for result in results)
-    failures = len(results) - successes
-    print(f"Completed: {successes} succeeded, {failures} failed")
-    print(f"Summary: {run_directory / 'summary.csv'}")
-    return 0 if failures == 0 else 1
+    print(
+        f"Completed: {batch_result.successes} succeeded, "
+        f"{batch_result.failures} failed"
+    )
+    print(f"Summary: {batch_result.summary_path}")
+    return 0 if batch_result.failures == 0 and batch_result.cancelled == 0 else 1
 
 
 if __name__ == "__main__":
