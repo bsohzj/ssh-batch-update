@@ -74,8 +74,8 @@ DEFAULT_FAILURE_PATTERNS = {
 }
 
 
+# Load basic KEY=VALUE entries if python-dotenv is unavailable.
 def _load_dotenv_fallback(env_path: Path) -> None:
-    """Load basic KEY=VALUE entries if python-dotenv is unavailable."""
 
     if not env_path.is_file():
         return
@@ -96,8 +96,8 @@ def _load_dotenv_fallback(env_path: Path) -> None:
             os.environ.setdefault(key, value)
 
 
+# Load an env file without replacing values already in the environment.
 def load_environment(env_path: Path) -> None:
-    """Load an env file without replacing values already in the environment."""
 
     try:
         from dotenv import load_dotenv
@@ -107,14 +107,18 @@ def load_environment(env_path: Path) -> None:
         load_dotenv(dotenv_path=env_path, override=False)
 
 
+# Return a required environment value, or explain which value is missing.
 def _required_environment(name: str) -> str:
+
     value = os.getenv(name, "").strip()
     if not value:
         raise ConfigurationError(f"Missing required environment variable: {name}")
     return value
 
 
+# Read a positive integer setting from the environment, using a default when absent.
 def _integer_environment(name: str, default: int) -> int:
+
     raw_value = os.getenv(name, str(default)).strip()
     try:
         value = int(raw_value)
@@ -125,7 +129,9 @@ def _integer_environment(name: str, default: int) -> int:
     return value
 
 
+# Load SSH credentials and connection settings into one validated object.
 def load_settings(device_type: str, env_path: Path) -> Settings:
+
     load_environment(env_path)
     return Settings(
         username=_required_environment("SSH_USERNAME"),
@@ -137,7 +143,9 @@ def load_settings(device_type: str, env_path: Path) -> Settings:
     )
 
 
+# Validate an IP address or hostname and return its canonical form.
 def _normalise_address(value: str) -> str:
+
     try:
         return str(ipaddress.ip_address(value))
     except ValueError:
@@ -146,8 +154,8 @@ def _normalise_address(value: str) -> str:
     raise ValueError("not an IP address or hostname")
 
 
+# Read and de-duplicate IP addresses or DNS hostnames from an inventory.
 def read_device_entries(path: Path) -> list[DeviceEntry]:
-    """Read and de-duplicate IP addresses or DNS hostnames from an inventory."""
 
     entries: list[DeviceEntry] = []
     seen: set[tuple[str, str]] = set()
@@ -174,8 +182,8 @@ def read_device_entries(path: Path) -> list[DeviceEntry]:
     return entries
 
 
+# Parse an ordered [exec]/[config] command file without interpolation.
 def read_commands(path: Path) -> list[Command]:
-    """Parse an ordered [exec]/[config] command file without interpolation."""
 
     commands: list[Command] = []
     section: Optional[str] = None
@@ -197,8 +205,8 @@ def read_commands(path: Path) -> list[Command]:
     return commands
 
 
+# Compile vendor defaults and site-specific command failure patterns.
 def compile_failure_patterns(device_type: str, custom_patterns: Iterable[str]) -> list[re.Pattern[str]]:
-    """Compile vendor defaults and site-specific command failure patterns."""
 
     lower_device_type = device_type.lower()
     defaults: tuple[str, ...] = ()
@@ -216,7 +224,9 @@ def compile_failure_patterns(device_type: str, custom_patterns: Iterable[str]) -
     return compiled
 
 
+# Format an exception for reports while removing known connection secrets.
 def _safe_error(exc: Exception, settings: Settings) -> str:
+
     message = str(exc) or exc.__class__.__name__
     for secret in (settings.password, settings.enable_secret):
         if secret:
@@ -224,14 +234,18 @@ def _safe_error(exc: Exception, settings: Settings) -> str:
     return f"{exc.__class__.__name__}: {message}"
 
 
+# Add an operation label and its device response to a transcript buffer.
 def _append_transcript(transcript: list[str], label: str, response: Any) -> None:
+
     transcript.append(label)
     text = str(response)
     if text:
         transcript.append(text if text.endswith("\n") else f"{text}\n")
 
 
+# Return the first failure regex matching a device response, if any.
 def _rejected(response: Any, patterns: Iterable[re.Pattern[str]]) -> Optional[str]:
+
     text = str(response)
     for pattern in patterns:
         if pattern.search(text):
@@ -239,6 +253,7 @@ def _rejected(response: Any, patterns: Iterable[re.Pattern[str]]) -> Optional[st
     return None
 
 
+# Execute commands for one device and return its complete transcript and result.
 def execute_device(
     address: str,
     settings: Settings,
@@ -247,7 +262,6 @@ def execute_device(
     netmiko_module: Any,
     progress: Optional[Callable[[str], None]] = None,
 ) -> DeviceResult:
-    """Execute commands for one device and return its full transcript/result."""
 
     transcript: list[str] = [f"Device: {address}\n", f"Device type: {settings.device_type}\n\n"]
     connection = None
@@ -340,12 +354,16 @@ def execute_device(
     return result
 
 
+# Convert a device address into a filename that is safe on common filesystems.
 def _safe_filename(address: str) -> str:
+
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", address)
     return cleaned.strip("._") or "device"
 
 
+# Write a private text file through a temporary file to avoid partial reports.
 def _atomic_write(path: Path, content: str) -> None:
+
     temporary_path: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -363,8 +381,8 @@ def _atomic_write(path: Path, content: str) -> None:
             temporary_path.unlink()
 
 
+# Create a unique, private timestamped directory for one apply run.
 def create_run_directory(output_dir: Path) -> Path:
-    """Create a unique, private timestamped directory for one apply run."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(output_dir, 0o700)
@@ -380,8 +398,8 @@ def create_run_directory(output_dir: Path) -> Path:
     raise OSError("could not create a unique timestamped run directory")
 
 
+# Write result metadata without transcript content.
 def write_summary(path: Path, results: Iterable[DeviceResult]) -> None:
-    """Write result metadata without transcript content."""
 
     rows = list(results)
     with tempfile.NamedTemporaryFile(
@@ -418,7 +436,9 @@ def write_summary(path: Path, results: Iterable[DeviceResult]) -> None:
                 temp_path.unlink()
 
 
+# Import Netmiko only for apply runs and give a useful install error if absent.
 def _load_netmiko() -> Any:
+
     try:
         import netmiko
     except ImportError as exc:
@@ -428,7 +448,9 @@ def _load_netmiko() -> Any:
     return netmiko
 
 
+# Create the command-line interface and its defaults.
 def build_parser() -> argparse.ArgumentParser:
+
     parser = argparse.ArgumentParser(
         description="Run [exec] and [config] command files against devices over SSH."
     )
@@ -445,7 +467,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Validate inputs, optionally run commands, write reports, and return an exit code.
 def main(argv: Optional[Sequence[str]] = None) -> int:
+
     args = build_parser().parse_args(argv)
     try:
         entries = read_device_entries(args.inventory)
