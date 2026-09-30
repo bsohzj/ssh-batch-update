@@ -27,6 +27,7 @@ The GUI selects existing inventory, command, and `.env` files; it does not edit
 their contents. Validate Files performs no SSH connections. Run Live requires a
 confirmation and displays per-device progress without displaying literal
 commands. Reports default to `~/Documents/SSH Batch Update/outputs`.
+Double-click a file path in the Transcript column to open that device's output.
 
 ## Use
 

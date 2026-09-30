@@ -160,6 +160,33 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window.open_output_button.isEnabled())
         self.assertTrue(self.window.open_summary_button.isEnabled())
 
+    def test_double_clicking_transcript_column_opens_existing_file(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        transcript = self.base / "device-transcript.txt"
+        transcript.write_text("show version output\n", encoding="utf-8")
+        row = self.window._rows["192.0.2.1"]
+        self.window._set_cell(row, 4, str(transcript))
+
+        with patch.object(gui.QDesktopServices, "openUrl") as open_url:
+            self.window.open_transcript_at(row, 4)
+
+        open_url.assert_called_once()
+        self.assertEqual(
+            open_url.call_args.args[0].toLocalFile(),
+            str(transcript),
+        )
+
+    def test_double_clicking_another_column_does_not_open_transcript(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        row = self.window._rows["192.0.2.1"]
+
+        with patch.object(gui.QDesktopServices, "openUrl") as open_url:
+            self.window.open_transcript_at(row, 0)
+
+        open_url.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -146,6 +146,7 @@ class MainWindow(QMainWindow):
         )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.device_table.cellDoubleClicked.connect(self.open_transcript_at)
         header = self.device_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -315,6 +316,19 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.device_table.setItem(row, column, item)
         item.setText(value)
+        if column == 4:
+            item.setToolTip("Double-click to open this transcript" if value else "")
+
+    @Slot(int, int)
+    def open_transcript_at(self, row: int, column: int) -> None:
+        if column != 4:
+            return
+        item = self.device_table.item(row, column)
+        if item is None or not item.text().strip():
+            return
+        transcript = Path(item.text().strip()).expanduser()
+        if transcript.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(transcript)))
 
     @Slot()
     def start_run(self) -> None:
