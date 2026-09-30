@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtCore import QSettings
     from PySide6.QtGui import QCloseEvent
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
 
     import gui
     import run_commands as runner
@@ -40,15 +40,11 @@ class MainWindowTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def populate_valid_inputs(self):
-        inventory = self.base / "devices.txt"
-        commands = self.base / "commands.txt"
-        env_file = self.base / ".env"
-        inventory.write_text("192.0.2.1\nbad host\n", encoding="utf-8")
-        commands.write_text("[exec]\nshow version\n", encoding="utf-8")
-        env_file.write_text("SSH_USERNAME=admin\nSSH_PASSWORD=secret\n", encoding="utf-8")
-        self.window.inventory_edit.setText(str(inventory))
-        self.window.command_edit.setText(str(commands))
-        self.window.env_edit.setText(str(env_file))
+        self.window.inventory_text_edit.setPlainText("192.0.2.1\nbad host\n")
+        self.window.exec_commands_edit.setPlainText("show version\n")
+        self.window.config_commands_edit.setPlainText("interface loopback 1\n")
+        self.window.username_edit.setText("admin")
+        self.window.password_edit.setText("secret")
         self.window.output_edit.setText(str(self.base / "outputs"))
         self.window.device_type_combo.setCurrentText("cisco_ios")
 
@@ -67,7 +63,7 @@ class MainWindowTests(unittest.TestCase):
         self.populate_valid_inputs()
         self.assertTrue(self.window.validate_inputs(show_success=False))
 
-        self.window.command_edit.setText(str(self.base / "different.txt"))
+        self.window.exec_commands_edit.setPlainText("display version")
 
         self.assertFalse(self.window.run_button.isEnabled())
         self.assertIsNone(self.window._prepared)
@@ -76,13 +72,60 @@ class MainWindowTests(unittest.TestCase):
         self.populate_valid_inputs()
         self.assertTrue(self.window.validate_inputs(show_success=False))
 
-        self.assertEqual(
-            self.settings.value("paths/env"),
-            str(self.base / ".env"),
-        )
         all_keys = set(self.settings.allKeys())
+        self.assertNotIn("paths/env", all_keys)
         self.assertNotIn("SSH_PASSWORD", all_keys)
+        self.assertNotIn("admin", [self.settings.value(key) for key in all_keys])
         self.assertNotIn("secret", [self.settings.value(key) for key in all_keys])
+        self.assertNotIn("show version", [self.settings.value(key) for key in all_keys])
+
+    def test_password_is_hidden_and_credentials_can_be_imported(self):
+        credential_file = self.base / ".env"
+        credential_file.write_text(
+            "SSH_USERNAME=imported-admin\n"
+            "SSH_PASSWORD=imported-secret\n"
+            "SSH_PORT=2200\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(credential_file), "Environment files (*.env)"),
+        ):
+            self.window._import_credentials()
+
+        self.assertEqual(self.window.username_edit.text(), "imported-admin")
+        self.assertEqual(self.window.password_edit.text(), "imported-secret")
+        self.assertEqual(
+            self.window.password_edit.echoMode(),
+            QLineEdit.EchoMode.Password,
+        )
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.exec_commands_edit.setPlainText("show version")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        self.assertEqual(self.window._prepared.settings.port, 2200)
+
+    def test_importing_sectioned_command_file_splits_the_command_boxes(self):
+        command_file = self.base / "commands.txt"
+        command_file.write_text(
+            "[exec]\nshow version\n[config]\ninterface loopback 1\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(command_file), "Text files (*.txt)"),
+        ):
+            self.window._import_sectioned_commands()
+
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "show version")
+        self.assertEqual(
+            self.window.config_commands_edit.toPlainText(),
+            "interface loopback 1",
+        )
 
     def test_declining_confirmation_does_not_start_worker_thread(self):
         self.populate_valid_inputs()
@@ -117,6 +160,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.device_table.item(row, 2).text(), "exec / 2")
 
     def test_cancel_requests_cooperative_stop(self):
+        self.assertEqual(self.window.cancel_button.text(), "Stop Run")
+        self.assertIn("#c62828", self.window.cancel_button.styleSheet())
         token = runner.CancellationToken()
         self.window._running = True
         self.window._token = token
@@ -163,6 +208,7 @@ class MainWindowTests(unittest.TestCase):
     def test_double_clicking_transcript_column_opens_existing_file(self):
         self.populate_valid_inputs()
         self.assertTrue(self.window.validate_inputs(show_success=False))
+        self.assertEqual(self.window.device_table.horizontalHeaderItem(4).text(), "Output")
         transcript = self.base / "device-transcript.txt"
         transcript.write_text("show version output\n", encoding="utf-8")
         row = self.window._rows["192.0.2.1"]

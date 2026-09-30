@@ -39,6 +39,8 @@ from run_commands import (
     PreparedRun,
     ProgressEvent,
     RunRequest,
+    load_environment,
+    parse_commands,
     prepare_run,
     run_batch,
 )
@@ -89,10 +91,14 @@ class MainWindow(QMainWindow):
         self._loading_settings = True
         self._close_after_run = False
         self._rows: dict[str, int] = {}
+        self._last_inventory_import = ""
+        self._last_command_import = ""
+        self._last_credential_import = ""
+        self._credential_file: Optional[Path] = None
 
         self.setWindowTitle(APP_NAME)
-        self.resize(1050, 720)
-        self.setMinimumSize(820, 560)
+        self.resize(1100, 850)
+        self.setMinimumSize(860, 680)
         self._build_ui()
         self._restore_settings()
         self._connect_input_changes()
@@ -103,32 +109,61 @@ class MainWindow(QMainWindow):
         central = QWidget(self)
         root = QVBoxLayout(central)
 
-        self.configuration_group = QGroupBox("Run configuration")
+        self.configuration_group = QGroupBox()
         form = QFormLayout(self.configuration_group)
-        self.inventory_edit, inventory_row = self._path_row("Choose inventory…", self._choose_inventory)
-        self.command_edit, command_row = self._path_row("Choose commands…", self._choose_commands)
-        self.env_edit, env_row = self._path_row("Choose .env…", self._choose_env)
+
+        self.inventory_text_edit = QPlainTextEdit()
+        self.inventory_text_edit.setPlaceholderText(
+            "One IP address or hostname per line. Blank lines and # comments are ignored."
+        )
+        self.inventory_text_edit.setMaximumHeight(100)
+        inventory_button = QPushButton("Import Devices")
+        inventory_button.clicked.connect(self._import_inventory)
+        inventory_container = QWidget()
+        inventory_layout = QHBoxLayout(inventory_container)
+        inventory_layout.setContentsMargins(0, 0, 0, 0)
+        inventory_layout.addWidget(self.inventory_text_edit, 1)
+        inventory_layout.addWidget(inventory_button, 0)
+        form.addRow("Devices", inventory_container)
+
+        self.exec_commands_edit = QPlainTextEdit()
+        self.exec_commands_edit.setPlaceholderText("One exec command per line")
+        self.exec_commands_edit.setMaximumHeight(120)
+        self.config_commands_edit = QPlainTextEdit()
+        self.config_commands_edit.setPlaceholderText("One configuration command per line")
+        self.config_commands_edit.setMaximumHeight(120)
+        import_sectioned_button = QPushButton("Import Existing Commands")
+        import_sectioned_button.clicked.connect(self._import_sectioned_commands)
+
+        form.addRow("Exec Commands", self.exec_commands_edit)
+        form.addRow("Config Commands", self.config_commands_edit)
+        form.addRow("", import_sectioned_button)
+
+        self.username_edit = QLineEdit()
+        self.username_edit.setPlaceholderText("SSH Username")
+        self.password_edit = QLineEdit()
+        self.password_edit.setPlaceholderText("SSH Password")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        import_credentials_button = QPushButton("Import Credentials")
+        import_credentials_button.clicked.connect(self._import_credentials)
         self.output_edit, output_row = self._path_row("Choose output folder…", self._choose_output)
-        form.addRow("Inventory", inventory_row)
-        form.addRow("Commands", command_row)
-        form.addRow("Credentials", env_row)
-        form.addRow("Output folder", output_row)
+        form.insertRow(0, "Username", self.username_edit)
+        form.insertRow(1, "Password", self.password_edit)
+        form.insertRow(2, "", import_credentials_button)
+        form.addRow("Output Folder", output_row)
 
         self.device_type_combo = QComboBox()
         self.device_type_combo.setEditable(True)
         self.device_type_combo.addItems(["huawei", "cisco_ios"])
-        form.addRow("Device type", self.device_type_combo)
+        form.insertRow(3, "Device Type", self.device_type_combo)
 
-        self.failure_patterns_edit = QPlainTextEdit()
-        self.failure_patterns_edit.setPlaceholderText("Optional: one additional failure regex per line")
-        self.failure_patterns_edit.setMaximumHeight(76)
-        form.addRow("Failure patterns", self.failure_patterns_edit)
         root.addWidget(self.configuration_group)
 
         button_row = QHBoxLayout()
         self.validate_button = QPushButton("Validate Files")
         self.run_button = QPushButton("Run Live")
-        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button = QPushButton("Stop Run")
+        self.cancel_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.validate_button.clicked.connect(self.validate_inputs)
         self.run_button.clicked.connect(self.start_run)
         self.cancel_button.clicked.connect(self.cancel_run)
@@ -136,13 +171,13 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.run_button)
         button_row.addWidget(self.cancel_button)
         button_row.addStretch()
-        self.validation_label = QLabel("Select the required files, then validate.")
+        self.validation_label = QLabel("Enter or import devices and commands, then validate.")
         button_row.addWidget(self.validation_label)
         root.addLayout(button_row)
 
         self.device_table = QTableWidget(0, 5)
         self.device_table.setHorizontalHeaderLabels(
-            ["Device", "Status", "Section / Line", "Result", "Transcript"]
+            ["Device", "Status", "Section / Line", "Result", "Output"]
         )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -192,31 +227,35 @@ class MainWindow(QMainWindow):
         return edit, container
 
     def _connect_input_changes(self) -> None:
-        for edit in (self.inventory_edit, self.command_edit, self.env_edit, self.output_edit):
+        for edit in (self.username_edit, self.password_edit, self.output_edit):
             edit.textChanged.connect(self.invalidate_validation)
+        self.inventory_text_edit.textChanged.connect(self.invalidate_validation)
+        self.exec_commands_edit.textChanged.connect(self.invalidate_validation)
+        self.config_commands_edit.textChanged.connect(self.invalidate_validation)
         self.device_type_combo.currentTextChanged.connect(self.invalidate_validation)
-        self.failure_patterns_edit.textChanged.connect(self.invalidate_validation)
 
     def _restore_settings(self) -> None:
         default_output = Path.home() / "Documents" / APP_NAME / "outputs"
-        self.inventory_edit.setText(self.settings.value("paths/inventory", "", str))
-        self.command_edit.setText(self.settings.value("paths/commands", "", str))
-        self.env_edit.setText(self.settings.value("paths/env", "", str))
+        self._last_inventory_import = self.settings.value("paths/inventory_import", "", str)
+        self._last_command_import = self.settings.value("paths/command_import", "", str)
+        self._last_credential_import = self.settings.value(
+            "paths/credential_import", "", str
+        )
         self.output_edit.setText(self.settings.value("paths/output", str(default_output), str))
         self.device_type_combo.setCurrentText(
             self.settings.value("run/device_type", "huawei", str)
         )
-        self.failure_patterns_edit.setPlainText(
-            self.settings.value("run/failure_patterns", "", str)
-        )
 
     def _save_settings(self) -> None:
-        self.settings.setValue("paths/inventory", self.inventory_edit.text().strip())
-        self.settings.setValue("paths/commands", self.command_edit.text().strip())
-        self.settings.setValue("paths/env", self.env_edit.text().strip())
+        self.settings.remove("paths/inventory")
+        self.settings.remove("paths/commands")
+        self.settings.setValue("paths/inventory_import", self._last_inventory_import)
+        self.settings.setValue("paths/command_import", self._last_command_import)
+        self.settings.remove("paths/env")
+        self.settings.setValue("paths/credential_import", self._last_credential_import)
         self.settings.setValue("paths/output", self.output_edit.text().strip())
         self.settings.setValue("run/device_type", self.device_type_combo.currentText().strip())
-        self.settings.setValue("run/failure_patterns", self.failure_patterns_edit.toPlainText())
+        self.settings.remove("run/failure_patterns")
         self.settings.sync()
 
     @Slot()
@@ -233,38 +272,39 @@ class MainWindow(QMainWindow):
 
     def _request_from_inputs(self) -> RunRequest:
         required = {
-            "inventory file": self.inventory_edit.text().strip(),
-            "command file": self.command_edit.text().strip(),
-            ".env file": self.env_edit.text().strip(),
+            "username": self.username_edit.text().strip(),
+            "password": self.password_edit.text(),
             "output folder": self.output_edit.text().strip(),
             "device type": self.device_type_combo.currentText().strip(),
         }
         missing = [label for label, value in required.items() if not value]
         if missing:
             raise ConfigurationError(f"Missing required selection: {', '.join(missing)}")
-        for label in ("inventory file", "command file", ".env file"):
-            if not Path(required[label]).expanduser().is_file():
-                raise ConfigurationError(f"{label} does not exist: {required[label]}")
-        patterns = tuple(
-            line.strip()
-            for line in self.failure_patterns_edit.toPlainText().splitlines()
-            if line.strip()
-        )
         return RunRequest(
-            inventory=Path(required["inventory file"]).expanduser(),
-            command_file=Path(required["command file"]).expanduser(),
+            inventory=None,
+            command_file=None,
             device_type=required["device type"],
             output_dir=Path(required["output folder"]).expanduser(),
-            env_file=Path(required[".env file"]).expanduser(),
-            failure_patterns=patterns,
+            env_file=self._credential_file,
+            failure_patterns=(),
             apply=True,
+            inventory_text=self.inventory_text_edit.toPlainText(),
+            exec_commands_text=self.exec_commands_edit.toPlainText(),
+            config_commands_text=self.config_commands_edit.toPlainText(),
         )
 
     @Slot()
     def validate_inputs(self, show_success: bool = True) -> bool:
         try:
             request = self._request_from_inputs()
-            prepared = prepare_run(request, require_credentials=True, environment={})
+            prepared = prepare_run(
+                request,
+                require_credentials=True,
+                environment={
+                    "SSH_USERNAME": self.username_edit.text(),
+                    "SSH_PASSWORD": self.password_edit.text(),
+                },
+            )
         except (ConfigurationError, OSError) as exc:
             self._prepared = None
             self._set_validated(False)
@@ -317,7 +357,7 @@ class MainWindow(QMainWindow):
             self.device_table.setItem(row, column, item)
         item.setText(value)
         if column == 4:
-            item.setToolTip("Double-click to open this transcript" if value else "")
+            item.setToolTip("Double-click to open this output file" if value else "")
 
     @Slot(int, int)
     def open_transcript_at(self, row: int, column: int) -> None:
@@ -344,7 +384,7 @@ class MainWindow(QMainWindow):
             f"Run {len(prepared.commands)} command(s) on "
             f"{len(prepared.valid_entries)} valid device(s)?\n\n"
             "This makes live changes and does not automatically roll them back.\n"
-            "Literal passwords in the command file may appear in transcripts or summary.csv.",
+            "Literal passwords in the command boxes may appear in outputs or summary.csv.",
             QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -468,23 +508,99 @@ class MainWindow(QMainWindow):
         event.accept()
 
     @Slot()
-    def _choose_inventory(self) -> None:
-        self._choose_file(self.inventory_edit, "Choose inventory file", "Text files (*.txt);;All files (*)")
+    def _import_inventory(self) -> None:
+        path = self._select_import_file("Import devices", self._last_inventory_import)
+        if path is None:
+            return
+        text = self._read_import_file(path)
+        if text is not None:
+            self.inventory_text_edit.setPlainText(text)
+            self._last_inventory_import = str(path)
 
     @Slot()
-    def _choose_commands(self) -> None:
-        self._choose_file(self.command_edit, "Choose command file", "Text files (*.txt);;All files (*)")
+    def _import_sectioned_commands(self) -> None:
+        path = self._select_import_file(
+            "Import existing [exec]/[config] command file",
+            self._last_command_import,
+        )
+        if path is None:
+            return
+        text = self._read_import_file(path)
+        if text is None:
+            return
+        try:
+            commands = parse_commands(text)
+        except ConfigurationError as exc:
+            QMessageBox.critical(self, "Command import failed", str(exc))
+            return
+        self.exec_commands_edit.setPlainText(
+            "\n".join(command.text for command in commands if command.section == "exec")
+        )
+        self.config_commands_edit.setPlainText(
+            "\n".join(command.text for command in commands if command.section == "config")
+        )
+        self._last_command_import = str(path)
 
     @Slot()
-    def _choose_env(self) -> None:
-        self._choose_file(self.env_edit, "Choose credentials file", "Environment files (*.env);;All files (*)")
+    def _import_credentials(self) -> None:
+        start = (
+            str(Path(self._last_credential_import).parent)
+            if self._last_credential_import
+            else str(Path.home())
+        )
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import credentials",
+            start,
+            "Environment files (*.env);;All files (*)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            values = load_environment(path)
+        except (OSError, UnicodeError) as exc:
+            QMessageBox.critical(
+                self,
+                "Credential import failed",
+                f"Could not read {path}:\n{exc}",
+            )
+            return
+        username = values.get("SSH_USERNAME", "").strip()
+        password = values.get("SSH_PASSWORD", "")
+        missing = [
+            label
+            for label, value in (("SSH_USERNAME", username), ("SSH_PASSWORD", password))
+            if not value
+        ]
+        if missing:
+            QMessageBox.critical(
+                self,
+                "Credential import failed",
+                f"Missing required value(s): {', '.join(missing)}",
+            )
+            return
+        self._credential_file = path
+        self._last_credential_import = str(path)
+        self.username_edit.setText(username)
+        self.password_edit.setText(password)
 
-    def _choose_file(self, edit: QLineEdit, title: str, file_filter: str) -> None:
-        current = edit.text().strip()
-        start = str(Path(current).parent) if current else str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(self, title, start, file_filter)
-        if path:
-            edit.setText(path)
+    def _select_import_file(self, title: str, previous: str) -> Optional[Path]:
+        start = str(Path(previous).parent) if previous else str(Path.home())
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            start,
+            "Text files (*.txt);;All files (*)",
+        )
+        return Path(selected) if selected else None
+
+    def _read_import_file(self, path: Path) -> Optional[str]:
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            QMessageBox.critical(self, "Import failed", f"Could not read {path}:\n{exc}")
+            return None
 
     @Slot()
     def _choose_output(self) -> None:

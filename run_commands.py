@@ -66,13 +66,16 @@ class DeviceResult:
 
 @dataclass(frozen=True)
 class RunRequest:
-    inventory: Path
-    command_file: Path
+    inventory: Optional[Path]
+    command_file: Optional[Path]
     device_type: str
     output_dir: Path = Path("outputs")
-    env_file: Path = Path(".env")
+    env_file: Optional[Path] = Path(".env")
     failure_patterns: tuple[str, ...] = ()
     apply: bool = False
+    inventory_text: Optional[str] = None
+    exec_commands_text: Optional[str] = None
+    config_commands_text: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -220,11 +223,11 @@ def _integer_environment(name: str, default: int, values: Mapping[str, str]) -> 
 # Load SSH settings without retaining values from an earlier env file.
 def load_settings(
     device_type: str,
-    env_path: Path,
+    env_path: Optional[Path],
     environment: Optional[Mapping[str, str]] = None,
 ) -> Settings:
 
-    values = load_environment(env_path)
+    values = load_environment(env_path) if env_path is not None else {}
     values.update(os.environ if environment is None else environment)
     return Settings(
         username=_required_environment("SSH_USERNAME", values),
@@ -247,12 +250,12 @@ def _normalise_address(value: str) -> str:
     raise ValueError("not an IP address or hostname")
 
 
-# Read and de-duplicate IP addresses or DNS hostnames from an inventory.
-def read_device_entries(path: Path) -> list[DeviceEntry]:
+# Parse and de-duplicate IP addresses or DNS hostnames from inventory text.
+def parse_device_entries(text: str) -> list[DeviceEntry]:
 
     entries: list[DeviceEntry] = []
     seen: set[tuple[str, str]] = set()
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
         value = raw_line.strip()
         if not value or value.startswith("#"):
             continue
@@ -275,12 +278,18 @@ def read_device_entries(path: Path) -> list[DeviceEntry]:
     return entries
 
 
-# Parse an ordered [exec]/[config] command file without interpolation.
-def read_commands(path: Path) -> list[Command]:
+# Read and de-duplicate IP addresses or DNS hostnames from an inventory file.
+def read_device_entries(path: Path) -> list[DeviceEntry]:
+
+    return parse_device_entries(path.read_text(encoding="utf-8"))
+
+
+# Parse ordered [exec]/[config] command text without interpolation.
+def parse_commands(text: str) -> list[Command]:
 
     commands: list[Command] = []
     section: Optional[str] = None
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -295,6 +304,32 @@ def read_commands(path: Path) -> list[Command]:
         commands.append(Command(section, raw_line, line_number))
     if not commands:
         raise ConfigurationError("no commands found in the command file")
+    return commands
+
+
+# Parse an ordered [exec]/[config] command file without interpolation.
+def read_commands(path: Path) -> list[Command]:
+
+    return parse_commands(path.read_text(encoding="utf-8"))
+
+
+# Parse separate GUI command boxes; exec commands always precede config commands.
+def parse_inline_commands(exec_text: str, config_text: str) -> list[Command]:
+
+    commands: list[Command] = []
+    for section, text in (("exec", exec_text), ("config", config_text)):
+        for line_number, raw_line in enumerate(text.splitlines(), 1):
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("[") and stripped.endswith("]"):
+                raise ConfigurationError(
+                    f"section headers are not allowed in the {section} command box "
+                    f"(line {line_number})"
+                )
+            commands.append(Command(section, raw_line, line_number))
+    if not commands:
+        raise ConfigurationError("no commands found in the command boxes")
     return commands
 
 
@@ -592,8 +627,24 @@ def prepare_run(
     device_type = request.device_type.strip()
     if not device_type:
         raise ConfigurationError("device type is required")
-    entries = tuple(read_device_entries(request.inventory))
-    commands = tuple(read_commands(request.command_file))
+    if request.inventory_text is not None:
+        entries = tuple(parse_device_entries(request.inventory_text))
+    elif request.inventory is not None:
+        entries = tuple(read_device_entries(request.inventory))
+    else:
+        raise ConfigurationError("inventory file or inventory text is required")
+
+    if request.exec_commands_text is not None or request.config_commands_text is not None:
+        commands = tuple(
+            parse_inline_commands(
+                request.exec_commands_text or "",
+                request.config_commands_text or "",
+            )
+        )
+    elif request.command_file is not None:
+        commands = tuple(read_commands(request.command_file))
+    else:
+        raise ConfigurationError("command file or command text is required")
     patterns = tuple(compile_failure_patterns(device_type, request.failure_patterns))
     settings = None
     if require_credentials:

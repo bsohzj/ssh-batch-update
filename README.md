@@ -23,11 +23,17 @@ python -m pip install -r requirements-gui.txt
 python gui.py
 ```
 
-The GUI selects existing inventory, command, and `.env` files; it does not edit
-their contents. Validate Files performs no SSH connections. Run Live requires a
+The GUI provides editable devices, exec-command, and config-command text
+boxes. Devices can be imported from a plain text file, while one shared
+command import loads an existing sectioned `[exec]`/`[config]` file into both
+command boxes. Exec commands always run first, followed by config commands.
+The username and masked password can be entered directly or populated from a
+local `.env` file with Import Credentials; credential values are never saved in
+the GUI settings. Validate Files performs no SSH connections. Run Live requires
 confirmation and displays per-device progress without displaying literal
-commands. Reports default to `~/Documents/SSH Batch Update/outputs`.
-Double-click a file path in the Transcript column to open that device's output.
+commands. Reports default to
+`~/Documents/SSH Batch Update/outputs`.
+Double-click a file path in the Output column to open that device's output.
 
 ## Use
 
@@ -99,10 +105,10 @@ For internal installation:
 1. Download the ZIP matching the Mac (`x86_64` for Intel or `arm64` for Apple Silicon).
 2. Extract it and move `SSH Batch Update.app` into Applications.
 3. On first launch, use macOS's explicit Open or Open Anyway flow when prompted.
-4. Select local inventory, command, and `.env` files in the app.
+4. Enter or import the devices and commands, then enter credentials or import a local `.env` file.
 
 If `.env` is hidden in the macOS file picker, press Command-Shift-Period to show
-hidden files, or paste its full path into the Credentials field.
+hidden files.
 
 The app is intentionally unsigned. Gatekeeper warnings are expected, and a
 company security policy may prevent unsigned applications from running. The app

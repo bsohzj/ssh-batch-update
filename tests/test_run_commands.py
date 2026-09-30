@@ -60,6 +60,24 @@ class CommandRunnerTests(unittest.TestCase):
             [("exec", "show version"), ("config", "set password"), ("config", " secret value ")],
         )
 
+    def test_inline_command_boxes_run_exec_before_config(self):
+        commands = runner.parse_inline_commands(
+            "show version\nshow clock\n",
+            "interface loopback 1\ndescription test\n",
+        )
+
+        self.assertEqual(
+            [(item.section, item.text, item.line_number) for item in commands],
+            [
+                ("exec", "show version", 1),
+                ("exec", "show clock", 2),
+                ("config", "interface loopback 1", 1),
+                ("config", "description test", 2),
+            ],
+        )
+        with self.assertRaisesRegex(runner.ConfigurationError, "section headers"):
+            runner.parse_inline_commands("[exec]\nshow version", "")
+
     def test_execute_runs_exec_and_config_in_order_with_enable(self):
         connection = Mock()
         connection.enable.return_value = "enabled"
