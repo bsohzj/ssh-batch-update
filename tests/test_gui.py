@@ -7,7 +7,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QSettings
+    from PySide6.QtCore import Qt, QSettings
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
 
@@ -58,6 +58,14 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.device_table.rowCount(), 2)
         self.assertEqual(self.window.device_table.item(0, 1).text(), "Ready")
         self.assertEqual(self.window.device_table.item(1, 1).text(), "Invalid")
+
+    def test_results_table_is_beside_the_settings_panel(self):
+        splitter = self.window.main_splitter
+
+        self.assertEqual(splitter.orientation(), Qt.Orientation.Horizontal)
+        self.assertEqual(splitter.count(), 2)
+        self.assertTrue(splitter.widget(0).isAncestorOf(self.window.configuration_group))
+        self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_input_change_invalidates_a_successful_validation(self):
         self.populate_valid_inputs()
@@ -222,6 +230,29 @@ class MainWindowTests(unittest.TestCase):
             open_url.call_args.args[0].toLocalFile(),
             str(transcript),
         )
+
+    def test_double_clicking_result_shows_the_full_message(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        row = self.window._rows["192.0.2.1"]
+        full_error = (
+            "NetmikoTimeoutException: TCP connection to device failed.\n"
+            "Verify the hostname, port, and network reachability."
+        )
+        self.window._set_cell(row, 1, "Failed")
+        self.window._set_cell(row, 3, full_error)
+
+        with patch.object(gui.QDialog, "exec", autospec=True) as execute_dialog:
+            self.window.handle_table_double_click(row, 3)
+
+        execute_dialog.assert_called_once()
+        dialogs = self.window.findChildren(gui.QDialog)
+        self.assertEqual(len(dialogs), 1)
+        dialog = dialogs[0]
+        detail_boxes = dialog.findChildren(gui.QPlainTextEdit)
+        self.assertEqual(len(detail_boxes), 1)
+        self.assertEqual(detail_boxes[0].toPlainText(), full_error)
+        self.assertIn("Double-click", self.window.device_table.item(row, 3).toolTip())
 
     def test_double_clicking_another_column_does_not_open_transcript(self):
         self.populate_valid_inputs()

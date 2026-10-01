@@ -34,6 +34,9 @@ confirmation and displays per-device progress without displaying literal
 commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
 Double-click a file path in the Output column to open that device's output.
+Double-click the Result column to view the complete status or error message.
+Failed-device output files include the sanitized exception message, with known
+connection secrets redacted.
 
 ## Use
 

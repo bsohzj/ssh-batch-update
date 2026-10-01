@@ -481,13 +481,17 @@ def execute_device(
 
         result = DeviceResult(address=address, status="success", transcript="")
     except RunCancelled as exc:
+        error = str(exc)
+        _append_transcript(transcript, "=== cancellation ===\n", error)
         result = DeviceResult(
             address=address,
             status="cancelled",
             transcript="",
-            error=str(exc),
+            error=error,
         )
     except Exception as exc:
+        error = _safe_error(exc, settings)
+        _append_transcript(transcript, "=== error ===\n", error)
         result = DeviceResult(
             address=address,
             status="failed",
@@ -495,7 +499,7 @@ def execute_device(
             failed_section=current.section if current else "",
             failed_line=str(current.line_number) if current else "",
             failed_command=current.text if current else "",
-            error=_safe_error(exc, settings),
+            error=error,
         )
     finally:
         if connection is not None:

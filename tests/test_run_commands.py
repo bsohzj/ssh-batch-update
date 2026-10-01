@@ -380,11 +380,15 @@ class CommandRunnerTests(unittest.TestCase):
             run_directory = next(output_dir.iterdir())
             with (run_directory / "summary.csv").open(encoding="utf-8", newline="") as summary:
                 rows = list(csv.DictReader(summary))
+            failed_transcript = Path(rows[0]["transcript_file"]).read_text(encoding="utf-8")
             success_transcript_exists = Path(rows[1]["transcript_file"]).exists()
 
         self.assertEqual(exit_code, 1)
         self.assertEqual([row["status"] for row in rows], ["failed", "success"])
         self.assertNotIn("ssh-secret", rows[0]["error"])
+        self.assertIn("=== error ===", failed_transcript)
+        self.assertIn("RuntimeError: login [redacted] rejected", failed_transcript)
+        self.assertNotIn("ssh-secret", failed_transcript)
         self.assertTrue(success_transcript_exists)
 
 

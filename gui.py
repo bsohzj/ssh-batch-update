@@ -8,11 +8,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, QSettings, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -97,8 +100,8 @@ class MainWindow(QMainWindow):
         self._credential_file: Optional[Path] = None
 
         self.setWindowTitle(APP_NAME)
-        self.resize(1100, 850)
-        self.setMinimumSize(860, 680)
+        self.resize(1400, 850)
+        self.setMinimumSize(1050, 680)
         self._build_ui()
         self._restore_settings()
         self._connect_input_changes()
@@ -108,6 +111,18 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         root = QVBoxLayout(central)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+
+        settings_panel = QWidget()
+        settings_layout = QVBoxLayout(settings_panel)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_panel.setMinimumWidth(400)
+
+        results_panel = QWidget()
+        results_layout = QVBoxLayout(results_panel)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_panel.setMinimumWidth(600)
 
         self.configuration_group = QGroupBox()
         form = QFormLayout(self.configuration_group)
@@ -157,7 +172,7 @@ class MainWindow(QMainWindow):
         self.device_type_combo.addItems(["huawei", "cisco_ios"])
         form.insertRow(3, "Device Type", self.device_type_combo)
 
-        root.addWidget(self.configuration_group)
+        settings_layout.addWidget(self.configuration_group)
 
         button_row = QHBoxLayout()
         self.validate_button = QPushButton("Validate Files")
@@ -172,8 +187,10 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.cancel_button)
         button_row.addStretch()
         self.validation_label = QLabel("Enter or import devices and commands, then validate.")
-        button_row.addWidget(self.validation_label)
-        root.addLayout(button_row)
+        self.validation_label.setWordWrap(True)
+        settings_layout.addLayout(button_row)
+        settings_layout.addWidget(self.validation_label)
+        settings_layout.addStretch(1)
 
         self.device_table = QTableWidget(0, 5)
         self.device_table.setHorizontalHeaderLabels(
@@ -181,14 +198,14 @@ class MainWindow(QMainWindow):
         )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.device_table.cellDoubleClicked.connect(self.open_transcript_at)
+        self.device_table.cellDoubleClicked.connect(self.handle_table_double_click)
         header = self.device_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        root.addWidget(self.device_table, 1)
+        results_layout.addWidget(self.device_table, 1)
 
         progress_grid = QGridLayout()
         self.progress_bar = QProgressBar()
@@ -199,7 +216,7 @@ class MainWindow(QMainWindow):
         progress_grid.addWidget(self.progress_bar, 0, 0, 1, 2)
         progress_grid.addWidget(self.status_label, 1, 0)
         progress_grid.addWidget(self.totals_label, 1, 1)
-        root.addLayout(progress_grid)
+        results_layout.addLayout(progress_grid)
 
         result_buttons = QHBoxLayout()
         self.open_output_button = QPushButton("Open Output Folder")
@@ -211,9 +228,17 @@ class MainWindow(QMainWindow):
         result_buttons.addWidget(self.open_output_button)
         result_buttons.addWidget(self.open_summary_button)
         result_buttons.addStretch()
-        root.addLayout(result_buttons)
+        results_layout.addLayout(result_buttons)
+
+        self.main_splitter.addWidget(settings_panel)
+        self.main_splitter.addWidget(results_panel)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([480, 900])
+        root.addWidget(self.main_splitter)
 
         self.setCentralWidget(central)
+
     def _path_row(self, placeholder: str, callback) -> tuple[QLineEdit, QWidget]:
         edit = QLineEdit()
         edit.setPlaceholderText(placeholder)
@@ -245,6 +270,9 @@ class MainWindow(QMainWindow):
         self.device_type_combo.setCurrentText(
             self.settings.value("run/device_type", "huawei", str)
         )
+        splitter_state = self.settings.value("window/main_splitter")
+        if splitter_state is not None:
+            self.main_splitter.restoreState(splitter_state)
 
     def _save_settings(self) -> None:
         self.settings.remove("paths/inventory")
@@ -255,6 +283,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("paths/credential_import", self._last_credential_import)
         self.settings.setValue("paths/output", self.output_edit.text().strip())
         self.settings.setValue("run/device_type", self.device_type_combo.currentText().strip())
+        self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.remove("run/failure_patterns")
         self.settings.sync()
 
@@ -356,8 +385,42 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.device_table.setItem(row, column, item)
         item.setText(value)
-        if column == 4:
+        if column == 3:
+            item.setToolTip("Double-click to view the full result" if value else "")
+        elif column == 4:
             item.setToolTip("Double-click to open this output file" if value else "")
+
+    @Slot(int, int)
+    def handle_table_double_click(self, row: int, column: int) -> None:
+        if column == 3:
+            self.show_result_details(row)
+        elif column == 4:
+            self.open_transcript_at(row, column)
+
+    def show_result_details(self, row: int) -> None:
+        result_item = self.device_table.item(row, 3)
+        if result_item is None or not result_item.text().strip():
+            return
+
+        device_item = self.device_table.item(row, 0)
+        status_item = self.device_table.item(row, 1)
+        device = device_item.text() if device_item else "Device"
+        status = status_item.text() if status_item else "Result"
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Device Result — {device}")
+        dialog.resize(720, 360)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel(f"{device} — {status}")
+        layout.addWidget(heading)
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(result_item.text())
+        layout.addWidget(details, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     @Slot(int, int)
     def open_transcript_at(self, row: int, column: int) -> None:
