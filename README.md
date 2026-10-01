@@ -27,9 +27,11 @@ The GUI provides editable devices, exec-command, and config-command text
 boxes. Devices can be imported from a plain text file, while one shared
 command import loads an existing sectioned `[exec]`/`[config]` file into both
 command boxes. Exec commands always run first, followed by config commands.
-The username and masked password can be entered directly or populated from a
-local `.env` file with Import Credentials; credential values are never saved in
-the GUI settings. Validate Files performs no SSH connections. Run Live requires
+The username and masked password can be entered directly or loaded from a saved
+credential profile. Profiles reference user-managed `.env` files and the last
+selected valid profile reloads when the app reopens. Only the friendly profile
+name and file path are saved in GUI settings; credential values are never
+copied there. Validate Files performs no SSH connections. Run Live requires
 confirmation and displays per-device progress without displaying literal
 commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
@@ -37,6 +39,25 @@ Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
 Failed-device output files include the sanitized exception message, with known
 connection secrets redacted.
+
+### Credential profiles
+
+Use **Manage Profiles…** to add, rename, relink, or remove credential profiles.
+Adding or relinking selects an existing `.env` containing:
+
+```text
+SSH_USERNAME=admin
+SSH_PASSWORD=replace-me
+ENABLE_SECRET=optional-enable-secret
+SSH_PORT=22
+SSH_TIMEOUT=15
+```
+
+Only `SSH_USERNAME` and `SSH_PASSWORD` are required. Removing a profile removes
+the app's reference but never deletes or edits its `.env` file. Editing a loaded
+username or password switches the GUI to Manual mode for that run. Because
+`.env` passwords are plaintext, keep those files private, restrict their file
+permissions, and never commit them to Git.
 
 ## Use
 
@@ -108,7 +129,7 @@ For internal installation:
 1. Download the ZIP matching the Mac (`x86_64` for Intel or `arm64` for Apple Silicon).
 2. Extract it and move `SSH Batch Update.app` into Applications.
 3. On first launch, use macOS's explicit Open or Open Anyway flow when prompted.
-4. Enter or import the devices and commands, then enter credentials or import a local `.env` file.
+4. Enter or import the devices and commands, then enter credentials manually or add a local `.env` profile.
 
 If `.env` is hidden in the macOS file picker, press Command-Shift-Period to show
 hidden files.

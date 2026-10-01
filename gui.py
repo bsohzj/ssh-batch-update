@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from PySide6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QCloseEvent, QDesktopServices
@@ -21,6 +23,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -42,7 +45,8 @@ from run_commands import (
     PreparedRun,
     ProgressEvent,
     RunRequest,
-    load_environment,
+    Settings,
+    load_settings,
     parse_commands,
     prepare_run,
     run_batch,
@@ -51,6 +55,321 @@ from run_commands import (
 
 APP_NAME = "SSH Batch Update"
 ORGANIZATION_NAME = "SG4291"
+MANUAL_PROFILE_TEXT = "Manual"
+PROFILE_GROUP = "credential_profiles/items"
+LAST_PROFILE_KEY = "credential_profiles/last_selected"
+
+
+@dataclass(frozen=True)
+class CredentialProfile:
+    """A saved display name and reference to a user-managed credentials file."""
+
+    profile_id: str
+    name: str
+    env_path: Path
+
+
+class CredentialProfileStore:
+    """Persist profile metadata without storing any credential values."""
+
+    def __init__(self, settings: QSettings) -> None:
+        self.settings = settings
+
+    def profiles(self) -> list[CredentialProfile]:
+        profiles: list[CredentialProfile] = []
+        self.settings.beginGroup(PROFILE_GROUP)
+        try:
+            for profile_id in self.settings.childGroups():
+                self.settings.beginGroup(profile_id)
+                try:
+                    name = self.settings.value("name", "", str).strip()
+                    env_path = self.settings.value("env_path", "", str).strip()
+                finally:
+                    self.settings.endGroup()
+                if name and env_path:
+                    profiles.append(CredentialProfile(profile_id, name, Path(env_path)))
+        finally:
+            self.settings.endGroup()
+        return sorted(profiles, key=lambda profile: profile.name.casefold())
+
+    def get(self, profile_id: str) -> Optional[CredentialProfile]:
+        return next(
+            (profile for profile in self.profiles() if profile.profile_id == profile_id),
+            None,
+        )
+
+    def add(self, name: str, env_path: Path) -> CredentialProfile:
+        clean_name = self._validate_name(name)
+        profile = CredentialProfile(uuid4().hex, clean_name, self._absolute_path(env_path))
+        self._write(profile)
+        return profile
+
+    def rename(self, profile_id: str, name: str) -> CredentialProfile:
+        profile = self._required(profile_id)
+        updated = CredentialProfile(
+            profile.profile_id,
+            self._validate_name(name, exclude_id=profile_id),
+            profile.env_path,
+        )
+        self._write(updated)
+        return updated
+
+    def relink(self, profile_id: str, env_path: Path) -> CredentialProfile:
+        profile = self._required(profile_id)
+        updated = CredentialProfile(
+            profile.profile_id,
+            profile.name,
+            self._absolute_path(env_path),
+        )
+        self._write(updated)
+        return updated
+
+    def remove(self, profile_id: str) -> None:
+        self.settings.remove(f"{PROFILE_GROUP}/{profile_id}")
+        if self.selected_id() == profile_id:
+            self.set_selected_id(None)
+        self.settings.sync()
+
+    def selected_id(self) -> Optional[str]:
+        value = self.settings.value(LAST_PROFILE_KEY, "", str).strip()
+        return value or None
+
+    def set_selected_id(self, profile_id: Optional[str]) -> None:
+        if profile_id:
+            self.settings.setValue(LAST_PROFILE_KEY, profile_id)
+        else:
+            self.settings.remove(LAST_PROFILE_KEY)
+        self.settings.sync()
+
+    def _required(self, profile_id: str) -> CredentialProfile:
+        profile = self.get(profile_id)
+        if profile is None:
+            raise ConfigurationError("credential profile no longer exists")
+        return profile
+
+    def _validate_name(self, name: str, exclude_id: Optional[str] = None) -> str:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ConfigurationError("profile name is required")
+        if len(clean_name) > 80:
+            raise ConfigurationError("profile name must be 80 characters or fewer")
+        if any(
+            profile.profile_id != exclude_id
+            and profile.name.casefold() == clean_name.casefold()
+            for profile in self.profiles()
+        ):
+            raise ConfigurationError(f"a profile named {clean_name!r} already exists")
+        return clean_name
+
+    @staticmethod
+    def _absolute_path(env_path: Path) -> Path:
+        return Path(env_path).expanduser().absolute()
+
+    def _write(self, profile: CredentialProfile) -> None:
+        base = f"{PROFILE_GROUP}/{profile.profile_id}"
+        self.settings.setValue(f"{base}/name", profile.name)
+        self.settings.setValue(f"{base}/env_path", str(profile.env_path))
+        self.settings.sync()
+
+
+def read_credential_profile(env_path: Path) -> Settings:
+    """Validate and read a profile without consulting global environment values."""
+
+    path = Path(env_path).expanduser()
+    if not path.is_file():
+        raise ConfigurationError(f"credential file does not exist: {path}")
+    try:
+        return load_settings("profile", path, environment={})
+    except (OSError, UnicodeError) as exc:
+        raise ConfigurationError(f"could not read credential file: {exc}") from exc
+
+
+class CredentialProfileDialog(QDialog):
+    """Add and maintain references to existing credentials files."""
+
+    def __init__(
+        self,
+        store: CredentialProfileStore,
+        initial_path: str = "",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.store = store
+        self.last_path = initial_path
+        self.setWindowTitle("Manage Credential Profiles")
+        self.resize(760, 360)
+
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Profiles reference existing .env files. Removing a profile does not delete its file."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+
+        self.profile_table = QTableWidget(0, 2)
+        self.profile_table.setHorizontalHeaderLabels(["Profile", "Credentials File"])
+        self.profile_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.profile_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.profile_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        profile_header = self.profile_table.horizontalHeader()
+        profile_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        profile_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.profile_table.itemSelectionChanged.connect(self._update_button_states)
+        layout.addWidget(self.profile_table, 1)
+
+        action_row = QHBoxLayout()
+        self.add_button = QPushButton("Add…")
+        self.rename_button = QPushButton("Rename…")
+        self.relink_button = QPushButton("Relink…")
+        self.remove_button = QPushButton("Remove")
+        self.add_button.clicked.connect(self.add_profile)
+        self.rename_button.clicked.connect(self.rename_profile)
+        self.relink_button.clicked.connect(self.relink_profile)
+        self.remove_button.clicked.connect(self.remove_profile)
+        action_row.addWidget(self.add_button)
+        action_row.addWidget(self.rename_button)
+        action_row.addWidget(self.relink_button)
+        action_row.addWidget(self.remove_button)
+        action_row.addStretch()
+        close_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_buttons.rejected.connect(self.reject)
+        action_row.addWidget(close_buttons)
+        layout.addLayout(action_row)
+
+        self.refresh()
+
+    def refresh(self, selected_id: Optional[str] = None) -> None:
+        self.profile_table.setRowCount(0)
+        selected_row = -1
+        for row, profile in enumerate(self.store.profiles()):
+            self.profile_table.insertRow(row)
+            name_item = QTableWidgetItem(profile.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, profile.profile_id)
+            path_item = QTableWidgetItem(str(profile.env_path))
+            self.profile_table.setItem(row, 0, name_item)
+            self.profile_table.setItem(row, 1, path_item)
+            if profile.profile_id == selected_id:
+                selected_row = row
+        if selected_row >= 0:
+            self.profile_table.selectRow(selected_row)
+        self._update_button_states()
+
+    def selected_profile(self) -> Optional[CredentialProfile]:
+        row = self.profile_table.currentRow()
+        if row < 0:
+            return None
+        item = self.profile_table.item(row, 0)
+        if item is None:
+            return None
+        profile_id = item.data(Qt.ItemDataRole.UserRole)
+        return self.store.get(str(profile_id)) if profile_id else None
+
+    @Slot()
+    def add_profile(self) -> None:
+        path = self._choose_credentials_file("Add credential profile")
+        if path is None or not self._validate_file(path):
+            return
+        default_name = path.stem.lstrip(".") or path.parent.name or "Profile"
+        name, accepted = QInputDialog.getText(
+            self,
+            "Add Credential Profile",
+            "Profile name:",
+            QLineEdit.EchoMode.Normal,
+            default_name,
+        )
+        if not accepted:
+            return
+        try:
+            profile = self.store.add(name, path)
+        except ConfigurationError as exc:
+            QMessageBox.critical(self, "Could not add profile", str(exc))
+            return
+        self.last_path = str(path)
+        self.refresh(profile.profile_id)
+
+    @Slot()
+    def rename_profile(self) -> None:
+        profile = self.selected_profile()
+        if profile is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "Rename Credential Profile",
+            "Profile name:",
+            QLineEdit.EchoMode.Normal,
+            profile.name,
+        )
+        if not accepted:
+            return
+        try:
+            updated = self.store.rename(profile.profile_id, name)
+        except ConfigurationError as exc:
+            QMessageBox.critical(self, "Could not rename profile", str(exc))
+            return
+        self.refresh(updated.profile_id)
+
+    @Slot()
+    def relink_profile(self) -> None:
+        profile = self.selected_profile()
+        if profile is None:
+            return
+        path = self._choose_credentials_file(
+            "Relink credential profile",
+            str(profile.env_path),
+        )
+        if path is None or not self._validate_file(path):
+            return
+        updated = self.store.relink(profile.profile_id, path)
+        self.last_path = str(path)
+        self.refresh(updated.profile_id)
+
+    @Slot()
+    def remove_profile(self) -> None:
+        profile = self.selected_profile()
+        if profile is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove credential profile?",
+            f"Remove {profile.name!r} from the app?\n\n"
+            "The credentials file will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.store.remove(profile.profile_id)
+        self.refresh()
+
+    def _choose_credentials_file(
+        self,
+        title: str,
+        current: str = "",
+    ) -> Optional[Path]:
+        previous = current or self.last_path
+        start = str(Path(previous).parent) if previous else str(Path.home())
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            title,
+            start,
+            "Environment files (*.env);;All files (*)",
+        )
+        return Path(selected).absolute() if selected else None
+
+    def _validate_file(self, path: Path) -> bool:
+        try:
+            read_credential_profile(path)
+        except ConfigurationError as exc:
+            QMessageBox.critical(self, "Invalid credential profile", str(exc))
+            return False
+        return True
+
+    @Slot()
+    def _update_button_states(self) -> None:
+        enabled = self.selected_profile() is not None
+        self.rename_button.setEnabled(enabled)
+        self.relink_button.setEnabled(enabled)
+        self.remove_button.setEnabled(enabled)
 
 
 class BatchWorker(QObject):
@@ -85,6 +404,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: Optional[QSettings] = None) -> None:
         super().__init__()
         self.settings = settings or QSettings(ORGANIZATION_NAME, APP_NAME)
+        self.profile_store = CredentialProfileStore(self.settings)
         self._prepared: Optional[PreparedRun] = None
         self._batch_result: Optional[BatchResult] = None
         self._token: Optional[CancellationToken] = None
@@ -92,6 +412,7 @@ class MainWindow(QMainWindow):
         self._worker: Optional[BatchWorker] = None
         self._running = False
         self._loading_settings = True
+        self._loading_profile = False
         self._close_after_run = False
         self._rows: dict[str, int] = {}
         self._last_inventory_import = ""
@@ -159,12 +480,18 @@ class MainWindow(QMainWindow):
         self.password_edit = QLineEdit()
         self.password_edit.setPlaceholderText("SSH Password")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        import_credentials_button = QPushButton("Import Credentials")
-        import_credentials_button.clicked.connect(self._import_credentials)
+        self.profile_combo = QComboBox()
+        self.manage_profiles_button = QPushButton("Manage Profiles…")
+        self.manage_profiles_button.clicked.connect(self.manage_profiles)
+        profile_container = QWidget()
+        profile_layout = QHBoxLayout(profile_container)
+        profile_layout.setContentsMargins(0, 0, 0, 0)
+        profile_layout.addWidget(self.profile_combo, 1)
+        profile_layout.addWidget(self.manage_profiles_button)
         self.output_edit, output_row = self._path_row("Choose output folder…", self._choose_output)
-        form.insertRow(0, "Username", self.username_edit)
-        form.insertRow(1, "Password", self.password_edit)
-        form.insertRow(2, "", import_credentials_button)
+        form.insertRow(0, "Profile", profile_container)
+        form.insertRow(1, "Username", self.username_edit)
+        form.insertRow(2, "Password", self.password_edit)
         form.addRow("Output Folder", output_row)
 
         self.device_type_combo = QComboBox()
@@ -252,12 +579,14 @@ class MainWindow(QMainWindow):
         return edit, container
 
     def _connect_input_changes(self) -> None:
-        for edit in (self.username_edit, self.password_edit, self.output_edit):
-            edit.textChanged.connect(self.invalidate_validation)
+        self.username_edit.textChanged.connect(self._credentials_edited)
+        self.password_edit.textChanged.connect(self._credentials_edited)
+        self.output_edit.textChanged.connect(self.invalidate_validation)
         self.inventory_text_edit.textChanged.connect(self.invalidate_validation)
         self.exec_commands_edit.textChanged.connect(self.invalidate_validation)
         self.config_commands_edit.textChanged.connect(self.invalidate_validation)
         self.device_type_combo.currentTextChanged.connect(self.invalidate_validation)
+        self.profile_combo.activated.connect(self._profile_activated)
 
     def _restore_settings(self) -> None:
         default_output = Path.home() / "Documents" / APP_NAME / "outputs"
@@ -270,6 +599,10 @@ class MainWindow(QMainWindow):
         self.device_type_combo.setCurrentText(
             self.settings.value("run/device_type", "huawei", str)
         )
+        selected_profile_id = self.profile_store.selected_id()
+        self._refresh_profile_combo(selected_profile_id)
+        if selected_profile_id:
+            self._load_profile_by_id(selected_profile_id, startup=True)
         splitter_state = self.settings.value("window/main_splitter")
         if splitter_state is not None:
             self.main_splitter.restoreState(splitter_state)
@@ -286,6 +619,123 @@ class MainWindow(QMainWindow):
         self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.remove("run/failure_patterns")
         self.settings.sync()
+
+    def _refresh_profile_combo(self, selected_id: Optional[str] = None) -> None:
+        self.profile_combo.clear()
+        self.profile_combo.addItem(MANUAL_PROFILE_TEXT, None)
+        selected_index = 0
+        for profile in self.profile_store.profiles():
+            self.profile_combo.addItem(profile.name, profile.profile_id)
+            if profile.profile_id == selected_id:
+                selected_index = self.profile_combo.count() - 1
+        self.profile_combo.setCurrentIndex(selected_index)
+
+    @Slot(int)
+    def _profile_activated(self, index: int) -> None:
+        profile_id = self.profile_combo.itemData(index)
+        if not profile_id:
+            self._switch_to_manual(clear_credentials=True)
+            self.validation_label.setText("Enter credentials manually, then validate.")
+            return
+        self._load_profile_by_id(str(profile_id), startup=False)
+
+    def _load_profile_by_id(self, profile_id: str, startup: bool) -> bool:
+        profile = self.profile_store.get(profile_id)
+        if profile is None:
+            self._switch_to_manual(clear_credentials=True)
+            self.validation_label.setText("The previously selected profile no longer exists.")
+            return False
+
+        try:
+            credentials = read_credential_profile(profile.env_path)
+        except ConfigurationError as exc:
+            self._loading_profile = True
+            try:
+                self.username_edit.clear()
+                self.password_edit.clear()
+            finally:
+                self._loading_profile = False
+            self._credential_file = None
+            self._prepared = None
+            self._set_validated(False)
+            if startup:
+                self.profile_store.set_selected_id(None)
+                self.profile_combo.setCurrentIndex(0)
+                self.validation_label.setText(
+                    f"Could not load the previous profile {profile.name!r}: {exc}"
+                )
+            else:
+                self.profile_store.set_selected_id(profile.profile_id)
+                self.validation_label.setText(
+                    f"Could not load profile {profile.name!r}: {exc}"
+                )
+            return False
+
+        self._loading_profile = True
+        try:
+            self.username_edit.setText(credentials.username)
+            self.password_edit.setText(credentials.password)
+        finally:
+            self._loading_profile = False
+        self._credential_file = profile.env_path
+        self.profile_store.set_selected_id(profile.profile_id)
+        self._prepared = None
+        self._set_validated(False)
+        self.validation_label.setText(f"Loaded credential profile: {profile.name}")
+        return True
+
+    @Slot()
+    def _credentials_edited(self) -> None:
+        if self._loading_settings or self._loading_profile or self._running:
+            return
+        if self.profile_combo.currentData():
+            self._switch_to_manual(clear_credentials=False)
+        self.invalidate_validation()
+
+    def _switch_to_manual(self, clear_credentials: bool) -> None:
+        self._loading_profile = True
+        try:
+            self.profile_combo.setCurrentIndex(0)
+            if clear_credentials:
+                self.username_edit.clear()
+                self.password_edit.clear()
+        finally:
+            self._loading_profile = False
+        self._credential_file = None
+        self.profile_store.set_selected_id(None)
+        self._prepared = None
+        self._set_validated(False)
+
+    @Slot()
+    def manage_profiles(self) -> None:
+        selected_id = self.profile_combo.currentData()
+        was_manual = not bool(selected_id)
+        dialog = CredentialProfileDialog(
+            self.profile_store,
+            self._last_credential_import,
+            self,
+        )
+        if selected_id:
+            dialog.refresh(str(selected_id))
+        dialog.exec()
+        if dialog.last_path:
+            self._last_credential_import = dialog.last_path
+
+        selected_id = str(selected_id) if selected_id else None
+        selected_profile = self.profile_store.get(selected_id) if selected_id else None
+        self._refresh_profile_combo(selected_id if selected_profile else None)
+        if selected_profile:
+            self._load_profile_by_id(selected_profile.profile_id, startup=False)
+        elif was_manual:
+            self._credential_file = None
+            self.profile_store.set_selected_id(None)
+            self._prepared = None
+            self._set_validated(False)
+            self.validation_label.setText("Select a profile or enter credentials manually.")
+        else:
+            self._switch_to_manual(clear_credentials=True)
+            self.validation_label.setText("Select a profile or enter credentials manually.")
+        self._save_settings()
 
     @Slot()
     def invalidate_validation(self) -> None:
@@ -603,50 +1053,6 @@ class MainWindow(QMainWindow):
             "\n".join(command.text for command in commands if command.section == "config")
         )
         self._last_command_import = str(path)
-
-    @Slot()
-    def _import_credentials(self) -> None:
-        start = (
-            str(Path(self._last_credential_import).parent)
-            if self._last_credential_import
-            else str(Path.home())
-        )
-        selected, _ = QFileDialog.getOpenFileName(
-            self,
-            "Import credentials",
-            start,
-            "Environment files (*.env);;All files (*)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            values = load_environment(path)
-        except (OSError, UnicodeError) as exc:
-            QMessageBox.critical(
-                self,
-                "Credential import failed",
-                f"Could not read {path}:\n{exc}",
-            )
-            return
-        username = values.get("SSH_USERNAME", "").strip()
-        password = values.get("SSH_PASSWORD", "")
-        missing = [
-            label
-            for label, value in (("SSH_USERNAME", username), ("SSH_PASSWORD", password))
-            if not value
-        ]
-        if missing:
-            QMessageBox.critical(
-                self,
-                "Credential import failed",
-                f"Missing required value(s): {', '.join(missing)}",
-            )
-            return
-        self._credential_file = path
-        self._last_credential_import = str(path)
-        self.username_edit.setText(username)
-        self.password_edit.setText(password)
 
     def _select_import_file(self, title: str, previous: str) -> Optional[Path]:
         start = str(Path(previous).parent) if previous else str(Path.home())

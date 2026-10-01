@@ -87,21 +87,39 @@ class MainWindowTests(unittest.TestCase):
         self.assertNotIn("secret", [self.settings.value(key) for key in all_keys])
         self.assertNotIn("show version", [self.settings.value(key) for key in all_keys])
 
-    def test_password_is_hidden_and_credentials_can_be_imported(self):
+    def test_profile_settings_store_only_name_id_and_path(self):
+        credential_file = self.base / "private.env"
+        credential_file.write_text(
+            "SSH_USERNAME=profile-user\n"
+            "SSH_PASSWORD=profile-password\n"
+            "ENABLE_SECRET=profile-enable\n",
+            encoding="utf-8",
+        )
+        profile = self.window.profile_store.add("Private Profile", credential_file)
+        self.window.profile_store.set_selected_id(profile.profile_id)
+
+        stored = "\n".join(
+            f"{key}={self.settings.value(key)}" for key in self.settings.allKeys()
+        )
+        self.assertIn("Private Profile", stored)
+        self.assertIn(str(credential_file.absolute()), stored)
+        self.assertNotIn("profile-user", stored)
+        self.assertNotIn("profile-password", stored)
+        self.assertNotIn("profile-enable", stored)
+
+    def test_profile_selection_loads_masked_credentials_and_optional_settings(self):
         credential_file = self.base / ".env"
         credential_file.write_text(
             "SSH_USERNAME=imported-admin\n"
             "SSH_PASSWORD=imported-secret\n"
+            "ENABLE_SECRET=enable-secret\n"
             "SSH_PORT=2200\n",
             encoding="utf-8",
         )
-
-        with patch.object(
-            gui.QFileDialog,
-            "getOpenFileName",
-            return_value=(str(credential_file), "Environment files (*.env)"),
-        ):
-            self.window._import_credentials()
+        profile = self.window.profile_store.add("Lab Admin", credential_file)
+        self.window._refresh_profile_combo(profile.profile_id)
+        profile_index = self.window.profile_combo.findData(profile.profile_id)
+        self.window._profile_activated(profile_index)
 
         self.assertEqual(self.window.username_edit.text(), "imported-admin")
         self.assertEqual(self.window.password_edit.text(), "imported-secret")
@@ -114,6 +132,167 @@ class MainWindowTests(unittest.TestCase):
         self.window.output_edit.setText(str(self.base / "outputs"))
         self.assertTrue(self.window.validate_inputs(show_success=False))
         self.assertEqual(self.window._prepared.settings.port, 2200)
+        self.assertEqual(self.window._prepared.settings.enable_secret, "enable-secret")
+
+    def test_profiles_are_sorted_and_reject_invalid_names(self):
+        first_file = self.base / "first.env"
+        second_file = self.base / "second.env"
+        first_file.write_text("SSH_USERNAME=one\nSSH_PASSWORD=first\n", encoding="utf-8")
+        second_file.write_text("SSH_USERNAME=two\nSSH_PASSWORD=second\n", encoding="utf-8")
+
+        self.window.profile_store.add("Zulu", first_file)
+        self.window.profile_store.add("Alpha", second_file)
+
+        self.assertEqual(
+            [profile.name for profile in self.window.profile_store.profiles()],
+            ["Alpha", "Zulu"],
+        )
+        with self.assertRaisesRegex(runner.ConfigurationError, "already exists"):
+            self.window.profile_store.add("alpha", first_file)
+        with self.assertRaisesRegex(runner.ConfigurationError, "name is required"):
+            self.window.profile_store.add("  ", first_file)
+
+    def test_profile_manager_adds_renames_relinks_and_removes_references(self):
+        first_file = self.base / "first.env"
+        second_file = self.base / "second.env"
+        first_file.write_text("SSH_USERNAME=one\nSSH_PASSWORD=first\n", encoding="utf-8")
+        second_file.write_text("SSH_USERNAME=two\nSSH_PASSWORD=second\n", encoding="utf-8")
+        dialog = gui.CredentialProfileDialog(self.window.profile_store, parent=self.window)
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(first_file), "Environment files (*.env)"),
+        ), patch.object(gui.QInputDialog, "getText", return_value=("Lab Admin", True)):
+            dialog.add_profile()
+
+        profile = self.window.profile_store.profiles()[0]
+        dialog.profile_table.selectRow(0)
+        with patch.object(gui.QInputDialog, "getText", return_value=("Core Admin", True)):
+            dialog.rename_profile()
+        self.assertEqual(self.window.profile_store.get(profile.profile_id).name, "Core Admin")
+
+        dialog.profile_table.selectRow(0)
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(second_file), "Environment files (*.env)"),
+        ):
+            dialog.relink_profile()
+        self.assertEqual(
+            self.window.profile_store.get(profile.profile_id).env_path,
+            second_file.absolute(),
+        )
+
+        dialog.profile_table.selectRow(0)
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            dialog.remove_profile()
+        self.assertEqual(self.window.profile_store.profiles(), [])
+        self.assertTrue(first_file.exists())
+        self.assertTrue(second_file.exists())
+
+    def test_invalid_profile_file_is_rejected_by_manager(self):
+        invalid_file = self.base / "invalid.env"
+        invalid_file.write_text("SSH_USERNAME=admin\n", encoding="utf-8")
+        dialog = gui.CredentialProfileDialog(self.window.profile_store, parent=self.window)
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(invalid_file), "Environment files (*.env)"),
+        ), patch.object(gui.QMessageBox, "critical") as critical, patch.object(
+            gui.QInputDialog,
+            "getText",
+        ) as get_name:
+            dialog.add_profile()
+
+        critical.assert_called_once()
+        get_name.assert_not_called()
+        self.assertEqual(self.window.profile_store.profiles(), [])
+
+    def test_manual_edit_detaches_loaded_profile_without_editing_file(self):
+        credential_file = self.base / "saved.env"
+        original = "SSH_USERNAME=saved-user\nSSH_PASSWORD=saved-password\nSSH_PORT=2200\n"
+        credential_file.write_text(original, encoding="utf-8")
+        profile = self.window.profile_store.add("Saved", credential_file)
+        self.window._refresh_profile_combo(profile.profile_id)
+        self.window._profile_activated(self.window.profile_combo.findData(profile.profile_id))
+
+        self.window.username_edit.setText("one-off-user")
+
+        self.assertIsNone(self.window.profile_combo.currentData())
+        self.assertIsNone(self.window._credential_file)
+        self.assertIsNone(self.window.profile_store.selected_id())
+        self.assertEqual(credential_file.read_text(encoding="utf-8"), original)
+
+    def test_reselecting_profile_reloads_changed_env_file(self):
+        credential_file = self.base / "reload.env"
+        credential_file.write_text(
+            "SSH_USERNAME=first-user\nSSH_PASSWORD=first-password\n",
+            encoding="utf-8",
+        )
+        profile = self.window.profile_store.add("Reload", credential_file)
+        self.window._refresh_profile_combo(profile.profile_id)
+        index = self.window.profile_combo.findData(profile.profile_id)
+        self.window._profile_activated(index)
+        credential_file.write_text(
+            "SSH_USERNAME=second-user\nSSH_PASSWORD=second-password\n",
+            encoding="utf-8",
+        )
+
+        self.window._profile_activated(index)
+
+        self.assertEqual(self.window.username_edit.text(), "second-user")
+        self.assertEqual(self.window.password_edit.text(), "second-password")
+
+    def test_selecting_missing_profile_keeps_it_available_for_relinking(self):
+        profile = self.window.profile_store.add("Unavailable", self.base / "gone.env")
+        self.window._refresh_profile_combo(profile.profile_id)
+        index = self.window.profile_combo.findData(profile.profile_id)
+
+        self.window._profile_activated(index)
+
+        self.assertEqual(self.window.profile_combo.currentData(), profile.profile_id)
+        self.assertEqual(self.window.username_edit.text(), "")
+        self.assertEqual(self.window.password_edit.text(), "")
+        self.assertIn("Could not load profile", self.window.validation_label.text())
+        self.assertIsNotNone(self.window.profile_store.get(profile.profile_id))
+
+    def test_last_selected_profile_reloads_after_reopening(self):
+        credential_file = self.base / "remembered.env"
+        credential_file.write_text(
+            "SSH_USERNAME=remembered-user\nSSH_PASSWORD=remembered-password\n",
+            encoding="utf-8",
+        )
+        profile = self.window.profile_store.add("Remembered", credential_file)
+        self.window._refresh_profile_combo(profile.profile_id)
+        self.window._profile_activated(self.window.profile_combo.findData(profile.profile_id))
+
+        reopened = gui.MainWindow(self.settings)
+        try:
+            self.assertEqual(reopened.profile_combo.currentData(), profile.profile_id)
+            self.assertEqual(reopened.username_edit.text(), "remembered-user")
+            self.assertEqual(reopened.password_edit.text(), "remembered-password")
+        finally:
+            reopened.close()
+
+    def test_missing_last_profile_starts_manual_and_keeps_reference(self):
+        missing_file = self.base / "missing.env"
+        profile = self.window.profile_store.add("Missing", missing_file)
+        self.window.profile_store.set_selected_id(profile.profile_id)
+
+        reopened = gui.MainWindow(self.settings)
+        try:
+            self.assertIsNone(reopened.profile_combo.currentData())
+            self.assertEqual(reopened.username_edit.text(), "")
+            self.assertIn("Could not load", reopened.validation_label.text())
+            self.assertIsNotNone(reopened.profile_store.get(profile.profile_id))
+        finally:
+            reopened.close()
 
     def test_importing_sectioned_command_file_splits_the_command_boxes(self):
         command_file = self.base / "commands.txt"
