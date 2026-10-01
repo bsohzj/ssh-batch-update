@@ -48,6 +48,7 @@ from run_commands import (
     Settings,
     load_settings,
     parse_commands,
+    parse_inline_commands,
     prepare_run,
     run_batch,
 )
@@ -455,11 +456,19 @@ class MainWindow(QMainWindow):
         self.inventory_text_edit.setMaximumHeight(100)
         inventory_button = QPushButton("Import Devices")
         inventory_button.clicked.connect(self._import_inventory)
+        inventory_export_button = QPushButton("Export Devices")
+        inventory_export_button.clicked.connect(self._export_inventory)
+        inventory_buttons = QWidget()
+        inventory_buttons_layout = QVBoxLayout(inventory_buttons)
+        inventory_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        inventory_buttons_layout.addWidget(inventory_button)
+        inventory_buttons_layout.addWidget(inventory_export_button)
+        inventory_buttons_layout.addStretch()
         inventory_container = QWidget()
         inventory_layout = QHBoxLayout(inventory_container)
         inventory_layout.setContentsMargins(0, 0, 0, 0)
         inventory_layout.addWidget(self.inventory_text_edit, 1)
-        inventory_layout.addWidget(inventory_button, 0)
+        inventory_layout.addWidget(inventory_buttons, 0)
         form.addRow("Devices", inventory_container)
 
         self.exec_commands_edit = QPlainTextEdit()
@@ -470,10 +479,18 @@ class MainWindow(QMainWindow):
         self.config_commands_edit.setMaximumHeight(120)
         import_sectioned_button = QPushButton("Import Existing Commands")
         import_sectioned_button.clicked.connect(self._import_sectioned_commands)
+        export_sectioned_button = QPushButton("Export Commands")
+        export_sectioned_button.clicked.connect(self._export_sectioned_commands)
+        command_file_buttons = QWidget()
+        command_file_buttons_layout = QHBoxLayout(command_file_buttons)
+        command_file_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        command_file_buttons_layout.addWidget(import_sectioned_button)
+        command_file_buttons_layout.addWidget(export_sectioned_button)
+        command_file_buttons_layout.addStretch()
 
         form.addRow("Exec Commands", self.exec_commands_edit)
         form.addRow("Config Commands", self.config_commands_edit)
-        form.addRow("", import_sectioned_button)
+        form.addRow("", command_file_buttons)
 
         self.username_edit = QLineEdit()
         self.username_edit.setPlaceholderText("SSH Username")
@@ -502,7 +519,7 @@ class MainWindow(QMainWindow):
         settings_layout.addWidget(self.configuration_group)
 
         button_row = QHBoxLayout()
-        self.validate_button = QPushButton("Validate Files")
+        self.validate_button = QPushButton("Validate Input")
         self.run_button = QPushButton("Run Live")
         self.cancel_button = QPushButton("Stop Run")
         self.cancel_button.setStyleSheet("QPushButton { color: #c62828; }")
@@ -1031,6 +1048,20 @@ class MainWindow(QMainWindow):
             self._last_inventory_import = str(path)
 
     @Slot()
+    def _export_inventory(self) -> None:
+        text = self.inventory_text_edit.toPlainText()
+        if not text.strip():
+            QMessageBox.critical(self, "Device export failed", "There are no devices to export.")
+            return
+        path = self._select_export_file(
+            "Export devices",
+            self._last_inventory_import,
+            "devices.txt",
+        )
+        if path is not None and self._write_export_file(path, text):
+            self._last_inventory_import = str(path)
+
+    @Slot()
     def _import_sectioned_commands(self) -> None:
         path = self._select_import_file(
             "Import existing [exec]/[config] command file",
@@ -1054,6 +1085,25 @@ class MainWindow(QMainWindow):
         )
         self._last_command_import = str(path)
 
+    @Slot()
+    def _export_sectioned_commands(self) -> None:
+        exec_text = self.exec_commands_edit.toPlainText()
+        config_text = self.config_commands_edit.toPlainText()
+        try:
+            parse_inline_commands(exec_text, config_text)
+        except ConfigurationError as exc:
+            QMessageBox.critical(self, "Command export failed", str(exc))
+            return
+
+        contents = f"[exec]\n{exec_text.rstrip()}\n\n[config]\n{config_text.rstrip()}\n"
+        path = self._select_export_file(
+            "Export [exec]/[config] command file",
+            self._last_command_import,
+            "commands.txt",
+        )
+        if path is not None and self._write_export_file(path, contents):
+            self._last_command_import = str(path)
+
     def _select_import_file(self, title: str, previous: str) -> Optional[Path]:
         start = str(Path(previous).parent) if previous else str(Path.home())
         selected, _ = QFileDialog.getOpenFileName(
@@ -1063,6 +1113,29 @@ class MainWindow(QMainWindow):
             "Text files (*.txt);;All files (*)",
         )
         return Path(selected) if selected else None
+
+    def _select_export_file(
+        self,
+        title: str,
+        previous: str,
+        default_name: str,
+    ) -> Optional[Path]:
+        start = Path(previous).parent if previous else Path.home()
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            title,
+            str(start / default_name),
+            "Text files (*.txt);;All files (*)",
+        )
+        return Path(selected) if selected else None
+
+    def _write_export_file(self, path: Path, text: str) -> bool:
+        try:
+            path.write_text(text, encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            QMessageBox.critical(self, "Export failed", f"Could not write {path}:\n{exc}")
+            return False
+        return True
 
     def _read_import_file(self, path: Path) -> Optional[str]:
         try:

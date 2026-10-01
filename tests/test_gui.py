@@ -314,6 +314,64 @@ class MainWindowTests(unittest.TestCase):
             "interface loopback 1",
         )
 
+    def test_exporting_devices_writes_the_devices_text(self):
+        export_file = self.base / "exported-devices.txt"
+        self.window.inventory_text_edit.setPlainText(
+            "# Core switches\n192.0.2.1\nswitch-2.example.test"
+        )
+
+        with patch.object(
+            gui.QFileDialog,
+            "getSaveFileName",
+            return_value=(str(export_file), "Text files (*.txt)"),
+        ):
+            self.window._export_inventory()
+
+        self.assertEqual(
+            export_file.read_text(encoding="utf-8"),
+            "# Core switches\n192.0.2.1\nswitch-2.example.test",
+        )
+        self.assertEqual(self.window._last_inventory_import, str(export_file))
+
+    def test_exporting_commands_writes_both_sections(self):
+        export_file = self.base / "exported-commands.txt"
+        self.window.exec_commands_edit.setPlainText("show version\nshow clock")
+        self.window.config_commands_edit.setPlainText("interface loopback 1\ndescription Test")
+
+        with patch.object(
+            gui.QFileDialog,
+            "getSaveFileName",
+            return_value=(str(export_file), "Text files (*.txt)"),
+        ):
+            self.window._export_sectioned_commands()
+
+        self.assertEqual(
+            export_file.read_text(encoding="utf-8"),
+            "[exec]\nshow version\nshow clock\n\n"
+            "[config]\ninterface loopback 1\ndescription Test\n",
+        )
+        commands = runner.read_commands(export_file)
+        self.assertEqual(
+            [(command.section, command.text) for command in commands],
+            [
+                ("exec", "show version"),
+                ("exec", "show clock"),
+                ("config", "interface loopback 1"),
+                ("config", "description Test"),
+            ],
+        )
+        self.assertEqual(self.window._last_command_import, str(export_file))
+
+    def test_empty_commands_are_not_exported(self):
+        with (
+            patch.object(gui.QFileDialog, "getSaveFileName") as save_dialog,
+            patch.object(gui.QMessageBox, "critical") as error_dialog,
+        ):
+            self.window._export_sectioned_commands()
+
+        save_dialog.assert_not_called()
+        error_dialog.assert_called_once()
+
     def test_declining_confirmation_does_not_start_worker_thread(self):
         self.populate_valid_inputs()
         self.assertTrue(self.window.validate_inputs(show_success=False))
