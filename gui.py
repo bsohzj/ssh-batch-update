@@ -832,7 +832,7 @@ class MainWindow(QMainWindow):
         except (ConfigurationError, OSError) as exc:
             self._prepared = None
             self._set_validated(False)
-            self.validation_label.setText("Validation failed")
+            self.validation_label.setText(f"Validation failed; {exc}")
             if show_success:
                 QMessageBox.critical(self, "Validation failed", str(exc))
             return False
@@ -842,6 +842,14 @@ class MainWindow(QMainWindow):
         self._save_settings()
         valid = len(prepared.valid_entries)
         invalid = len(prepared.invalid_entries)
+        if valid == 0:
+            entry_word = "entry" if invalid == 1 else "entries"
+            reason = f"no valid IP addresses found ({invalid} invalid device {entry_word})"
+            self.validation_label.setText(f"Validation failed; {reason}")
+            self._set_validated(False)
+            if show_success:
+                QMessageBox.critical(self, "Validation failed", reason)
+            return False
         self.validation_label.setText(
             f"Validated: {valid} valid, {invalid} invalid, {len(prepared.commands)} commands"
         )

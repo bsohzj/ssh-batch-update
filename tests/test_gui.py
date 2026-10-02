@@ -59,6 +59,33 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.device_table.item(0, 1).text(), "Ready")
         self.assertEqual(self.window.device_table.item(1, 1).text(), "Invalid")
 
+    def test_validation_label_includes_failure_reason(self):
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.exec_commands_edit.setPlainText("show version")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+
+        valid = self.window.validate_inputs(show_success=False)
+
+        self.assertFalse(valid)
+        self.assertIn(
+            "Validation failed; Missing required selection: username, password",
+            self.window.validation_label.text(),
+        )
+
+    def test_validation_reports_when_all_ip_addresses_are_invalid(self):
+        self.populate_valid_inputs()
+        self.window.inventory_text_edit.setPlainText("10.2.0.44a")
+
+        valid = self.window.validate_inputs(show_success=False)
+
+        self.assertFalse(valid)
+        self.assertEqual(
+            self.window.validation_label.text(),
+            "Validation failed; no valid IP addresses found "
+            "(1 invalid device entry)",
+        )
+        self.assertFalse(self.window.run_button.isEnabled())
+
     def test_results_table_is_beside_the_settings_panel(self):
         splitter = self.window.main_splitter
 
