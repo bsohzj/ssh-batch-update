@@ -3,8 +3,6 @@ name: macOS application
 on:
   pull_request:
   push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
