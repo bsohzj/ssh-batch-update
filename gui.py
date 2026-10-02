@@ -49,8 +49,10 @@ from run_commands import (
     load_settings,
     parse_commands,
     parse_inline_commands,
+    prepare_connection_test,
     prepare_run,
     run_batch,
+    run_connection_test,
 )
 
 
@@ -374,25 +376,38 @@ class CredentialProfileDialog(QDialog):
 
 
 class BatchWorker(QObject):
-    """Run a prepared batch off the GUI thread."""
+    """Run a prepared live batch or connection test off the GUI thread."""
 
     event = Signal(object)
     completed = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, prepared: PreparedRun, cancellation_token: CancellationToken) -> None:
+    def __init__(
+        self,
+        prepared: PreparedRun,
+        cancellation_token: CancellationToken,
+        operation: str = "run",
+    ) -> None:
         super().__init__()
         self.prepared = prepared
         self.cancellation_token = cancellation_token
+        self.operation = operation
 
     @Slot()
     def run(self) -> None:
         try:
-            result = run_batch(
-                self.prepared,
-                progress_callback=self.event.emit,
-                cancellation_token=self.cancellation_token,
-            )
+            if self.operation == "connection_test":
+                result = run_connection_test(
+                    self.prepared,
+                    progress_callback=self.event.emit,
+                    cancellation_token=self.cancellation_token,
+                )
+            else:
+                result = run_batch(
+                    self.prepared,
+                    progress_callback=self.event.emit,
+                    cancellation_token=self.cancellation_token,
+                )
         except Exception as exc:  # The GUI boundary must surface all worker failures.
             self.failed.emit(f"{exc.__class__.__name__}: {exc}")
         else:
@@ -411,6 +426,7 @@ class MainWindow(QMainWindow):
         self._token: Optional[CancellationToken] = None
         self._thread: Optional[QThread] = None
         self._worker: Optional[BatchWorker] = None
+        self._operation: Optional[str] = None
         self._running = False
         self._loading_settings = True
         self._loading_profile = False
@@ -451,18 +467,25 @@ class MainWindow(QMainWindow):
 
         self.inventory_text_edit = QPlainTextEdit()
         self.inventory_text_edit.setPlaceholderText(
-            "One IP address or hostname per line. Blank lines and # comments are ignored."
+            "One IPv4 or IPv6 address per line. Blank lines and # comments are ignored."
         )
         self.inventory_text_edit.setMaximumHeight(100)
         inventory_button = QPushButton("Import Devices")
         inventory_button.clicked.connect(self._import_inventory)
         inventory_export_button = QPushButton("Export Devices")
         inventory_export_button.clicked.connect(self._export_inventory)
+        self.test_connections_button = QPushButton("Test Connections")
+        self.test_connections_button.setToolTip(
+            "Log in, detect the prompt, optionally test enable mode, and disconnect. "
+            "Commands in the command boxes are not run."
+        )
+        self.test_connections_button.clicked.connect(self.start_connection_test)
         inventory_buttons = QWidget()
         inventory_buttons_layout = QVBoxLayout(inventory_buttons)
         inventory_buttons_layout.setContentsMargins(0, 0, 0, 0)
         inventory_buttons_layout.addWidget(inventory_button)
         inventory_buttons_layout.addWidget(inventory_export_button)
+        inventory_buttons_layout.addWidget(self.test_connections_button)
         inventory_buttons_layout.addStretch()
         inventory_container = QWidget()
         inventory_layout = QHBoxLayout(inventory_container)
@@ -538,7 +561,7 @@ class MainWindow(QMainWindow):
 
         self.device_table = QTableWidget(0, 5)
         self.device_table.setHorizontalHeaderLabels(
-            ["Device", "Status", "Section / Line", "Result", "Output"]
+            ["Device", "Status", "Stage / Line", "Result", "Output"]
         )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -764,9 +787,10 @@ class MainWindow(QMainWindow):
 
     def _set_validated(self, validated: bool) -> None:
         self.run_button.setEnabled(validated and not self._running)
+        self.test_connections_button.setEnabled(not self._running)
         self.cancel_button.setEnabled(self._running)
 
-    def _request_from_inputs(self) -> RunRequest:
+    def _request_from_inputs(self, include_commands: bool = True) -> RunRequest:
         required = {
             "username": self.username_edit.text().strip(),
             "password": self.password_edit.text(),
@@ -785,8 +809,12 @@ class MainWindow(QMainWindow):
             failure_patterns=(),
             apply=True,
             inventory_text=self.inventory_text_edit.toPlainText(),
-            exec_commands_text=self.exec_commands_edit.toPlainText(),
-            config_commands_text=self.config_commands_edit.toPlainText(),
+            exec_commands_text=(
+                self.exec_commands_edit.toPlainText() if include_commands else None
+            ),
+            config_commands_text=(
+                self.config_commands_edit.toPlainText() if include_commands else None
+            ),
         )
 
     @Slot()
@@ -828,7 +856,11 @@ class MainWindow(QMainWindow):
             )
         return valid > 0
 
-    def _populate_devices(self, prepared: PreparedRun) -> None:
+    def _populate_devices(
+        self,
+        prepared: PreparedRun,
+        operation: str = "run",
+    ) -> None:
         self.device_table.setRowCount(0)
         self._rows.clear()
         for row, entry in enumerate(prepared.entries):
@@ -842,7 +874,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, max(1, len(prepared.entries)))
         self.progress_bar.setValue(0)
         self.status_label.setText("Validated")
-        self.totals_label.setText("0 succeeded, 0 failed, 0 cancelled")
+        self.totals_label.setText(
+            "0 passed, 0 failed, 0 cancelled"
+            if operation == "connection_test"
+            else "0 succeeded, 0 failed, 0 cancelled"
+        )
         self.open_output_button.setEnabled(False)
         self.open_summary_button.setEnabled(False)
 
@@ -901,6 +937,36 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(transcript)))
 
     @Slot()
+    def start_connection_test(self) -> None:
+        if self._running:
+            return
+        try:
+            request = self._request_from_inputs(include_commands=False)
+            prepared = prepare_connection_test(
+                request,
+                environment={
+                    "SSH_USERNAME": self.username_edit.text(),
+                    "SSH_PASSWORD": self.password_edit.text(),
+                },
+            )
+        except (ConfigurationError, OSError) as exc:
+            QMessageBox.critical(self, "Cannot test connections", str(exc))
+            return
+
+        if not prepared.valid_entries:
+            self._populate_devices(prepared, operation="connection_test")
+            QMessageBox.critical(
+                self,
+                "Cannot test connections",
+                "At least one valid IP address is required.",
+            )
+            return
+
+        self._populate_devices(prepared, operation="connection_test")
+        self._save_settings()
+        self._start_worker(prepared, operation="connection_test")
+
+    @Slot()
     def start_run(self) -> None:
         if self._running:
             return
@@ -921,11 +987,15 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Apply:
             return
 
+        self._start_worker(prepared, operation="run")
+
+    def _start_worker(self, prepared: PreparedRun, operation: str) -> None:
         self._running = True
+        self._operation = operation
         self._batch_result = None
         self._token = CancellationToken()
         self._thread = QThread(self)
-        self._worker = BatchWorker(prepared, self._token)
+        self._worker = BatchWorker(prepared, self._token, operation=operation)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.event.connect(self.handle_progress)
@@ -940,6 +1010,7 @@ class MainWindow(QMainWindow):
 
     def _set_running_ui(self, running: bool) -> None:
         self.validate_button.setEnabled(not running)
+        self.test_connections_button.setEnabled(not running)
         self.run_button.setEnabled(not running and self._prepared is not None)
         self.cancel_button.setEnabled(running)
         self.configuration_group.setEnabled(not running)
@@ -949,7 +1020,11 @@ class MainWindow(QMainWindow):
         if event.kind == "run_started":
             self.progress_bar.setRange(0, max(1, event.total))
             self.progress_bar.setValue(0)
-            self.status_label.setText("Running")
+            self.status_label.setText(
+                "Testing connections"
+                if self._operation == "connection_test"
+                else "Running"
+            )
             return
         if event.kind == "run_finished":
             self.status_label.setText(event.message)
@@ -961,14 +1036,21 @@ class MainWindow(QMainWindow):
             self._set_cell(row, 1, "Starting")
         elif event.kind == "device_status":
             self._set_cell(row, 1, event.status.title())
+            if event.section:
+                self._set_cell(row, 2, event.section)
         elif event.kind == "command_started":
             self._set_cell(row, 1, "Running")
             self._set_cell(row, 2, f"{event.section} / {event.line_number}")
         elif event.kind == "device_finished":
-            self._set_cell(row, 1, event.status.title())
-            if event.section or event.line_number:
+            status = event.status.title()
+            if self._operation == "connection_test" and event.status == "success":
+                status = "Passed"
+            self._set_cell(row, 1, status)
+            if event.line_number:
                 self._set_cell(row, 2, f"{event.section} / {event.line_number}")
-            self._set_cell(row, 3, event.message or event.status.title())
+            elif event.section:
+                self._set_cell(row, 2, event.section)
+            self._set_cell(row, 3, event.message or status)
             self._set_cell(row, 4, event.transcript_file)
             self.progress_bar.setValue(event.index)
 
@@ -983,18 +1065,36 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _run_completed(self, result: BatchResult) -> None:
         self._batch_result = result
-        self.totals_label.setText(
-            f"{result.successes} succeeded, {result.failures} failed, "
-            f"{result.cancelled} cancelled"
-        )
-        self.status_label.setText("Run complete" if not result.cancelled else "Run cancelled")
+        if self._operation == "connection_test":
+            self.totals_label.setText(
+                f"{result.successes} passed, {result.failures} failed, "
+                f"{result.cancelled} cancelled"
+            )
+            self.status_label.setText(
+                "Connection test complete"
+                if not result.cancelled
+                else "Connection test cancelled"
+            )
+        else:
+            self.totals_label.setText(
+                f"{result.successes} succeeded, {result.failures} failed, "
+                f"{result.cancelled} cancelled"
+            )
+            self.status_label.setText(
+                "Run complete" if not result.cancelled else "Run cancelled"
+            )
         self.open_output_button.setEnabled(result.run_directory.is_dir())
         self.open_summary_button.setEnabled(result.summary_path.is_file())
 
     @Slot(str)
     def _run_failed(self, message: str) -> None:
-        self.status_label.setText("Run failed")
-        QMessageBox.critical(self, "Run failed", message)
+        title = (
+            "Connection test failed"
+            if self._operation == "connection_test"
+            else "Run failed"
+        )
+        self.status_label.setText(title)
+        QMessageBox.critical(self, title, message)
 
     @Slot()
     def _thread_finished(self) -> None:
@@ -1002,6 +1102,7 @@ class MainWindow(QMainWindow):
         self._set_running_ui(False)
         self._token = None
         self._worker = None
+        self._operation = None
         thread = self._thread
         self._thread = None
         if thread is not None:
@@ -1024,7 +1125,7 @@ class MainWindow(QMainWindow):
         if self._running:
             answer = QMessageBox.question(
                 self,
-                "Cancel active run?",
+                "Stop active operation?",
                 "The app will stop at the next safe checkpoint and then close.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,

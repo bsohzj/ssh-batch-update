@@ -40,7 +40,7 @@ class MainWindowTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def populate_valid_inputs(self):
-        self.window.inventory_text_edit.setPlainText("192.0.2.1\nbad host\n")
+        self.window.inventory_text_edit.setPlainText("192.0.2.1\n10.2.0.44a\n")
         self.window.exec_commands_edit.setPlainText("show version\n")
         self.window.config_commands_edit.setPlainText("interface loopback 1\n")
         self.window.username_edit.setText("admin")
@@ -317,7 +317,7 @@ class MainWindowTests(unittest.TestCase):
     def test_exporting_devices_writes_the_devices_text(self):
         export_file = self.base / "exported-devices.txt"
         self.window.inventory_text_edit.setPlainText(
-            "# Core switches\n192.0.2.1\nswitch-2.example.test"
+            "# Core switches\n192.0.2.1\n192.0.2.2"
         )
 
         with patch.object(
@@ -329,7 +329,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual(
             export_file.read_text(encoding="utf-8"),
-            "# Core switches\n192.0.2.1\nswitch-2.example.test",
+            "# Core switches\n192.0.2.1\n192.0.2.2",
         )
         self.assertEqual(self.window._last_inventory_import, str(export_file))
 
@@ -385,6 +385,71 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(self.window._running)
         self.assertIsNone(self.window._thread)
+
+    def test_connection_test_does_not_require_command_text(self):
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.username_edit.setText("admin")
+        self.window.password_edit.setText("secret")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+        self.window.device_type_combo.setCurrentText("cisco_ios")
+
+        with patch.object(self.window, "_start_worker") as start_worker:
+            self.window.start_connection_test()
+
+        start_worker.assert_called_once()
+        prepared = start_worker.call_args.args[0]
+        self.assertEqual(prepared.commands, ())
+        self.assertEqual(start_worker.call_args.kwargs["operation"], "connection_test")
+        self.assertEqual(self.window.device_table.rowCount(), 1)
+        self.assertEqual(
+            self.window.device_table.horizontalHeaderItem(2).text(),
+            "Stage / Line",
+        )
+
+    def test_connection_progress_updates_stage_result_and_output(self):
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.username_edit.setText("admin")
+        self.window.password_edit.setText("secret")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+        request = self.window._request_from_inputs(include_commands=False)
+        prepared = runner.prepare_connection_test(
+            request,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        self.window._populate_devices(prepared, operation="connection_test")
+        self.window._operation = "connection_test"
+        diagnostic = self.base / "192.0.2.1.txt"
+        diagnostic.write_text("connection test", encoding="utf-8")
+
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_status",
+                address="192.0.2.1",
+                status="detecting prompt",
+                section="Prompt detection",
+            )
+        )
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_finished",
+                address="192.0.2.1",
+                index=1,
+                total=1,
+                status="success",
+                section="Complete",
+                message="SSH connection test passed",
+                transcript_file=str(diagnostic),
+            )
+        )
+
+        row = self.window._rows["192.0.2.1"]
+        self.assertEqual(self.window.device_table.item(row, 1).text(), "Passed")
+        self.assertEqual(self.window.device_table.item(row, 2).text(), "Complete")
+        self.assertEqual(
+            self.window.device_table.item(row, 3).text(),
+            "SSH connection test passed",
+        )
+        self.assertEqual(self.window.device_table.item(row, 4).text(), str(diagnostic))
 
     def test_progress_event_never_requires_command_text(self):
         self.populate_valid_inputs()
@@ -474,7 +539,7 @@ class MainWindowTests(unittest.TestCase):
         row = self.window._rows["192.0.2.1"]
         full_error = (
             "NetmikoTimeoutException: TCP connection to device failed.\n"
-            "Verify the hostname, port, and network reachability."
+            "Verify the IP address, port, and network reachability."
         )
         self.window._set_cell(row, 1, "Failed")
         self.window._set_cell(row, 3, full_error)
