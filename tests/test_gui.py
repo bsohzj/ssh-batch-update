@@ -40,7 +40,7 @@ class MainWindowTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def populate_valid_inputs(self):
-        self.window.inventory_text_edit.setPlainText("192.0.2.1\nbad host\n")
+        self.window.inventory_text_edit.setPlainText("192.0.2.1\n10.2.0.44a\n")
         self.window.exec_commands_edit.setPlainText("show version\n")
         self.window.config_commands_edit.setPlainText("interface loopback 1\n")
         self.window.username_edit.setText("admin")
@@ -58,6 +58,105 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.device_table.rowCount(), 2)
         self.assertEqual(self.window.device_table.item(0, 1).text(), "Ready")
         self.assertEqual(self.window.device_table.item(1, 1).text(), "Invalid")
+
+    def test_validation_label_includes_failure_reason(self):
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.exec_commands_edit.setPlainText("show version")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+
+        valid = self.window.validate_inputs(show_success=False)
+
+        self.assertFalse(valid)
+        self.assertIn(
+            "Validation failed; Missing required selection: username, password",
+            self.window.validation_label.text(),
+        )
+
+    def test_validation_reports_when_all_ip_addresses_are_invalid(self):
+        self.populate_valid_inputs()
+        self.window.inventory_text_edit.setPlainText("10.2.0.44a")
+
+        valid = self.window.validate_inputs(show_success=False)
+
+        self.assertFalse(valid)
+        self.assertEqual(
+            self.window.validation_label.text(),
+            "Validation failed; no valid IP addresses found "
+            "(1 invalid device entry)",
+        )
+        self.assertFalse(self.window.run_button.isEnabled())
+
+    def test_clear_buttons_follow_their_text_content(self):
+        self.assertFalse(self.window.clear_devices_button.isEnabled())
+        self.assertFalse(self.window.clear_commands_button.isEnabled())
+        self.assertEqual(self.window.clear_devices_button.styleSheet(), "")
+        self.assertEqual(self.window.clear_commands_button.styleSheet(), "")
+
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.assertTrue(self.window.clear_devices_button.isEnabled())
+        self.window.inventory_text_edit.clear()
+        self.assertFalse(self.window.clear_devices_button.isEnabled())
+
+        self.window.config_commands_edit.setPlainText("interface loopback 1")
+        self.assertTrue(self.window.clear_commands_button.isEnabled())
+        self.window.config_commands_edit.clear()
+        self.assertFalse(self.window.clear_commands_button.isEnabled())
+
+        self.window.exec_commands_edit.setPlainText("show version")
+        self.assertTrue(self.window.clear_commands_button.isEnabled())
+
+    def test_clear_devices_preserves_other_inputs_and_results(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        row_count = self.window.device_table.rowCount()
+        self.window._set_cell(0, 4, "/tmp/existing-device-output.txt")
+        result_marker = object()
+        self.window._batch_result = result_marker
+        username = self.window.username_edit.text()
+        password = self.window.password_edit.text()
+        device_type = self.window.device_type_combo.currentText()
+        output_folder = self.window.output_edit.text()
+
+        self.window.clear_devices_button.click()
+
+        self.assertEqual(self.window.inventory_text_edit.toPlainText(), "")
+        self.assertFalse(self.window.clear_devices_button.isEnabled())
+        self.assertIsNone(self.window._prepared)
+        self.assertFalse(self.window.run_button.isEnabled())
+        self.assertEqual(self.window.device_table.rowCount(), row_count)
+        self.assertEqual(
+            self.window.device_table.item(0, 4).text(),
+            "/tmp/existing-device-output.txt",
+        )
+        self.assertIs(self.window._batch_result, result_marker)
+        self.assertEqual(self.window.username_edit.text(), username)
+        self.assertEqual(self.window.password_edit.text(), password)
+        self.assertEqual(self.window.device_type_combo.currentText(), device_type)
+        self.assertEqual(self.window.output_edit.text(), output_folder)
+
+    def test_clear_commands_clears_both_and_preserves_devices_and_results(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        devices = self.window.inventory_text_edit.toPlainText()
+        row_count = self.window.device_table.rowCount()
+        self.window._set_cell(0, 4, "/tmp/existing-command-output.txt")
+        result_marker = object()
+        self.window._batch_result = result_marker
+
+        self.window.clear_commands_button.click()
+
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "")
+        self.assertEqual(self.window.config_commands_edit.toPlainText(), "")
+        self.assertFalse(self.window.clear_commands_button.isEnabled())
+        self.assertEqual(self.window.inventory_text_edit.toPlainText(), devices)
+        self.assertIsNone(self.window._prepared)
+        self.assertFalse(self.window.run_button.isEnabled())
+        self.assertEqual(self.window.device_table.rowCount(), row_count)
+        self.assertEqual(
+            self.window.device_table.item(0, 4).text(),
+            "/tmp/existing-command-output.txt",
+        )
+        self.assertIs(self.window._batch_result, result_marker)
 
     def test_results_table_is_beside_the_settings_panel(self):
         splitter = self.window.main_splitter
@@ -313,11 +412,29 @@ class MainWindowTests(unittest.TestCase):
             self.window.config_commands_edit.toPlainText(),
             "interface loopback 1",
         )
+        self.assertTrue(self.window.clear_commands_button.isEnabled())
+
+    def test_importing_devices_enables_clear_devices(self):
+        device_file = self.base / "devices.txt"
+        device_file.write_text("192.0.2.1\n192.0.2.2\n", encoding="utf-8")
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(device_file), "Text files (*.txt)"),
+        ):
+            self.window._import_inventory()
+
+        self.assertEqual(
+            self.window.inventory_text_edit.toPlainText(),
+            "192.0.2.1\n192.0.2.2\n",
+        )
+        self.assertTrue(self.window.clear_devices_button.isEnabled())
 
     def test_exporting_devices_writes_the_devices_text(self):
         export_file = self.base / "exported-devices.txt"
         self.window.inventory_text_edit.setPlainText(
-            "# Core switches\n192.0.2.1\nswitch-2.example.test"
+            "# Core switches\n192.0.2.1\n192.0.2.2"
         )
 
         with patch.object(
@@ -329,7 +446,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertEqual(
             export_file.read_text(encoding="utf-8"),
-            "# Core switches\n192.0.2.1\nswitch-2.example.test",
+            "# Core switches\n192.0.2.1\n192.0.2.2",
         )
         self.assertEqual(self.window._last_inventory_import, str(export_file))
 
@@ -385,6 +502,71 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(self.window._running)
         self.assertIsNone(self.window._thread)
+
+    def test_connection_test_does_not_require_command_text(self):
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.username_edit.setText("admin")
+        self.window.password_edit.setText("secret")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+        self.window.device_type_combo.setCurrentText("cisco_ios")
+
+        with patch.object(self.window, "_start_worker") as start_worker:
+            self.window.start_connection_test()
+
+        start_worker.assert_called_once()
+        prepared = start_worker.call_args.args[0]
+        self.assertEqual(prepared.commands, ())
+        self.assertEqual(start_worker.call_args.kwargs["operation"], "connection_test")
+        self.assertEqual(self.window.device_table.rowCount(), 1)
+        self.assertEqual(
+            self.window.device_table.horizontalHeaderItem(2).text(),
+            "Stage / Line",
+        )
+
+    def test_connection_progress_updates_stage_result_and_output(self):
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.window.username_edit.setText("admin")
+        self.window.password_edit.setText("secret")
+        self.window.output_edit.setText(str(self.base / "outputs"))
+        request = self.window._request_from_inputs(include_commands=False)
+        prepared = runner.prepare_connection_test(
+            request,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        self.window._populate_devices(prepared, operation="connection_test")
+        self.window._operation = "connection_test"
+        diagnostic = self.base / "192.0.2.1.txt"
+        diagnostic.write_text("connection test", encoding="utf-8")
+
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_status",
+                address="192.0.2.1",
+                status="detecting prompt",
+                section="Prompt detection",
+            )
+        )
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_finished",
+                address="192.0.2.1",
+                index=1,
+                total=1,
+                status="success",
+                section="Complete",
+                message="SSH connection test passed",
+                transcript_file=str(diagnostic),
+            )
+        )
+
+        row = self.window._rows["192.0.2.1"]
+        self.assertEqual(self.window.device_table.item(row, 1).text(), "Passed")
+        self.assertEqual(self.window.device_table.item(row, 2).text(), "Complete")
+        self.assertEqual(
+            self.window.device_table.item(row, 3).text(),
+            "SSH connection test passed",
+        )
+        self.assertEqual(self.window.device_table.item(row, 4).text(), str(diagnostic))
 
     def test_progress_event_never_requires_command_text(self):
         self.populate_valid_inputs()
@@ -474,7 +656,7 @@ class MainWindowTests(unittest.TestCase):
         row = self.window._rows["192.0.2.1"]
         full_error = (
             "NetmikoTimeoutException: TCP connection to device failed.\n"
-            "Verify the hostname, port, and network reachability."
+            "Verify the IP address, port, and network reachability."
         )
         self.window._set_cell(row, 1, "Failed")
         self.window._set_cell(row, 3, full_error)

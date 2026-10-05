@@ -21,12 +21,12 @@ class CommandRunnerTests(unittest.TestCase):
             device_type=device_type,
         )
 
-    def test_inventory_accepts_hostnames_normalises_ips_and_deduplicates(self):
+    def test_inventory_accepts_only_ips_normalises_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as directory:
             inventory = Path(directory) / "devices.txt"
             inventory.write_text(
                 "# comment\n192.0.2.1\n192.0.2.1\n2001:0db8::1\n"
-                "Switch-A.Example.net\nswitch-a.example.net\nbad host\n",
+                "10.2.0.44a\nswitch-a.example.net\nbad host\n",
                 encoding="utf-8",
             )
             entries = runner.read_device_entries(inventory)
@@ -36,7 +36,8 @@ class CommandRunnerTests(unittest.TestCase):
             [
                 ("192.0.2.1", False),
                 ("2001:db8::1", False),
-                ("switch-a.example.net", False),
+                ("10.2.0.44a", True),
+                ("switch-a.example.net", True),
                 ("bad host", True),
             ],
         )
@@ -150,7 +151,7 @@ class CommandRunnerTests(unittest.TestCase):
         netmiko = types.SimpleNamespace(ConnectHandler=Mock(return_value=connection))
 
         result = runner.execute_device(
-            "router.example.net",
+            "192.0.2.50",
             self.settings("generic_termserver"),
             [runner.Command("exec", "run restricted task", 2)],
             runner.compile_failure_patterns("generic_termserver", ["policy denied"]),
@@ -194,7 +195,7 @@ class CommandRunnerTests(unittest.TestCase):
             base = Path(directory)
             devices = base / "devices.txt"
             commands = base / "commands.txt"
-            devices.write_text("router.example.net\n", encoding="utf-8")
+            devices.write_text("192.0.2.50\n", encoding="utf-8")
             commands.write_text("[exec]\nshow version\n", encoding="utf-8")
             with patch.object(runner, "_load_netmiko", side_effect=AssertionError("not loaded")), patch.dict(
                 os.environ, {}, clear=True
@@ -338,6 +339,144 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertIn("first command", result.transcript)
         self.assertNotIn("second command", result.transcript)
         connection.exit_config_mode.assert_called_once_with()
+        connection.disconnect.assert_called_once_with()
+
+    def test_connection_test_needs_no_commands_and_writes_safe_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            request = runner.RunRequest(
+                inventory=None,
+                command_file=None,
+                device_type="cisco_ios",
+                output_dir=base / "outputs",
+                env_file=None,
+                apply=True,
+                inventory_text="192.0.2.1",
+            )
+            prepared = runner.prepare_connection_test(
+                request,
+                environment={
+                    "SSH_USERNAME": "admin",
+                    "SSH_PASSWORD": "ssh-secret",
+                    "ENABLE_SECRET": "enable-secret",
+                },
+            )
+            connection = Mock()
+            connection.find_prompt.return_value = "switch#"
+            connection.enable.return_value = "enabled with enable-secret"
+            events = []
+
+            result = runner.run_connection_test(
+                prepared,
+                progress_callback=events.append,
+                netmiko_module=types.SimpleNamespace(
+                    ConnectHandler=Mock(return_value=connection)
+                ),
+            )
+            diagnostic = Path(result.results[0].transcript_file).read_text(
+                encoding="utf-8"
+            )
+            with result.summary_path.open(encoding="utf-8", newline="") as summary:
+                summary_rows = list(csv.DictReader(summary))
+
+        self.assertEqual(prepared.commands, ())
+        self.assertEqual(result.successes, 1)
+        self.assertTrue(result.run_directory.name.startswith("connection_test_"))
+        self.assertIn("SSH connection test passed", diagnostic)
+        self.assertIn("switch#", diagnostic)
+        self.assertNotIn("ssh-secret", diagnostic)
+        self.assertNotIn("enable-secret", diagnostic)
+        self.assertEqual(summary_rows[0]["status"], "success")
+        connection.find_prompt.assert_called_once_with()
+        connection.enable.assert_called_once_with()
+        connection.disconnect.assert_called_once_with()
+        connection.send_command.assert_not_called()
+        connection.send_command_timing.assert_not_called()
+        self.assertEqual(events[0].kind, "run_started")
+        self.assertEqual(events[-1].kind, "run_finished")
+        finished = next(event for event in events if event.kind == "device_finished")
+        self.assertEqual(finished.section, "Complete")
+        self.assertEqual(finished.message, "SSH connection test passed")
+
+    def test_connection_test_reports_stage_and_continues_after_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            request = runner.RunRequest(
+                inventory=None,
+                command_file=None,
+                device_type="cisco_ios",
+                output_dir=base / "outputs",
+                env_file=None,
+                apply=True,
+                inventory_text="192.0.2.10\n192.0.2.11",
+            )
+            prepared = runner.prepare_connection_test(
+                request,
+                environment={
+                    "SSH_USERNAME": "admin",
+                    "SSH_PASSWORD": "ssh-secret",
+                },
+            )
+            successful_connection = Mock()
+            successful_connection.find_prompt.return_value = "switch>"
+            netmiko = types.SimpleNamespace(
+                ConnectHandler=Mock(
+                    side_effect=[
+                        RuntimeError("admin login ssh-secret rejected"),
+                        successful_connection,
+                    ]
+                )
+            )
+
+            result = runner.run_connection_test(prepared, netmiko_module=netmiko)
+            failed_diagnostic = Path(result.results[0].transcript_file).read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual([item.status for item in result.results], ["failed", "success"])
+        self.assertEqual(result.results[0].failed_section, "SSH connection")
+        self.assertIn(
+            "RuntimeError: [redacted] login [redacted] rejected",
+            failed_diagnostic,
+        )
+        self.assertNotIn("admin", failed_diagnostic)
+        self.assertNotIn("ssh-secret", failed_diagnostic)
+        successful_connection.disconnect.assert_called_once_with()
+
+    def test_connection_test_cancellation_disconnects_and_stops_later_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            request = runner.RunRequest(
+                inventory=None,
+                command_file=None,
+                device_type="cisco_ios",
+                output_dir=base / "outputs",
+                env_file=None,
+                apply=True,
+                inventory_text="192.0.2.1\n192.0.2.2",
+            )
+            prepared = runner.prepare_connection_test(
+                request,
+                environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+            )
+            token = runner.CancellationToken()
+            connection = Mock()
+            connection.find_prompt.return_value = "switch>"
+
+            def cancel_after_prompt_started(event):
+                if event.kind == "device_status" and event.section == "Prompt detection":
+                    token.cancel()
+
+            result = runner.run_connection_test(
+                prepared,
+                progress_callback=cancel_after_prompt_started,
+                cancellation_token=token,
+                netmiko_module=types.SimpleNamespace(
+                    ConnectHandler=Mock(return_value=connection)
+                ),
+            )
+
+        self.assertEqual([item.status for item in result.results], ["cancelled", "cancelled"])
         connection.disconnect.assert_called_once_with()
 
     def test_run_directory_uses_a_human_readable_timestamp(self):

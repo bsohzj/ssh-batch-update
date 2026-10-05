@@ -145,11 +145,6 @@ class CancellationToken:
             raise RunCancelled("cancelled by user")
 
 
-HOSTNAME_RE = re.compile(
-    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
-)
-
 DEFAULT_FAILURE_PATTERNS = {
     "cisco": (
         r"^\s*%\s*(?:Invalid input|Incomplete command|Ambiguous command|Error)",
@@ -239,18 +234,16 @@ def load_settings(
     )
 
 
-# Validate an IP address or hostname and return its canonical form.
+# Validate an IPv4 or IPv6 address and return its canonical form.
 def _normalise_address(value: str) -> str:
 
     try:
         return str(ipaddress.ip_address(value))
-    except ValueError:
-        if HOSTNAME_RE.fullmatch(value):
-            return value.lower()
-    raise ValueError("not an IP address or hostname")
+    except ValueError as exc:
+        raise ValueError("not an IP address") from exc
 
 
-# Parse and de-duplicate IP addresses or DNS hostnames from inventory text.
+# Parse and de-duplicate IPv4 and IPv6 addresses from inventory text.
 def parse_device_entries(text: str) -> list[DeviceEntry]:
 
     entries: list[DeviceEntry] = []
@@ -266,7 +259,7 @@ def parse_device_entries(text: str) -> list[DeviceEntry]:
             if key not in seen:
                 seen.add(key)
                 entries.append(
-                    DeviceEntry(value, f"invalid IP address or hostname on line {line_number}")
+                    DeviceEntry(value, f"invalid IP address on line {line_number}")
                 )
             continue
         key = ("valid", address)
@@ -278,7 +271,7 @@ def parse_device_entries(text: str) -> list[DeviceEntry]:
     return entries
 
 
-# Read and de-duplicate IP addresses or DNS hostnames from an inventory file.
+# Read and de-duplicate IPv4 and IPv6 addresses from an inventory file.
 def read_device_entries(path: Path) -> list[DeviceEntry]:
 
     return parse_device_entries(path.read_text(encoding="utf-8"))
@@ -355,11 +348,16 @@ def compile_failure_patterns(device_type: str, custom_patterns: Iterable[str]) -
 # Format an exception for reports while removing known connection secrets.
 def _safe_error(exc: Exception, settings: Settings) -> str:
 
-    message = str(exc) or exc.__class__.__name__
-    for secret in (settings.password, settings.enable_secret):
+    message = _redact_secrets(str(exc) or exc.__class__.__name__, settings)
+    return f"{exc.__class__.__name__}: {message}"
+
+
+def _redact_secrets(value: Any, settings: Settings) -> str:
+    message = str(value)
+    for secret in (settings.username, settings.password, settings.enable_secret):
         if secret:
             message = message.replace(secret, "[redacted]")
-    return f"{exc.__class__.__name__}: {message}"
+    return message
 
 
 # Add an operation label and its device response to a transcript buffer.
@@ -379,6 +377,20 @@ def _rejected(response: Any, patterns: Iterable[re.Pattern[str]]) -> Optional[st
         if pattern.search(text):
             return pattern.pattern
     return None
+
+
+def _connection_parameters(address: str, settings: Settings) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "device_type": settings.device_type,
+        "host": address,
+        "username": settings.username,
+        "password": settings.password,
+        "port": settings.port,
+        "timeout": settings.timeout,
+    }
+    if settings.enable_secret:
+        parameters["secret"] = settings.enable_secret
+    return parameters
 
 
 # Execute commands for one device and return its complete transcript and result.
@@ -401,21 +413,11 @@ def execute_device(
     try:
         if cancellation_token:
             cancellation_token.raise_if_cancelled()
-        parameters: dict[str, Any] = {
-            "device_type": settings.device_type,
-            "host": address,
-            "username": settings.username,
-            "password": settings.password,
-            "port": settings.port,
-            "timeout": settings.timeout,
-        }
-        if settings.enable_secret:
-            parameters["secret"] = settings.enable_secret
         if progress:
             progress(f"CONNECTING {address}")
         if event_callback:
             event_callback(ProgressEvent("device_status", address=address, status="connecting"))
-        connection = netmiko_module.ConnectHandler(**parameters)
+        connection = netmiko_module.ConnectHandler(**_connection_parameters(address, settings))
         if cancellation_token:
             cancellation_token.raise_if_cancelled()
         if settings.enable_secret:
@@ -527,6 +529,124 @@ def execute_device(
     return result
 
 
+# Test SSH login, prompt detection, and optional enable mode without running user commands.
+def test_device_connection(
+    address: str,
+    settings: Settings,
+    netmiko_module: Any,
+    event_callback: Optional[Callable[[ProgressEvent], None]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
+) -> DeviceResult:
+
+    transcript: list[str] = [
+        "Connection test\n",
+        f"Device: {address}\n",
+        f"Device type: {settings.device_type}\n",
+        f"SSH port: {settings.port}\n\n",
+    ]
+    connection = None
+    stage = "SSH connection"
+    result: Optional[DeviceResult] = None
+    try:
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
+        if event_callback:
+            event_callback(
+                ProgressEvent(
+                    "device_status",
+                    address=address,
+                    status="connecting",
+                    section=stage,
+                )
+            )
+        connection = netmiko_module.ConnectHandler(
+            **_connection_parameters(address, settings)
+        )
+        _append_transcript(transcript, "=== SSH connection ===\n", "Connected successfully.")
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
+
+        stage = "Prompt detection"
+        if event_callback:
+            event_callback(
+                ProgressEvent(
+                    "device_status",
+                    address=address,
+                    status="detecting prompt",
+                    section=stage,
+                )
+            )
+        prompt = _redact_secrets(connection.find_prompt(), settings)
+        _append_transcript(transcript, "=== Prompt detection ===\n", prompt)
+        if cancellation_token:
+            cancellation_token.raise_if_cancelled()
+
+        if settings.enable_secret:
+            stage = "Enable mode"
+            if event_callback:
+                event_callback(
+                    ProgressEvent(
+                        "device_status",
+                        address=address,
+                        status="entering enable mode",
+                        section=stage,
+                    )
+                )
+            _append_transcript(
+                transcript,
+                "=== Enable mode ===\n",
+                _redact_secrets(connection.enable(), settings),
+            )
+            if cancellation_token:
+                cancellation_token.raise_if_cancelled()
+
+        stage = "Complete"
+        _append_transcript(
+            transcript,
+            "=== Result ===\n",
+            "SSH connection test passed.",
+        )
+        result = DeviceResult(address=address, status="success", transcript="")
+    except RunCancelled as exc:
+        error = str(exc)
+        _append_transcript(transcript, "=== Cancellation ===\n", error)
+        result = DeviceResult(
+            address=address,
+            status="cancelled",
+            transcript="",
+            failed_section=stage,
+            error=error,
+        )
+    except Exception as exc:
+        error = _safe_error(exc, settings)
+        _append_transcript(transcript, f"=== Error during {stage} ===\n", error)
+        result = DeviceResult(
+            address=address,
+            status="failed",
+            transcript="",
+            failed_section=stage,
+            error=error,
+        )
+    finally:
+        if connection is not None:
+            try:
+                if event_callback:
+                    event_callback(
+                        ProgressEvent(
+                            "device_status",
+                            address=address,
+                            status="disconnecting",
+                            section="Disconnecting",
+                        )
+                    )
+                connection.disconnect()
+            except Exception:
+                pass
+    assert result is not None
+    result.transcript = "".join(transcript)
+    return result
+
+
 # Convert a device address into a filename that is safe on common filesystems.
 def _safe_filename(address: str) -> str:
 
@@ -554,12 +674,12 @@ def _atomic_write(path: Path, content: str) -> None:
             temporary_path.unlink()
 
 
-# Create a unique, private timestamped directory for one apply run.
-def create_run_directory(output_dir: Path) -> Path:
+# Create a unique, private timestamped output directory.
+def create_run_directory(output_dir: Path, prefix: str = "run") -> Path:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(output_dir, 0o700)
-    stem = f"run_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    stem = f"{prefix}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     for suffix in range(1000):
         candidate = output_dir / (stem if suffix == 0 else f"{stem}_{suffix}")
         try:
@@ -654,6 +774,25 @@ def prepare_run(
     if require_credentials:
         settings = load_settings(device_type, request.env_file, environment=environment)
     return PreparedRun(request, entries, commands, patterns, settings)
+
+
+def prepare_connection_test(
+    request: RunRequest,
+    environment: Optional[Mapping[str, str]] = None,
+) -> PreparedRun:
+    """Validate connection inputs without requiring or parsing command text."""
+
+    device_type = request.device_type.strip()
+    if not device_type:
+        raise ConfigurationError("device type is required")
+    if request.inventory_text is not None:
+        entries = tuple(parse_device_entries(request.inventory_text))
+    elif request.inventory is not None:
+        entries = tuple(read_device_entries(request.inventory))
+    else:
+        raise ConfigurationError("inventory file or inventory text is required")
+    settings = load_settings(device_type, request.env_file, environment=environment)
+    return PreparedRun(request, entries, (), (), settings)
 
 
 # Execute a prepared run sequentially, emitting structured progress events.
@@ -751,13 +890,113 @@ def run_batch(
     return batch_result
 
 
+# Test connections sequentially and write sanitized diagnostics and a summary.
+def run_connection_test(
+    prepared: PreparedRun,
+    progress_callback: Optional[Callable[[ProgressEvent], None]] = None,
+    cancellation_token: Optional[CancellationToken] = None,
+    netmiko_module: Any = None,
+) -> BatchResult:
+
+    if prepared.settings is None:
+        raise ConfigurationError("connection settings were not prepared")
+
+    token = cancellation_token or CancellationToken()
+    run_directory = create_run_directory(
+        prepared.request.output_dir,
+        prefix="connection_test",
+    )
+    valid_entries = prepared.valid_entries
+    if valid_entries and netmiko_module is None:
+        netmiko_module = _load_netmiko()
+
+    total = len(prepared.entries)
+    results: list[DeviceResult] = []
+    if progress_callback:
+        progress_callback(
+            ProgressEvent("run_started", total=total, status="testing")
+        )
+
+    for index, entry in enumerate(prepared.entries, 1):
+        if progress_callback:
+            progress_callback(
+                ProgressEvent(
+                    "device_started",
+                    address=entry.address,
+                    index=index,
+                    total=total,
+                    status="starting",
+                )
+            )
+
+        if token.cancelled:
+            result = DeviceResult(
+                entry.address,
+                "cancelled",
+                "",
+                failed_section="Not started",
+                error="cancelled before connection test started",
+            )
+        elif entry.error:
+            result = DeviceResult(
+                entry.address,
+                "failed",
+                "",
+                failed_section="Input validation",
+                error=entry.error,
+            )
+        else:
+            result = test_device_connection(
+                entry.address,
+                prepared.settings,
+                netmiko_module,
+                event_callback=progress_callback,
+                cancellation_token=token,
+            )
+            transcript_path = run_directory / f"{_safe_filename(entry.address)}.txt"
+            _atomic_write(transcript_path, result.transcript)
+            result.transcript_file = str(transcript_path)
+
+        results.append(result)
+        if progress_callback:
+            progress_callback(
+                ProgressEvent(
+                    "device_finished",
+                    address=entry.address,
+                    index=index,
+                    total=total,
+                    status=result.status,
+                    message=result.error or "SSH connection test passed",
+                    transcript_file=result.transcript_file,
+                    section=result.failed_section or "Complete",
+                )
+            )
+
+    summary_path = run_directory / "summary.csv"
+    write_summary(summary_path, results)
+    batch_result = BatchResult(tuple(results), run_directory, summary_path)
+    if progress_callback:
+        progress_callback(
+            ProgressEvent(
+                "run_finished",
+                total=total,
+                status="cancelled" if batch_result.cancelled else "finished",
+                message=(
+                    f"{batch_result.successes} passed, {batch_result.failures} failed, "
+                    f"{batch_result.cancelled} cancelled"
+                ),
+            )
+        )
+    return batch_result
+
+
 # Create the command-line interface and its defaults.
 def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         description="Run [exec] and [config] command files against devices over SSH."
     )
-    parser.add_argument("inventory", type=Path, help="one IP address or hostname per line")
+    parser.add_argument("inventory", type=Path, help="one IPv4 or IPv6 address per line")
     parser.add_argument("command_file", type=Path, help="ordered [exec]/[config] command file")
     parser.add_argument("--device-type", required=True, help="Netmiko device type, e.g. cisco_ios or huawei")
     parser.add_argument("--apply", action="store_true", help="connect and run commands (otherwise dry-run)")

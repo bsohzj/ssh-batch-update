@@ -24,17 +24,22 @@ python gui.py
 ```
 
 The GUI provides editable devices, exec-command, and config-command text
-boxes. Devices can be imported from or exported to a plain text file. One
-shared command import loads an existing sectioned `[exec]`/`[config]` file into
-both command boxes, and **Export Commands** saves both boxes back to that same
-compatible format. Exec commands always run first, followed by config commands.
+boxes. Devices can be imported from or exported to a plain text file, and
+**Clear Devices** empties the device input. One shared command import loads an
+existing sectioned `[exec]`/`[config]` file into both command boxes, **Export
+Commands** saves both boxes back to that same compatible format, and **Clear
+Commands** empties both boxes. Exec commands always run first, followed by
+config commands.
 The username and masked password can be entered directly or loaded from a saved
 credential profile. Profiles reference user-managed `.env` files and the last
 selected valid profile reloads when the app reopens. Only the friendly profile
 name and file path are saved in GUI settings; credential values are never
-copied there. Validate Files performs no SSH connections. Run Live requires
-confirmation and displays per-device progress without displaying literal
-commands. Reports default to
+copied there. **Validate Input** performs no SSH connections. **Test
+Connections** logs in to each valid IP, detects the prompt, optionally verifies
+enable mode, and disconnects without running either command box. Its status,
+stage, full error, and diagnostic file appear in the same results table used by
+live runs. **Run Live** requires confirmation and displays per-device progress
+without displaying literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
 Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
@@ -62,8 +67,8 @@ permissions, and never commit them to Git.
 
 ## Use
 
-Put one IP address or DNS hostname per line in an inventory file. Blank lines
-and `#` comments are ignored. Then create a command file using `[exec]` and
+Put one IPv4 or IPv6 address per line in an inventory file. Hostnames are not
+accepted. Blank lines and `#` comments are ignored. Then create a command file using `[exec]` and
 `[config]` headers. Sections may repeat and run in file order:
 
 ```text
@@ -111,6 +116,11 @@ with remaining devices. It does not roll back partial configurations. While it
 runs, the console shows the current device, section, source line, and command.
 Those progress messages include literal command-file passwords, so do not share
 or redirect that output where others can read it.
+
+Each GUI connection test creates a separate owner-only
+`connection_test_YYYY-MM-DD_HH-MM-SS` directory containing sanitized per-device
+diagnostics and `summary.csv`. Credentials, enable secrets, and command-box
+contents are not written to connection-test diagnostics.
 
 ## Build the internal macOS app
 
