@@ -474,6 +474,9 @@ class MainWindow(QMainWindow):
         inventory_button.clicked.connect(self._import_inventory)
         inventory_export_button = QPushButton("Export Devices")
         inventory_export_button.clicked.connect(self._export_inventory)
+        self.clear_devices_button = QPushButton("Clear Devices")
+        self.clear_devices_button.setEnabled(False)
+        self.clear_devices_button.clicked.connect(self._clear_devices)
         self.test_connections_button = QPushButton("Test Connections")
         self.test_connections_button.setToolTip(
             "Log in, detect the prompt, optionally test enable mode, and disconnect. "
@@ -485,6 +488,7 @@ class MainWindow(QMainWindow):
         inventory_buttons_layout.setContentsMargins(0, 0, 0, 0)
         inventory_buttons_layout.addWidget(inventory_button)
         inventory_buttons_layout.addWidget(inventory_export_button)
+        inventory_buttons_layout.addWidget(self.clear_devices_button)
         inventory_buttons_layout.addWidget(self.test_connections_button)
         inventory_buttons_layout.addStretch()
         inventory_container = QWidget()
@@ -504,12 +508,17 @@ class MainWindow(QMainWindow):
         import_sectioned_button.clicked.connect(self._import_sectioned_commands)
         export_sectioned_button = QPushButton("Export Commands")
         export_sectioned_button.clicked.connect(self._export_sectioned_commands)
+        self.clear_commands_button = QPushButton("Clear Commands")
+        self.clear_commands_button.setEnabled(False)
+        self.clear_commands_button.clicked.connect(self._clear_commands)
         command_file_buttons = QWidget()
-        command_file_buttons_layout = QHBoxLayout(command_file_buttons)
+        command_file_buttons_layout = QGridLayout(command_file_buttons)
         command_file_buttons_layout.setContentsMargins(0, 0, 0, 0)
-        command_file_buttons_layout.addWidget(import_sectioned_button)
-        command_file_buttons_layout.addWidget(export_sectioned_button)
-        command_file_buttons_layout.addStretch()
+        command_file_buttons_layout.addWidget(import_sectioned_button, 0, 0, 1, 2)
+        command_file_buttons_layout.addWidget(export_sectioned_button, 1, 0)
+        command_file_buttons_layout.addWidget(self.clear_commands_button, 1, 1)
+        command_file_buttons_layout.setColumnStretch(0, 1)
+        command_file_buttons_layout.setColumnStretch(1, 1)
 
         form.addRow("Exec Commands", self.exec_commands_edit)
         form.addRow("Config Commands", self.config_commands_edit)
@@ -623,8 +632,11 @@ class MainWindow(QMainWindow):
         self.password_edit.textChanged.connect(self._credentials_edited)
         self.output_edit.textChanged.connect(self.invalidate_validation)
         self.inventory_text_edit.textChanged.connect(self.invalidate_validation)
+        self.inventory_text_edit.textChanged.connect(self._update_clear_devices_button)
         self.exec_commands_edit.textChanged.connect(self.invalidate_validation)
+        self.exec_commands_edit.textChanged.connect(self._update_clear_commands_button)
         self.config_commands_edit.textChanged.connect(self.invalidate_validation)
+        self.config_commands_edit.textChanged.connect(self._update_clear_commands_button)
         self.device_type_combo.currentTextChanged.connect(self.invalidate_validation)
         self.profile_combo.activated.connect(self._profile_activated)
 
@@ -789,6 +801,30 @@ class MainWindow(QMainWindow):
         self.run_button.setEnabled(validated and not self._running)
         self.test_connections_button.setEnabled(not self._running)
         self.cancel_button.setEnabled(self._running)
+
+    @Slot()
+    def _clear_devices(self) -> None:
+        self.inventory_text_edit.clear()
+
+    @Slot()
+    def _clear_commands(self) -> None:
+        self.exec_commands_edit.clear()
+        self.config_commands_edit.clear()
+
+    @Slot()
+    def _update_clear_devices_button(self) -> None:
+        self.clear_devices_button.setEnabled(
+            bool(self.inventory_text_edit.toPlainText())
+        )
+
+    @Slot()
+    def _update_clear_commands_button(self) -> None:
+        self.clear_commands_button.setEnabled(
+            bool(
+                self.exec_commands_edit.toPlainText()
+                or self.config_commands_edit.toPlainText()
+            )
+        )
 
     def _request_from_inputs(self, include_commands: bool = True) -> RunRequest:
         required = {

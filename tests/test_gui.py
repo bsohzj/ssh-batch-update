@@ -86,6 +86,78 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertFalse(self.window.run_button.isEnabled())
 
+    def test_clear_buttons_follow_their_text_content(self):
+        self.assertFalse(self.window.clear_devices_button.isEnabled())
+        self.assertFalse(self.window.clear_commands_button.isEnabled())
+        self.assertEqual(self.window.clear_devices_button.styleSheet(), "")
+        self.assertEqual(self.window.clear_commands_button.styleSheet(), "")
+
+        self.window.inventory_text_edit.setPlainText("192.0.2.1")
+        self.assertTrue(self.window.clear_devices_button.isEnabled())
+        self.window.inventory_text_edit.clear()
+        self.assertFalse(self.window.clear_devices_button.isEnabled())
+
+        self.window.config_commands_edit.setPlainText("interface loopback 1")
+        self.assertTrue(self.window.clear_commands_button.isEnabled())
+        self.window.config_commands_edit.clear()
+        self.assertFalse(self.window.clear_commands_button.isEnabled())
+
+        self.window.exec_commands_edit.setPlainText("show version")
+        self.assertTrue(self.window.clear_commands_button.isEnabled())
+
+    def test_clear_devices_preserves_other_inputs_and_results(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        row_count = self.window.device_table.rowCount()
+        self.window._set_cell(0, 4, "/tmp/existing-device-output.txt")
+        result_marker = object()
+        self.window._batch_result = result_marker
+        username = self.window.username_edit.text()
+        password = self.window.password_edit.text()
+        device_type = self.window.device_type_combo.currentText()
+        output_folder = self.window.output_edit.text()
+
+        self.window.clear_devices_button.click()
+
+        self.assertEqual(self.window.inventory_text_edit.toPlainText(), "")
+        self.assertFalse(self.window.clear_devices_button.isEnabled())
+        self.assertIsNone(self.window._prepared)
+        self.assertFalse(self.window.run_button.isEnabled())
+        self.assertEqual(self.window.device_table.rowCount(), row_count)
+        self.assertEqual(
+            self.window.device_table.item(0, 4).text(),
+            "/tmp/existing-device-output.txt",
+        )
+        self.assertIs(self.window._batch_result, result_marker)
+        self.assertEqual(self.window.username_edit.text(), username)
+        self.assertEqual(self.window.password_edit.text(), password)
+        self.assertEqual(self.window.device_type_combo.currentText(), device_type)
+        self.assertEqual(self.window.output_edit.text(), output_folder)
+
+    def test_clear_commands_clears_both_and_preserves_devices_and_results(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        devices = self.window.inventory_text_edit.toPlainText()
+        row_count = self.window.device_table.rowCount()
+        self.window._set_cell(0, 4, "/tmp/existing-command-output.txt")
+        result_marker = object()
+        self.window._batch_result = result_marker
+
+        self.window.clear_commands_button.click()
+
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "")
+        self.assertEqual(self.window.config_commands_edit.toPlainText(), "")
+        self.assertFalse(self.window.clear_commands_button.isEnabled())
+        self.assertEqual(self.window.inventory_text_edit.toPlainText(), devices)
+        self.assertIsNone(self.window._prepared)
+        self.assertFalse(self.window.run_button.isEnabled())
+        self.assertEqual(self.window.device_table.rowCount(), row_count)
+        self.assertEqual(
+            self.window.device_table.item(0, 4).text(),
+            "/tmp/existing-command-output.txt",
+        )
+        self.assertIs(self.window._batch_result, result_marker)
+
     def test_results_table_is_beside_the_settings_panel(self):
         splitter = self.window.main_splitter
 
@@ -340,6 +412,24 @@ class MainWindowTests(unittest.TestCase):
             self.window.config_commands_edit.toPlainText(),
             "interface loopback 1",
         )
+        self.assertTrue(self.window.clear_commands_button.isEnabled())
+
+    def test_importing_devices_enables_clear_devices(self):
+        device_file = self.base / "devices.txt"
+        device_file.write_text("192.0.2.1\n192.0.2.2\n", encoding="utf-8")
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(device_file), "Text files (*.txt)"),
+        ):
+            self.window._import_inventory()
+
+        self.assertEqual(
+            self.window.inventory_text_edit.toPlainText(),
+            "192.0.2.1\n192.0.2.2\n",
+        )
+        self.assertTrue(self.window.clear_devices_button.isEnabled())
 
     def test_exporting_devices_writes_the_devices_text(self):
         export_file = self.base / "exported-devices.txt"

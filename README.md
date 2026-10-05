@@ -24,10 +24,12 @@ python gui.py
 ```
 
 The GUI provides editable devices, exec-command, and config-command text
-boxes. Devices can be imported from or exported to a plain text file. One
-shared command import loads an existing sectioned `[exec]`/`[config]` file into
-both command boxes, and **Export Commands** saves both boxes back to that same
-compatible format. Exec commands always run first, followed by config commands.
+boxes. Devices can be imported from or exported to a plain text file, and
+**Clear Devices** empties the device input. One shared command import loads an
+existing sectioned `[exec]`/`[config]` file into both command boxes, **Export
+Commands** saves both boxes back to that same compatible format, and **Clear
+Commands** empties both boxes. Exec commands always run first, followed by
+config commands.
 The username and masked password can be entered directly or loaded from a saved
 credential profile. Profiles reference user-managed `.env` files and the last
 selected valid profile reloads when the app reopens. Only the friendly profile
