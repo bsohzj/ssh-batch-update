@@ -38,7 +38,7 @@ copied there. **Validate Input** performs no SSH connections. **Test
 Connections** logs in to each valid IP, detects the prompt, optionally verifies
 enable mode, and disconnects without running either command box. Its status,
 stage, full error, and diagnostic file appear in the same results table used by
-live runs. **Run Live** and **Schedule Batch…** validate and confirm a complete
+live runs. **Run Live** and **Schedule Batch** validate and confirm a complete
 batch snapshot before it can make changes. Per-device
 progress never displays literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
@@ -71,14 +71,16 @@ permissions, and never commit them to Git.
 The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
-earlier ready work. Use **Schedule Batch…** to select one future local date and
+earlier ready work. Use **Schedule Batch** to select one future local date and
 time. Future jobs do not block ready jobs, and batches scheduled for the same
 time run in the visible queue order.
 
 The **Queue** tab shows order, device and command counts, schedule, status, and
 result. Pending jobs can be moved, edited, rescheduled, retried, or removed.
 Cancelled and completed history entries can also be removed; removing an entry
-never deletes its transcripts, summary, or output directory.
+never deletes its transcripts, summary, or output directory. **Clear Completed**
+removes all successful, partially failed, failed, and cancelled history entries
+at once while leaving running, queued, and scheduled batches untouched.
 Editing loads the encrypted snapshot into the normal form and requires fresh
 validation and confirmation before replacing it. Double-click a queue row to
 open its per-device results. **Pause Queue** stops new batches from starting;

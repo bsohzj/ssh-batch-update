@@ -157,6 +157,28 @@ class BatchQueueTests(unittest.TestCase):
         self.assertIsNone(self.controller.job(cancelled.job_id))
         self.assertNotIn(cancelled.job_id, self.secrets.values)
 
+    def test_clear_completed_preserves_ready_and_scheduled_jobs(self):
+        succeeded = self.add("huawei")
+        cancelled = self.add("cisco_ios")
+        ready = self.add("huawei")
+        scheduled = self.add("cisco_ios", self.now + timedelta(hours=1))
+        self.controller.mark_running(succeeded.job_id)
+        self.controller.mark_terminal(succeeded.job_id, "succeeded", "complete")
+        self.controller.mark_running(cancelled.job_id)
+        self.controller.mark_terminal(cancelled.job_id, "cancelled", "cancelled")
+
+        removed = self.controller.clear_completed()
+
+        self.assertEqual(removed, [succeeded.job_id, cancelled.job_id])
+        self.assertEqual(
+            [job.job_id for job in self.controller.jobs],
+            [ready.job_id, scheduled.job_id],
+        )
+        self.assertEqual(self.controller.job(ready.job_id).status, "ready")
+        self.assertEqual(self.controller.job(scheduled.job_id).status, "scheduled")
+        self.assertIn(ready.job_id, self.secrets.values)
+        self.assertIn(scheduled.job_id, self.secrets.values)
+
     def test_blocked_job_is_skipped_and_retry_requires_explicit_action(self):
         blocked = self.add()
         ready = self.add("cisco_ios")

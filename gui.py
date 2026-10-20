@@ -745,6 +745,8 @@ class MainWindow(QMainWindow):
         self.reschedule_button = QPushButton("Reschedule…")
         self.retry_button = QPushButton("Retry")
         self.remove_batch_button = QPushButton("Remove")
+        self.clear_completed_button = QPushButton("Clear Completed")
+        self.clear_completed_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
         self.move_up_button.clicked.connect(lambda: self.move_selected_batch(-1))
         self.move_down_button.clicked.connect(lambda: self.move_selected_batch(1))
@@ -752,6 +754,7 @@ class MainWindow(QMainWindow):
         self.reschedule_button.clicked.connect(self.reschedule_selected_batch)
         self.retry_button.clicked.connect(self.retry_selected_batch)
         self.remove_batch_button.clicked.connect(self.remove_selected_batch)
+        self.clear_completed_button.clicked.connect(self.clear_completed_batches)
         for index, button in enumerate(
             (
                 self.pause_queue_button,
@@ -761,6 +764,7 @@ class MainWindow(QMainWindow):
                 self.reschedule_button,
                 self.retry_button,
                 self.remove_batch_button,
+                self.clear_completed_button,
             )
         ):
             queue_actions.addWidget(button, index // 4, index % 4)
@@ -1690,6 +1694,9 @@ class MainWindow(QMainWindow):
         self.reschedule_button.setEnabled(editable)
         self.retry_button.setEnabled(bool(job and job.status in {"blocked", "interrupted"}))
         self.remove_batch_button.setEnabled(bool(job and job.status != "running"))
+        self.clear_completed_button.setEnabled(
+            bool(self.queue_controller.completed_jobs())
+        )
 
     @Slot()
     def toggle_queue_pause(self) -> None:
@@ -1883,6 +1890,45 @@ class MainWindow(QMainWindow):
         self._job_progress.pop(job.job_id, None)
         self._selected_job_id = None
         self._refresh_queue_table()
+        self._update_queue_controls()
+
+    @Slot()
+    def clear_completed_batches(self) -> None:
+        completed = self.queue_controller.completed_jobs()
+        if not completed:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear completed runs?",
+            f"Remove {len(completed)} completed run(s) from the queue history?\n\n"
+            "Running, queued, and scheduled batches will remain. Output files, "
+            "transcripts, and summaries will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed_ids = self.queue_controller.clear_completed()
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not clear completed runs", str(exc))
+            return
+        for job_id in removed_ids:
+            self._job_prepared.pop(job_id, None)
+            self._job_results.pop(job_id, None)
+            self._job_rows.pop(job_id, None)
+            self._job_progress.pop(job_id, None)
+        if self._selected_job_id in removed_ids:
+            self._selected_job_id = None
+            self._batch_result = None
+            self.device_table.setRowCount(0)
+            self._rows.clear()
+            self.progress_bar.setValue(0)
+            self.status_label.setText("No batch selected")
+            self.totals_label.setText("0 succeeded, 0 failed, 0 cancelled")
+            self.open_output_button.setEnabled(False)
+            self.open_summary_button.setEnabled(False)
+        self._refresh_queue_table(select_job_id=self._selected_job_id)
         self._update_queue_controls()
 
     @Slot(str)

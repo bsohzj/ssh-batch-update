@@ -179,9 +179,12 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
         self.assertEqual(self.window.queue_table.columnCount(), 8)
-        self.assertEqual(self.window.schedule_button.text(), "Schedule Batch…")
+        self.assertEqual(self.window.schedule_button.text(), "Schedule Batch")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
         self.assertFalse(hasattr(self.window, "queue_button"))
+        self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
+        self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
+        self.assertFalse(self.window.clear_completed_button.isEnabled())
 
     def test_schedule_dialog_displays_date_time_picker(self):
         dialog = gui.ScheduleDialog()
@@ -415,6 +418,41 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertIsNone(self.window.queue_controller.job(job.job_id))
         self.assertEqual(self.window.queue_table.rowCount(), 0)
+
+    def test_clear_completed_button_leaves_future_schedule_untouched(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        completed = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        scheduled = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared),
+            prepared,
+            datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        self.window.queue_controller.mark_running(completed.job_id)
+        self.window.queue_controller.mark_terminal(
+            completed.job_id, "succeeded", "1 succeeded"
+        )
+        self.window._refresh_queue_table(select_job_id=completed.job_id)
+
+        self.assertTrue(self.window.clear_completed_button.isEnabled())
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.clear_completed_button.click()
+
+        self.assertIsNone(self.window.queue_controller.job(completed.job_id))
+        self.assertIsNotNone(self.window.queue_controller.job(scheduled.job_id))
+        self.assertEqual(
+            self.window.queue_controller.job(scheduled.job_id).status, "scheduled"
+        )
+        self.assertEqual(self.window.queue_table.rowCount(), 1)
 
     def _valid_request(self, device_type, address):
         return runner.RunRequest(

@@ -482,6 +482,23 @@ class QueueController:
         self.jobs = [job for job in self.jobs if job.job_id != job_id]
         self.metadata_store.save_all(self.jobs)
 
+    def completed_jobs(self) -> list[QueuedBatch]:
+        """Return terminal history entries that are safe to clear."""
+        return [job for job in self.jobs if job.status in TERMINAL_STATUSES]
+
+    def clear_completed(self) -> list[str]:
+        """Remove terminal history without affecting pending or active work."""
+        completed = self.completed_jobs()
+        completed_ids = [job.job_id for job in completed]
+        for job_id in completed_ids:
+            # Usually already deleted by mark_terminal; retrying also resolves a
+            # previous Keychain cleanup failure before hiding the history entry.
+            self.secret_store.delete(job_id)
+        completed_set = set(completed_ids)
+        self.jobs = [job for job in self.jobs if job.job_id not in completed_set]
+        self.metadata_store.save_all(self.jobs)
+        return completed_ids
+
     def pending_jobs(self) -> list[QueuedBatch]:
         return [job for job in self.jobs if job.status not in TERMINAL_STATUSES]
 
