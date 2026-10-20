@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +13,7 @@ try:
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
 
+    import batch_queue
     import gui
     import run_commands as runner
 except ImportError:
@@ -32,10 +35,16 @@ class MainWindowTests(unittest.TestCase):
             str(self.base / "settings.ini"),
             QSettings.Format.IniFormat,
         )
-        self.window = gui.MainWindow(self.settings)
+        self.secret_store = batch_queue.MemorySecretStore()
+        self.window = gui.MainWindow(self.settings, secret_store=self.secret_store)
 
     def tearDown(self):
-        self.window.close()
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.close()
         self.app.processEvents()
         self.temporary.cleanup()
 
@@ -165,6 +174,298 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(splitter.count(), 2)
         self.assertTrue(splitter.widget(0).isAncestorOf(self.window.configuration_group))
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
+
+    def test_queue_and_device_results_tabs_and_controls_are_available(self):
+        self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+        self.assertEqual(self.window.queue_table.columnCount(), 8)
+        self.assertEqual(self.window.schedule_button.text(), "Schedule Batch")
+        self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
+        self.assertFalse(hasattr(self.window, "queue_button"))
+        self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
+        self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
+        self.assertFalse(self.window.clear_completed_button.isEnabled())
+
+    def test_schedule_dialog_displays_date_time_picker(self):
+        dialog = gui.ScheduleDialog()
+        dialog.show()
+        self.app.processEvents()
+
+        self.assertIs(dialog.date_time_edit.parentWidget(), dialog)
+        self.assertTrue(dialog.date_time_edit.isVisible())
+        self.assertTrue(dialog.date_time_edit.calendarPopup())
+        self.assertEqual(dialog.date_time_edit.displayFormat(), "yyyy-MM-dd HH:mm")
+
+        dialog.close()
+
+    def test_queue_submission_snapshots_sensitive_inputs_outside_qsettings(self):
+        self.populate_valid_inputs()
+
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Apply,
+        ):
+            self.window.start_run()
+
+        self.assertEqual(len(self.window.queue_controller.jobs), 1)
+        job = self.window.queue_controller.jobs[0]
+        payload = self.window.queue_controller.payload(job.job_id)
+        self.assertEqual(payload.inventory_text, "192.0.2.1\n10.2.0.44a\n")
+        self.assertEqual(payload.password, "secret")
+        self.assertEqual(self.window.queue_table.rowCount(), 1)
+        stored = "\n".join(
+            f"{key}={self.settings.value(key)}" for key in self.settings.allKeys()
+        )
+        self.assertNotIn("192.0.2.1", stored)
+        self.assertNotIn("show version", stored)
+        self.assertNotIn("secret", stored)
+
+    def test_queued_batch_can_be_fully_edited_without_changing_active_snapshot(self):
+        self.populate_valid_inputs()
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Apply,
+        ):
+            self.window.start_run()
+        job_id = self.window.queue_controller.jobs[0].job_id
+        original = self.window.queue_controller.payload(job_id)
+        self.secret_store.set(
+            job_id,
+            replace(
+                original,
+                enable_secret="queued-enable",
+                port=2200,
+                timeout=30,
+            ).to_json(),
+        )
+
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.edit_selected_batch()
+        self.window.exec_commands_edit.setPlainText("show clock")
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Apply,
+        ):
+            self.window.save_batch_edit()
+
+        self.assertIsNone(self.window._editing_job_id)
+        saved = self.window.queue_controller.payload(job_id)
+        self.assertEqual(saved.exec_commands_text, "show clock")
+        self.assertEqual(saved.enable_secret, "queued-enable")
+        self.assertEqual(saved.port, 2200)
+        self.assertEqual(saved.timeout, 30)
+        self.assertFalse(self.window.save_edit_button.isVisible())
+
+    def test_dispatch_starts_only_one_ready_job(self):
+        first_prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        second_prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.2"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        first = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(first_prepared), first_prepared
+        )
+        self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(second_prepared), second_prepared
+        )
+        self.window.queue_controller.paused = False
+
+        with patch.object(self.window, "_start_worker") as start_worker:
+            self.window._queue_tick()
+            self.window._queue_tick()
+
+        start_worker.assert_called_once()
+        self.assertEqual(self.window.queue_controller.active_job_id, first.job_id)
+
+    def test_future_schedule_arms_idle_sleep_prevention(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        scheduled = datetime.now(timezone.utc) + timedelta(hours=1)
+        self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared, scheduled
+        )
+        self.window.queue_controller.paused = False
+
+        with patch.object(self.window.sleep_inhibitor, "set_required") as set_required:
+            self.window._queue_tick()
+
+        set_required.assert_called_with(True)
+
+    def test_queued_completion_updates_status_and_deletes_secret(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        job = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+        run_directory = self.base / "outputs" / "run_test"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        summary.write_text("device,status\n", encoding="utf-8")
+
+        self.window._run_completed(runner.BatchResult((), run_directory, summary))
+
+        self.assertEqual(
+            self.window.queue_controller.job(job.job_id).status, "succeeded"
+        )
+        self.assertNotIn(job.job_id, self.secret_store.values)
+        self.assertEqual(self.window._job_results[job.job_id].summary_path, summary)
+
+    def test_queued_worker_failure_does_not_open_blocking_dialog(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        job = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+
+        with patch.object(gui.QMessageBox, "critical") as critical:
+            self.window._run_failed("Unexpected worker failure")
+
+        critical.assert_not_called()
+        self.assertEqual(self.window.queue_controller.job(job.job_id).status, "failed")
+
+    def test_configuration_remains_editable_while_live_worker_runs(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+
+        self.window._set_running_ui(True)
+
+        self.assertTrue(self.window.configuration_group.isEnabled())
+        self.assertTrue(self.window.validate_button.isEnabled())
+        self.assertTrue(self.window.run_button.isEnabled())
+
+    def test_run_live_queues_behind_an_active_batch_without_starting_twice(self):
+        active_prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        active = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(active_prepared), active_prepared
+        )
+        self.window.queue_controller.mark_running(active.job_id)
+        self.window._running = True
+        self.window._active_job_id = active.job_id
+        self.populate_valid_inputs()
+
+        with (
+            patch.object(
+                gui.QMessageBox,
+                "warning",
+                return_value=QMessageBox.StandardButton.Apply,
+            ),
+            patch.object(self.window, "_start_worker") as start_worker,
+        ):
+            self.window.start_run()
+            self.window._queue_tick()
+
+        self.assertEqual(len(self.window.queue_controller.jobs), 2)
+        self.assertEqual(self.window.queue_controller.jobs[0].status, "running")
+        self.assertEqual(self.window.queue_controller.jobs[1].status, "ready")
+        start_worker.assert_not_called()
+        self.window._running = False
+        self.window._active_job_id = None
+        self.window.queue_controller.active_job_id = None
+
+    def test_cancelled_queue_entry_can_be_removed(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        job = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window.queue_controller.mark_terminal(
+            job.job_id, "cancelled", "0 succeeded, 0 failed, 1 cancelled"
+        )
+        self.window._refresh_queue_table(select_job_id=job.job_id)
+
+        self.assertTrue(self.window.remove_batch_button.isEnabled())
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.remove_selected_batch()
+
+        self.assertIsNone(self.window.queue_controller.job(job.job_id))
+        self.assertEqual(self.window.queue_table.rowCount(), 0)
+
+    def test_clear_completed_button_leaves_future_schedule_untouched(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        completed = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        scheduled = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared),
+            prepared,
+            datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        self.window.queue_controller.mark_running(completed.job_id)
+        self.window.queue_controller.mark_terminal(
+            completed.job_id, "succeeded", "1 succeeded"
+        )
+        self.window._refresh_queue_table(select_job_id=completed.job_id)
+
+        self.assertTrue(self.window.clear_completed_button.isEnabled())
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.clear_completed_button.click()
+
+        self.assertIsNone(self.window.queue_controller.job(completed.job_id))
+        self.assertIsNotNone(self.window.queue_controller.job(scheduled.job_id))
+        self.assertEqual(
+            self.window.queue_controller.job(scheduled.job_id).status, "scheduled"
+        )
+        self.assertEqual(self.window.queue_table.rowCount(), 1)
+
+    def _valid_request(self, device_type, address):
+        return runner.RunRequest(
+            inventory=None,
+            command_file=None,
+            device_type=device_type,
+            output_dir=self.base / "outputs",
+            env_file=None,
+            apply=True,
+            inventory_text=address,
+            exec_commands_text="show version",
+            config_commands_text="interface loopback 1",
+        )
 
     def test_input_change_invalidates_a_successful_validation(self):
         self.populate_valid_inputs()
@@ -596,6 +897,7 @@ class MainWindowTests(unittest.TestCase):
         self.window.cancel_run()
 
         self.assertTrue(token.cancelled)
+        self.assertTrue(self.window.queue_controller.paused)
         self.assertIn("Cancelling", self.window.status_label.text())
         self.window._running = False
         self.window._token = None
