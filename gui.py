@@ -4,19 +4,34 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from uuid import uuid4
 
-from PySide6.QtCore import Qt, QObject, QSettings, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QDateTime,
+    QObject,
+    QProcess,
+    QSettings,
+    QThread,
+    QTimer,
+    QUrl,
+    Qt,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateTimeEdit,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -34,8 +49,20 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
+)
+
+from batch_queue import (
+    BatchPayload,
+    EDITABLE_STATUSES,
+    KeychainSecretStore,
+    MemorySecretStore,
+    QueueController,
+    QueueMetadataStore,
+    QueueStorageError,
+    SecretStore,
 )
 
 from run_commands import (
@@ -414,15 +441,115 @@ class BatchWorker(QObject):
             self.completed.emit(result)
 
 
+class ScheduleDialog(QDialog):
+    """Select one future local date and time with minute precision."""
+
+    def __init__(
+        self,
+        initial_utc: Optional[datetime] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Schedule Batch")
+        layout = QVBoxLayout(self)
+        label = QLabel("Run this batch at:")
+        layout.addWidget(label)
+        self.date_time_edit = QDateTimeEdit()
+        self.date_time_edit.setCalendarPopup(True)
+        self.date_time_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        layout.addWidget(self.date_time_edit)
+        minimum = QDateTime.currentDateTime().addSecs(60)
+        self.date_time_edit.setMinimumDateTime(minimum)
+        if initial_utc is not None:
+            selected = QDateTime.fromSecsSinceEpoch(int(initial_utc.timestamp())).toLocalTime()
+            self.date_time_edit.setDateTime(max(selected, minimum))
+        else:
+            self.date_time_edit.setDateTime(minimum)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_if_future)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_utc(self) -> datetime:
+        local = self.date_time_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        if local.tzinfo is None:
+            local = local.astimezone()
+        return local.astimezone(timezone.utc)
+
+    @Slot()
+    def _accept_if_future(self) -> None:
+        if self.selected_utc() <= datetime.now(timezone.utc):
+            QMessageBox.critical(self, "Invalid schedule", "Choose a future date and time.")
+            return
+        self.accept()
+
+
+class IdleSleepInhibitor(QObject):
+    """Use macOS caffeinate while queued work needs the system to remain awake."""
+
+    warning = Signal(str)
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self.process = QProcess(self)
+        self.process.errorOccurred.connect(self._process_error)
+        self._requested = False
+        self._failed = False
+
+    def set_required(self, required: bool) -> None:
+        self._requested = required
+        if sys.platform != "darwin" or not Path("/usr/bin/caffeinate").is_file():
+            return
+        if not required:
+            self._failed = False
+        if (
+            required
+            and not self._failed
+            and self.process.state() == QProcess.ProcessState.NotRunning
+        ):
+            self.process.start("/usr/bin/caffeinate", ["-i", "-w", str(os.getpid())])
+        elif not required and self.process.state() != QProcess.ProcessState.NotRunning:
+            self.process.terminate()
+
+    @Slot(QProcess.ProcessError)
+    def _process_error(self, _error: QProcess.ProcessError) -> None:
+        if self._requested:
+            self._failed = True
+            self.warning.emit(
+                "macOS idle-sleep prevention could not start. Scheduled jobs remain queued, "
+                "but the Mac must stay awake."
+            )
+
+
 class MainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self, settings: Optional[QSettings] = None) -> None:
+    def __init__(
+        self,
+        settings: Optional[QSettings] = None,
+        secret_store: Optional[SecretStore] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+    ) -> None:
         super().__init__()
         self.settings = settings or QSettings(ORGANIZATION_NAME, APP_NAME)
         self.profile_store = CredentialProfileStore(self.settings)
+        self.queue_controller = QueueController(
+            QueueMetadataStore(self.settings),
+            secret_store or KeychainSecretStore(),
+            clock=clock,
+        )
         self._prepared: Optional[PreparedRun] = None
         self._batch_result: Optional[BatchResult] = None
+        self._job_prepared: dict[str, PreparedRun] = {}
+        self._job_results: dict[str, BatchResult] = {}
+        self._job_rows: dict[str, list[list[str]]] = {}
+        self._job_progress: dict[str, tuple[int, int, str, str]] = {}
+        self._selected_job_id: Optional[str] = None
+        self._active_job_id: Optional[str] = None
+        self._editing_job_id: Optional[str] = None
+        self._editing_connection_settings: Optional[Settings] = None
         self._token: Optional[CancellationToken] = None
         self._thread: Optional[QThread] = None
         self._worker: Optional[BatchWorker] = None
@@ -431,6 +558,7 @@ class MainWindow(QMainWindow):
         self._loading_settings = True
         self._loading_profile = False
         self._close_after_run = False
+        self._closing = False
         self._rows: dict[str, int] = {}
         self._last_inventory_import = ""
         self._last_command_import = ""
@@ -445,6 +573,14 @@ class MainWindow(QMainWindow):
         self._connect_input_changes()
         self._loading_settings = False
         self._set_validated(False)
+        self._refresh_queue_table()
+        self.sleep_inhibitor = IdleSleepInhibitor(self)
+        self.sleep_inhibitor.warning.connect(self._show_sleep_warning)
+        self.scheduler_timer = QTimer(self)
+        self.scheduler_timer.setInterval(1000)
+        self.scheduler_timer.timeout.connect(self._queue_tick)
+        self.scheduler_timer.start()
+        self._update_queue_controls()
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -550,24 +686,88 @@ class MainWindow(QMainWindow):
 
         settings_layout.addWidget(self.configuration_group)
 
-        button_row = QHBoxLayout()
+        button_row = QGridLayout()
         self.validate_button = QPushButton("Validate Input")
         self.run_button = QPushButton("Run Live")
+        self.schedule_button = QPushButton("Schedule Batch")
         self.cancel_button = QPushButton("Stop Run")
         self.cancel_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.validate_button.clicked.connect(self.validate_inputs)
         self.run_button.clicked.connect(self.start_run)
+        self.schedule_button.clicked.connect(self.schedule_batch)
         self.cancel_button.clicked.connect(self.cancel_run)
-        button_row.addWidget(self.validate_button)
-        button_row.addWidget(self.run_button)
-        button_row.addWidget(self.cancel_button)
-        button_row.addStretch()
+        button_row.addWidget(self.validate_button, 0, 0)
+        button_row.addWidget(self.run_button, 0, 1)
+        button_row.addWidget(self.schedule_button, 1, 0)
+        button_row.addWidget(self.cancel_button, 1, 1)
+        edit_row = QHBoxLayout()
+        self.save_edit_button = QPushButton("Save Changes")
+        self.cancel_edit_button = QPushButton("Cancel Edit")
+        self.save_edit_button.clicked.connect(self.save_batch_edit)
+        self.cancel_edit_button.clicked.connect(self.cancel_batch_edit)
+        self.save_edit_button.hide()
+        self.cancel_edit_button.hide()
+        edit_row.addWidget(self.save_edit_button)
+        edit_row.addWidget(self.cancel_edit_button)
+        edit_row.addStretch()
         self.validation_label = QLabel("Enter or import devices and commands, then validate.")
         self.validation_label.setWordWrap(True)
         settings_layout.addLayout(button_row)
+        settings_layout.addLayout(edit_row)
         settings_layout.addWidget(self.validation_label)
         settings_layout.addStretch(1)
 
+        self.results_tabs = QTabWidget()
+        queue_tab = QWidget()
+        queue_layout = QVBoxLayout(queue_tab)
+        self.queue_table = QTableWidget(0, 8)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["Order", "Batch", "Device Type", "Devices", "Commands", "Run At", "Status", "Result"]
+        )
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.queue_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.itemSelectionChanged.connect(self._queue_selection_changed)
+        self.queue_table.cellDoubleClicked.connect(self._queue_double_clicked)
+        queue_header = self.queue_table.horizontalHeader()
+        for column in (0, 2, 3, 4, 5, 6):
+            queue_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        queue_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        queue_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        queue_layout.addWidget(self.queue_table, 1)
+
+        queue_actions = QGridLayout()
+        self.pause_queue_button = QPushButton("Pause Queue")
+        self.move_up_button = QPushButton("Move Up")
+        self.move_down_button = QPushButton("Move Down")
+        self.edit_batch_button = QPushButton("Edit Batch")
+        self.reschedule_button = QPushButton("Reschedule…")
+        self.retry_button = QPushButton("Retry")
+        self.remove_batch_button = QPushButton("Remove")
+        self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
+        self.move_up_button.clicked.connect(lambda: self.move_selected_batch(-1))
+        self.move_down_button.clicked.connect(lambda: self.move_selected_batch(1))
+        self.edit_batch_button.clicked.connect(self.edit_selected_batch)
+        self.reschedule_button.clicked.connect(self.reschedule_selected_batch)
+        self.retry_button.clicked.connect(self.retry_selected_batch)
+        self.remove_batch_button.clicked.connect(self.remove_selected_batch)
+        for index, button in enumerate(
+            (
+                self.pause_queue_button,
+                self.move_up_button,
+                self.move_down_button,
+                self.edit_batch_button,
+                self.reschedule_button,
+                self.retry_button,
+                self.remove_batch_button,
+            )
+        ):
+            queue_actions.addWidget(button, index // 4, index % 4)
+        queue_layout.addLayout(queue_actions)
+
+        device_results_tab = QWidget()
+        device_results_layout = QVBoxLayout(device_results_tab)
         self.device_table = QTableWidget(0, 5)
         self.device_table.setHorizontalHeaderLabels(
             ["Device", "Status", "Stage / Line", "Result", "Output"]
@@ -581,7 +781,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        results_layout.addWidget(self.device_table, 1)
+        device_results_layout.addWidget(self.device_table, 1)
 
         progress_grid = QGridLayout()
         self.progress_bar = QProgressBar()
@@ -592,7 +792,7 @@ class MainWindow(QMainWindow):
         progress_grid.addWidget(self.progress_bar, 0, 0, 1, 2)
         progress_grid.addWidget(self.status_label, 1, 0)
         progress_grid.addWidget(self.totals_label, 1, 1)
-        results_layout.addLayout(progress_grid)
+        device_results_layout.addLayout(progress_grid)
 
         result_buttons = QHBoxLayout()
         self.open_output_button = QPushButton("Open Output Folder")
@@ -604,7 +804,11 @@ class MainWindow(QMainWindow):
         result_buttons.addWidget(self.open_output_button)
         result_buttons.addWidget(self.open_summary_button)
         result_buttons.addStretch()
-        results_layout.addLayout(result_buttons)
+        device_results_layout.addLayout(result_buttons)
+
+        self.results_tabs.addTab(queue_tab, "Queue")
+        self.results_tabs.addTab(device_results_tab, "Device Results")
+        results_layout.addWidget(self.results_tabs, 1)
 
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
@@ -738,7 +942,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _credentials_edited(self) -> None:
-        if self._loading_settings or self._loading_profile or self._running:
+        if self._loading_settings or self._loading_profile:
             return
         if self.profile_combo.currentData():
             self._switch_to_manual(clear_credentials=False)
@@ -791,14 +995,17 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def invalidate_validation(self) -> None:
-        if self._loading_settings or self._running:
+        if self._loading_settings:
             return
         self._prepared = None
         self._set_validated(False)
         self.validation_label.setText("Inputs changed; validate again.")
 
     def _set_validated(self, validated: bool) -> None:
-        self.run_button.setEnabled(validated and not self._running)
+        editable = self._editing_job_id is not None
+        self.run_button.setEnabled(validated and not editable)
+        self.schedule_button.setEnabled(validated and not editable)
+        self.save_edit_button.setEnabled(validated and editable)
         self.test_connections_button.setEnabled(not self._running)
         self.cancel_button.setEnabled(self._running)
 
@@ -853,6 +1060,21 @@ class MainWindow(QMainWindow):
             ),
         )
 
+    def _credential_environment(self) -> dict[str, str]:
+        values = {
+            "SSH_USERNAME": self.username_edit.text(),
+            "SSH_PASSWORD": self.password_edit.text(),
+        }
+        if self._editing_connection_settings is not None:
+            values.update(
+                {
+                    "ENABLE_SECRET": self._editing_connection_settings.enable_secret or "",
+                    "SSH_PORT": str(self._editing_connection_settings.port),
+                    "SSH_TIMEOUT": str(self._editing_connection_settings.timeout),
+                }
+            )
+        return values
+
     @Slot()
     def validate_inputs(self, show_success: bool = True) -> bool:
         try:
@@ -860,10 +1082,7 @@ class MainWindow(QMainWindow):
             prepared = prepare_run(
                 request,
                 require_credentials=True,
-                environment={
-                    "SSH_USERNAME": self.username_edit.text(),
-                    "SSH_PASSWORD": self.password_edit.text(),
-                },
+                environment=self._credential_environment(),
             )
         except (ConfigurationError, OSError) as exc:
             self._prepared = None
@@ -874,7 +1093,8 @@ class MainWindow(QMainWindow):
             return False
 
         self._prepared = prepared
-        self._populate_devices(prepared)
+        if not self._running and self._selected_job_id is None:
+            self._populate_devices(prepared)
         self._save_settings()
         valid = len(prepared.valid_entries)
         invalid = len(prepared.invalid_entries)
@@ -905,6 +1125,7 @@ class MainWindow(QMainWindow):
         prepared: PreparedRun,
         operation: str = "run",
     ) -> None:
+        self._selected_job_id = None
         self.device_table.setRowCount(0)
         self._rows.clear()
         for row, entry in enumerate(prepared.entries):
@@ -925,6 +1146,62 @@ class MainWindow(QMainWindow):
         )
         self.open_output_button.setEnabled(False)
         self.open_summary_button.setEnabled(False)
+
+    def _initialize_job_rows(self, job_id: str, prepared: PreparedRun) -> None:
+        self._job_rows[job_id] = [
+            [entry.address, "Invalid" if entry.error else "Ready", "", entry.error, ""]
+            for entry in prepared.entries
+        ]
+        self._job_progress[job_id] = (
+            0,
+            max(1, len(prepared.entries)),
+            "Queued",
+            "0 succeeded, 0 failed, 0 cancelled",
+        )
+
+    def _show_job_results(self, job_id: str) -> None:
+        job = self.queue_controller.job(job_id)
+        rows = self._job_rows.get(job_id)
+        if rows is None and job is not None:
+            try:
+                prepared = self._job_prepared.get(job_id)
+                if prepared is None:
+                    prepared = self.queue_controller.payload(job_id).prepare()
+            except (QueueStorageError, ConfigurationError, OSError):
+                prepared = None
+            if prepared is not None:
+                self._job_prepared[job_id] = prepared
+                self._initialize_job_rows(job_id, prepared)
+                rows = self._job_rows[job_id]
+        self._selected_job_id = job_id
+        self.device_table.setRowCount(0)
+        self._rows.clear()
+        for row_index, values in enumerate(rows or []):
+            self.device_table.insertRow(row_index)
+            self._rows[values[0]] = row_index
+            for column, value in enumerate(values):
+                self._set_cell(row_index, column, value)
+        value, maximum, status, totals = self._job_progress.get(
+            job_id,
+            (0, max(1, len(rows or [])), job.status.title() if job else "Queued", ""),
+        )
+        self.progress_bar.setRange(0, maximum)
+        self.progress_bar.setValue(value)
+        self.status_label.setText(status)
+        self.totals_label.setText(totals)
+        result = self._job_results.get(job_id)
+        self._batch_result = result
+        self.open_output_button.setEnabled(bool(result and result.run_directory.is_dir()))
+        self.open_summary_button.setEnabled(bool(result and result.summary_path.is_file()))
+
+    def _set_job_cell(self, job_id: str, address: str, column: int, value: str) -> None:
+        rows = self._job_rows.get(job_id, [])
+        for row_index, row in enumerate(rows):
+            if row[0] == address:
+                row[column] = value
+                if self._selected_job_id == job_id:
+                    self._set_cell(row_index, column, value)
+                return
 
     def _set_cell(self, row: int, column: int, value: str) -> None:
         item = self.device_table.item(row, column)
@@ -988,10 +1265,7 @@ class MainWindow(QMainWindow):
             request = self._request_from_inputs(include_commands=False)
             prepared = prepare_connection_test(
                 request,
-                environment={
-                    "SSH_USERNAME": self.username_edit.text(),
-                    "SSH_PASSWORD": self.password_edit.text(),
-                },
+                environment=self._credential_environment(),
             )
         except (ConfigurationError, OSError) as exc:
             QMessageBox.critical(self, "Cannot test connections", str(exc))
@@ -1012,31 +1286,113 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def start_run(self) -> None:
-        if self._running:
+        self._submit_batch(scheduled_utc=None, request_dispatch=True)
+
+    @Slot()
+    def schedule_batch(self) -> None:
+        dialog = ScheduleDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        self._submit_batch(scheduled_utc=dialog.selected_utc(), request_dispatch=False)
+
+    def _submit_batch(
+        self,
+        scheduled_utc: Optional[datetime],
+        request_dispatch: bool,
+    ) -> None:
         if not self.validate_inputs(show_success=False) or self._prepared is None:
             QMessageBox.critical(self, "Cannot run", "Correct the validation errors first.")
             return
         prepared = self._prepared
+        schedule_text = ""
+        if scheduled_utc is not None:
+            schedule_text = (
+                "\nScheduled for "
+                f"{scheduled_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
+            )
         answer = QMessageBox.warning(
             self,
-            "Confirm live run",
-            f"Run {len(prepared.commands)} command(s) on "
+            "Confirm live batch",
+            f"Submit {len(prepared.commands)} command(s) for "
             f"{len(prepared.valid_entries)} valid device(s)?\n\n"
+            f"{schedule_text}"
             "This makes live changes and does not automatically roll them back.\n"
-            "Literal passwords in the command boxes may appear in outputs or summary.csv.",
+            "Literal passwords in the command boxes may appear in outputs or summary.csv.\n"
+            "Until the batch finishes or is removed, its complete snapshot is protected "
+            "by macOS Keychain.",
             QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
         if answer != QMessageBox.StandardButton.Apply:
             return
 
-        self._start_worker(prepared, operation="run")
+        try:
+            payload = BatchPayload.from_prepared(prepared)
+            job = self.queue_controller.add(payload, prepared, scheduled_utc)
+        except (QueueStorageError, OSError) as exc:
+            QMessageBox.critical(self, "Could not queue batch", str(exc))
+            return
+        self._job_prepared[job.job_id] = prepared
+        self._initialize_job_rows(job.job_id, prepared)
+        self._selected_job_id = job.job_id
+        if request_dispatch:
+            self.queue_controller.paused = False
+        self._refresh_queue_table(select_job_id=job.job_id)
+        self._show_job_results(job.job_id)
+        self._save_settings()
+        self._update_queue_controls()
+        QTimer.singleShot(0, self._queue_tick)
 
-    def _start_worker(self, prepared: PreparedRun, operation: str) -> None:
+    @Slot()
+    def _queue_tick(self) -> None:
+        if self._closing:
+            return
+        self.queue_controller.refresh_due()
+        self._refresh_queue_table(select_job_id=self._selected_job_id)
+        future_armed = any(
+            job.status == "scheduled" for job in self.queue_controller.pending_jobs()
+        ) and not self.queue_controller.paused
+        self.sleep_inhibitor.set_required(self._running or future_armed)
+        if self._running:
+            return
+        job = self.queue_controller.next_eligible()
+        if job is None:
+            self._update_queue_controls()
+            return
+        try:
+            prepared = self._job_prepared.get(job.job_id)
+            if prepared is None:
+                prepared = self.queue_controller.payload(job.job_id).prepare()
+        except (QueueStorageError, ConfigurationError, OSError) as exc:
+            self.queue_controller.mark_blocked(job.job_id, str(exc))
+            self._refresh_queue_table(select_job_id=job.job_id)
+            QTimer.singleShot(0, self._queue_tick)
+            return
+
+        self._job_prepared[job.job_id] = prepared
+        if job.job_id not in self._job_rows:
+            self._initialize_job_rows(job.job_id, prepared)
+        self.queue_controller.mark_running(job.job_id)
+        self._active_job_id = job.job_id
+        self._selected_job_id = job.job_id
+        self._refresh_queue_table(select_job_id=job.job_id)
+        self._show_job_results(job.job_id)
+        self.results_tabs.setCurrentIndex(1)
+        self._start_worker(prepared, operation="run", job_id=job.job_id)
+
+    def _start_worker(
+        self,
+        prepared: PreparedRun,
+        operation: str,
+        job_id: Optional[str] = None,
+    ) -> None:
         self._running = True
         self._operation = operation
-        self._batch_result = None
+        if operation == "run":
+            self._active_job_id = job_id
+        else:
+            self._active_job_id = None
+            self._batch_result = None
         self._token = CancellationToken()
         self._thread = QThread(self)
         self._worker = BatchWorker(prepared, self._token, operation=operation)
@@ -1053,14 +1409,18 @@ class MainWindow(QMainWindow):
         self._thread.start()
 
     def _set_running_ui(self, running: bool) -> None:
-        self.validate_button.setEnabled(not running)
+        self.validate_button.setEnabled(True)
         self.test_connections_button.setEnabled(not running)
-        self.run_button.setEnabled(not running and self._prepared is not None)
         self.cancel_button.setEnabled(running)
-        self.configuration_group.setEnabled(not running)
+        self.configuration_group.setEnabled(True)
+        self._set_validated(self._prepared is not None)
+        self._update_queue_controls()
 
     @Slot(object)
     def handle_progress(self, event: ProgressEvent) -> None:
+        if self._operation == "run" and self._active_job_id:
+            self._handle_job_progress(self._active_job_id, event)
+            return
         if event.kind == "run_started":
             self.progress_bar.setRange(0, max(1, event.total))
             self.progress_bar.setValue(0)
@@ -1098,16 +1458,94 @@ class MainWindow(QMainWindow):
             self._set_cell(row, 4, event.transcript_file)
             self.progress_bar.setValue(event.index)
 
+    def _handle_job_progress(self, job_id: str, event: ProgressEvent) -> None:
+        value, maximum, status_text, totals = self._job_progress.get(
+            job_id, (0, max(1, event.total), "Queued", "")
+        )
+        if event.kind == "run_started":
+            value, maximum, status_text = 0, max(1, event.total), "Running"
+        elif event.kind == "run_finished":
+            status_text, totals = event.message, event.message
+        elif event.kind == "device_started":
+            self._set_job_cell(job_id, event.address, 1, "Starting")
+        elif event.kind == "device_status":
+            self._set_job_cell(job_id, event.address, 1, event.status.title())
+            if event.section:
+                self._set_job_cell(job_id, event.address, 2, event.section)
+        elif event.kind == "command_started":
+            self._set_job_cell(job_id, event.address, 1, "Running")
+            self._set_job_cell(
+                job_id,
+                event.address,
+                2,
+                f"{event.section} / {event.line_number}",
+            )
+        elif event.kind == "device_finished":
+            shown_status = event.status.title()
+            self._set_job_cell(job_id, event.address, 1, shown_status)
+            if event.line_number:
+                self._set_job_cell(
+                    job_id,
+                    event.address,
+                    2,
+                    f"{event.section} / {event.line_number}",
+                )
+            elif event.section:
+                self._set_job_cell(job_id, event.address, 2, event.section)
+            self._set_job_cell(job_id, event.address, 3, event.message or shown_status)
+            self._set_job_cell(job_id, event.address, 4, event.transcript_file)
+            value = event.index
+        self._job_progress[job_id] = (value, maximum, status_text, totals)
+        if self._selected_job_id == job_id:
+            self.progress_bar.setRange(0, maximum)
+            self.progress_bar.setValue(value)
+            self.status_label.setText(status_text)
+            self.totals_label.setText(totals)
+
     @Slot()
     def cancel_run(self) -> None:
         if not self._running or self._token is None:
             return
+        self.queue_controller.paused = True
+        self._refresh_queue_table(select_job_id=self._active_job_id)
         self._token.cancel()
         self.cancel_button.setEnabled(False)
         self.status_label.setText("Cancelling at the next safe checkpoint…")
+        self._update_queue_controls()
 
     @Slot(object)
     def _run_completed(self, result: BatchResult) -> None:
+        if self._operation == "run" and self._active_job_id:
+            job_id = self._active_job_id
+            self._job_results[job_id] = result
+            terminal_status = (
+                "cancelled"
+                if result.cancelled
+                else "completed_with_failures"
+                if result.failures
+                else "succeeded"
+            )
+            result_text = (
+                f"{result.successes} succeeded, {result.failures} failed, "
+                f"{result.cancelled} cancelled"
+            )
+            warning = self.queue_controller.mark_terminal(
+                job_id, terminal_status, result_text
+            )
+            current = self._job_progress.get(job_id, (0, 1, "", ""))
+            self._job_progress[job_id] = (
+                current[1],
+                current[1],
+                "Run cancelled" if result.cancelled else "Run complete",
+                result_text,
+            )
+            if self._selected_job_id == job_id:
+                self._batch_result = result
+                self._show_job_results(job_id)
+            self._refresh_queue_table(select_job_id=job_id)
+            if warning:
+                self.validation_label.setText(f"Keychain cleanup warning: {warning}")
+            return
         self._batch_result = result
         if self._operation == "connection_test":
             self.totals_label.setText(
@@ -1132,6 +1570,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _run_failed(self, message: str) -> None:
+        if self._operation == "run" and self._active_job_id:
+            job_id = self._active_job_id
+            warning = self.queue_controller.mark_terminal(job_id, "failed", message)
+            current = self._job_progress.get(job_id, (0, 1, "", ""))
+            self._job_progress[job_id] = (
+                current[0], current[1], "Run failed", message
+            )
+            self._refresh_queue_table(select_job_id=job_id)
+            if self._selected_job_id == job_id:
+                self.status_label.setText("Run failed")
+                self.totals_label.setText(message)
+            if warning:
+                self.validation_label.setText(f"Keychain cleanup warning: {warning}")
+            return
         title = (
             "Connection test failed"
             if self._operation == "connection_test"
@@ -1142,18 +1594,300 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _thread_finished(self) -> None:
+        finished_operation = self._operation
         self._running = False
         self._set_running_ui(False)
         self._token = None
         self._worker = None
         self._operation = None
+        self._active_job_id = None
         thread = self._thread
         self._thread = None
         if thread is not None:
             thread.deleteLater()
         if self._close_after_run:
             self._close_after_run = False
+            self._closing = True
             QTimer.singleShot(0, self.close)
+        elif finished_operation == "run":
+            QTimer.singleShot(0, self._queue_tick)
+
+    def _selected_queue_job_id(self) -> Optional[str]:
+        row = self.queue_table.currentRow()
+        if row < 0:
+            return None
+        item = self.queue_table.item(row, 0)
+        value = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return str(value) if value else None
+
+    def _refresh_queue_table(self, select_job_id: Optional[str] = None) -> None:
+        if not hasattr(self, "queue_table"):
+            return
+        selected = select_job_id or self._selected_queue_job_id()
+        self.queue_table.blockSignals(True)
+        try:
+            self.queue_table.setRowCount(0)
+            selected_row = -1
+            for row, job in enumerate(self.queue_controller.jobs):
+                self.queue_table.insertRow(row)
+                order_item = QTableWidgetItem(str(row + 1))
+                order_item.setData(Qt.ItemDataRole.UserRole, job.job_id)
+                scheduled = (
+                    job.scheduled_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+                    if job.scheduled_utc
+                    else "Ready now"
+                )
+                status = job.status.replace("_", " ").title()
+                values = (
+                    order_item,
+                    QTableWidgetItem(job.name),
+                    QTableWidgetItem(job.device_type),
+                    QTableWidgetItem(
+                        f"{job.valid_devices} valid"
+                        + (f", {job.invalid_devices} invalid" if job.invalid_devices else "")
+                    ),
+                    QTableWidgetItem(str(job.command_count)),
+                    QTableWidgetItem(scheduled),
+                    QTableWidgetItem(status),
+                    QTableWidgetItem(job.result),
+                )
+                for column, item in enumerate(values):
+                    self.queue_table.setItem(row, column, item)
+                if job.job_id == selected:
+                    selected_row = row
+            if selected_row >= 0:
+                self.queue_table.selectRow(selected_row)
+        finally:
+            self.queue_table.blockSignals(False)
+        self._update_queue_controls()
+
+    @Slot()
+    def _queue_selection_changed(self) -> None:
+        job_id = self._selected_queue_job_id()
+        if job_id:
+            self._show_job_results(job_id)
+        self._update_queue_controls()
+
+    @Slot(int, int)
+    def _queue_double_clicked(self, row: int, _column: int) -> None:
+        item = self.queue_table.item(row, 0)
+        job_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if job_id:
+            self._show_job_results(str(job_id))
+            self.results_tabs.setCurrentIndex(1)
+
+    def _update_queue_controls(self) -> None:
+        if not hasattr(self, "pause_queue_button"):
+            return
+        self.pause_queue_button.setText(
+            "Resume Queue" if self.queue_controller.paused else "Pause Queue"
+        )
+        job = self.queue_controller.job(self._selected_queue_job_id())
+        editable = bool(job and job.status in EDITABLE_STATUSES)
+        self.move_up_button.setEnabled(editable)
+        self.move_down_button.setEnabled(editable)
+        self.edit_batch_button.setEnabled(editable and self._editing_job_id is None)
+        self.reschedule_button.setEnabled(editable)
+        self.retry_button.setEnabled(bool(job and job.status in {"blocked", "interrupted"}))
+        self.remove_batch_button.setEnabled(bool(job and job.status != "running"))
+
+    @Slot()
+    def toggle_queue_pause(self) -> None:
+        self.queue_controller.paused = not self.queue_controller.paused
+        self._update_queue_controls()
+        self._refresh_queue_table()
+        if not self.queue_controller.paused:
+            QTimer.singleShot(0, self._queue_tick)
+
+    def move_selected_batch(self, direction: int) -> None:
+        job_id = self._selected_queue_job_id()
+        if not job_id:
+            return
+        try:
+            self.queue_controller.move(job_id, direction)
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not move batch", str(exc))
+            return
+        self._refresh_queue_table(select_job_id=job_id)
+
+    @Slot()
+    def edit_selected_batch(self) -> None:
+        job_id = self._selected_queue_job_id()
+        if not job_id:
+            return
+        if any(
+            (
+                self.inventory_text_edit.toPlainText().strip(),
+                self.exec_commands_edit.toPlainText().strip(),
+                self.config_commands_edit.toPlainText().strip(),
+                self.username_edit.text(),
+                self.password_edit.text(),
+            )
+        ):
+            answer = QMessageBox.question(
+                self,
+                "Replace current form?",
+                "Editing this queued batch will replace the current form contents.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            payload = self.queue_controller.payload(job_id)
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not edit batch", str(exc))
+            return
+        self._editing_connection_settings = Settings(
+            username=payload.username,
+            password=payload.password,
+            enable_secret=payload.enable_secret,
+            port=payload.port,
+            timeout=payload.timeout,
+            device_type=payload.device_type,
+        )
+        self._loading_settings = True
+        try:
+            self._switch_to_manual(clear_credentials=False)
+            self.username_edit.setText(payload.username)
+            self.password_edit.setText(payload.password)
+            self.device_type_combo.setCurrentText(payload.device_type)
+            self.inventory_text_edit.setPlainText(payload.inventory_text)
+            self.exec_commands_edit.setPlainText(payload.exec_commands_text)
+            self.config_commands_edit.setPlainText(payload.config_commands_text)
+            self.output_edit.setText(payload.output_dir)
+        finally:
+            self._loading_settings = False
+        self._credential_file = None
+        self._editing_job_id = job_id
+        self._prepared = None
+        self.save_edit_button.show()
+        self.cancel_edit_button.show()
+        self.validation_label.setText("Editing queued batch; validate before saving changes.")
+        self._set_validated(False)
+        self._update_queue_controls()
+
+    @Slot()
+    def save_batch_edit(self) -> None:
+        job_id = self._editing_job_id
+        if not job_id:
+            return
+        if not self.validate_inputs(show_success=False) or self._prepared is None:
+            QMessageBox.critical(self, "Cannot save batch", "Correct the validation errors first.")
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Confirm batch changes",
+            f"Replace the queued snapshot with {len(self._prepared.commands)} command(s) "
+            f"for {len(self._prepared.valid_entries)} valid device(s)?\n\n"
+            "The live changes have no automatic rollback.",
+            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Apply:
+            return
+        try:
+            payload = BatchPayload.from_prepared(self._prepared)
+            self.queue_controller.replace_payload(job_id, payload, self._prepared)
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not save batch", str(exc))
+            return
+        self._job_prepared[job_id] = self._prepared
+        self._initialize_job_rows(job_id, self._prepared)
+        self._finish_batch_edit()
+        self._refresh_queue_table(select_job_id=job_id)
+        self._show_job_results(job_id)
+
+    @Slot()
+    def cancel_batch_edit(self) -> None:
+        self._finish_batch_edit()
+        self.validation_label.setText("Queued batch was not changed.")
+
+    def _finish_batch_edit(self) -> None:
+        self._editing_job_id = None
+        self._editing_connection_settings = None
+        self.save_edit_button.hide()
+        self.cancel_edit_button.hide()
+        self._set_validated(self._prepared is not None)
+        self._update_queue_controls()
+
+    @Slot()
+    def reschedule_selected_batch(self) -> None:
+        job_id = self._selected_queue_job_id()
+        job = self.queue_controller.job(job_id)
+        if job is None:
+            return
+        dialog = ScheduleDialog(job.scheduled_utc, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.queue_controller.reschedule(job.job_id, dialog.selected_utc())
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not reschedule batch", str(exc))
+            return
+        self._refresh_queue_table(select_job_id=job.job_id)
+
+    @Slot()
+    def retry_selected_batch(self) -> None:
+        job_id = self._selected_queue_job_id()
+        job = self.queue_controller.job(job_id)
+        if job is None:
+            return
+        warning = (
+            "This batch may already have applied some commands. Retrying can repeat changes."
+            if job.status == "interrupted"
+            else "Retry this blocked batch?"
+        )
+        answer = QMessageBox.warning(
+            self,
+            "Retry batch?",
+            warning,
+            QMessageBox.StandardButton.Apply | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Apply:
+            return
+        try:
+            self.queue_controller.payload(job.job_id)
+            self.queue_controller.retry(job.job_id)
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not retry batch", str(exc))
+            return
+        self._refresh_queue_table(select_job_id=job.job_id)
+        QTimer.singleShot(0, self._queue_tick)
+
+    @Slot()
+    def remove_selected_batch(self) -> None:
+        job_id = self._selected_queue_job_id()
+        job = self.queue_controller.job(job_id)
+        if job is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove queued batch?",
+            "Remove this batch from the queue? Output files and credential profile files "
+            "will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.queue_controller.remove(job.job_id)
+        except QueueStorageError as exc:
+            QMessageBox.critical(self, "Could not remove batch", str(exc))
+            return
+        self._job_prepared.pop(job.job_id, None)
+        self._job_results.pop(job.job_id, None)
+        self._job_rows.pop(job.job_id, None)
+        self._job_progress.pop(job.job_id, None)
+        self._selected_job_id = None
+        self._refresh_queue_table()
+        self._update_queue_controls()
+
+    @Slot(str)
+    def _show_sleep_warning(self, message: str) -> None:
+        self.validation_label.setText(message)
 
     @Slot()
     def open_output_folder(self) -> None:
@@ -1166,11 +1900,20 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._batch_result.summary_path)))
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closing:
+            self._save_settings()
+            if hasattr(self, "scheduler_timer"):
+                self.scheduler_timer.stop()
+            if hasattr(self, "sleep_inhibitor"):
+                self.sleep_inhibitor.set_required(False)
+            event.accept()
+            return
         if self._running:
             answer = QMessageBox.question(
                 self,
                 "Stop active operation?",
-                "The app will stop at the next safe checkpoint and then close.",
+                "The app will stop at the next safe checkpoint and then close. "
+                "Any remaining queued batches will be restored paused next time.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1179,7 +1922,24 @@ class MainWindow(QMainWindow):
                 self.cancel_run()
             event.ignore()
             return
+        if self.queue_controller.pending_jobs():
+            answer = QMessageBox.question(
+                self,
+                "Close with queued batches?",
+                "Queued and scheduled batches will not run while the application is closed. "
+                "They will be restored in a paused state next time.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
         self._save_settings()
+        self._closing = True
+        if hasattr(self, "scheduler_timer"):
+            self.scheduler_timer.stop()
+        if hasattr(self, "sleep_inhibitor"):
+            self.sleep_inhibitor.set_required(False)
         event.accept()
 
     @Slot()
@@ -1312,15 +2072,22 @@ def main(argv: Optional[list[str]] = None) -> int:
     app = QApplication([sys.argv[0]])
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORGANIZATION_NAME)
-    window = MainWindow()
     if args.smoke_test:
         import netmiko  # noqa: F401 - verifies the packaged SSH dependency is present.
+        import keyring.backends.macOS  # noqa: F401 - verifies packaged Keychain support.
 
-        window.show()
-        app.processEvents()
-        window.close()
-        app.processEvents()
+        with tempfile.TemporaryDirectory() as temporary:
+            smoke_settings = QSettings(
+                str(Path(temporary) / "smoke-settings.ini"),
+                QSettings.Format.IniFormat,
+            )
+            window = MainWindow(smoke_settings, secret_store=MemorySecretStore())
+            window.show()
+            app.processEvents()
+            window.close()
+            app.processEvents()
         return 0
+    window = MainWindow()
     window.show()
     return app.exec()
 

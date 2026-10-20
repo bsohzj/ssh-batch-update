@@ -220,3 +220,4 @@ __marimo__/
 .streamlit/secrets.toml
 commands.txt
 devices.txt
+plan.md

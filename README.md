@@ -38,8 +38,9 @@ copied there. **Validate Input** performs no SSH connections. **Test
 Connections** logs in to each valid IP, detects the prompt, optionally verifies
 enable mode, and disconnects without running either command box. Its status,
 stage, full error, and diagnostic file appear in the same results table used by
-live runs. **Run Live** requires confirmation and displays per-device progress
-without displaying literal commands. Reports default to
+live runs. **Run Live** and **Schedule Batch…** validate and confirm a complete
+batch snapshot before it can make changes. Per-device
+progress never displays literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
 Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
@@ -64,6 +65,44 @@ the app's reference but never deletes or edits its `.env` file. Editing a loaded
 username or password switches the GUI to Manual mode for that run. Because
 `.env` passwords are plaintext, keep those files private, restrict their file
 permissions, and never commit them to Git.
+
+### Batch queue and scheduling
+
+The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
+to the end of the queue. It starts automatically when nothing else is running,
+or waits in FIFO order when another batch is active; it never jumps ahead of
+earlier ready work. Use **Schedule Batch…** to select one future local date and
+time. Future jobs do not block ready jobs, and batches scheduled for the same
+time run in the visible queue order.
+
+The **Queue** tab shows order, device and command counts, schedule, status, and
+result. Pending jobs can be moved, edited, rescheduled, retried, or removed.
+Cancelled and completed history entries can also be removed; removing an entry
+never deletes its transcripts, summary, or output directory.
+Editing loads the encrypted snapshot into the normal form and requires fresh
+validation and confirmation before replacing it. Double-click a queue row to
+open its per-device results. **Pause Queue** stops new batches from starting;
+**Stop Run** safely cancels the active batch at the next checkpoint and also
+pauses the queue. A batch with device failures does not prevent the next ready
+batch from starting.
+
+Queued device addresses, commands, output settings, and credentials are stored
+as a complete macOS Keychain payload. Ordinary application settings contain
+only an opaque job ID, ordering, schedule, device type, and counts. The Keychain
+payload is deleted when the batch completes, is cancelled, or is removed. A
+profile is snapshotted when submitted, so later changes to its `.env` do not
+change the queued batch.
+
+Queued work is restored after reopening, but the queue starts paused. An
+overdue schedule becomes **Ready** and requires **Resume Queue**. A batch that
+was running when the app stopped becomes **Interrupted** and must be retried
+manually because some commands may already have run. The app prevents idle
+system sleep while an unpaused schedule is armed or a run is active, but it
+cannot run while closed or while the Mac is shut down, manually asleep, or has
+its lid closed. Keep the Mac logged in, powered, awake, connected to the switch
+network, and leave the application open for unattended work.
+Verify queue ordering, cancellation, and scheduled live changes against approved
+lab switches before using the feature on production access switches.
 
 ## Use
 
