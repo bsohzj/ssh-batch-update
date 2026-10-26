@@ -109,10 +109,17 @@ lab switches before using the feature on production access switches.
 
 ### Audit history dashboard
 
-The **History** tab keeps a persistent audit index for live batches that run
-after the feature is installed. It does not import older output folders and
-does not record connection tests. History is loaded only when its tab is first
-opened, so it does not delay normal queue use or SSH execution.
+The full-window **History** screen keeps a persistent audit index for live
+batches that run after the feature is installed. It does not import older
+output folders and does not record connection tests. Use the main **SSH** and
+**History** tabs to switch between execution and audit review. History is
+loaded only when its screen is first opened, so it does not delay normal queue
+use or SSH execution.
+
+Queued and scheduled work continues while History is visible. When a batch
+starts and its device results begin updating, the **SSH** and **Device Results**
+tabs pulse briefly and retain a dot until **SSH** → **Device Results** is opened,
+without interrupting History review.
 
 The dashboard defaults to the last 30 days and provides summary cards, a line
 chart of successful and failed devices, a run-status donut chart, searchable

@@ -118,6 +118,8 @@ THEME_SYSTEM = "system"
 THEME_LIGHT = "light"
 THEME_DARK = "dark"
 THEME_MODES = (THEME_SYSTEM, THEME_LIGHT, THEME_DARK)
+RESULTS_ATTENTION_INTERVAL_MS = 500
+RESULTS_ATTENTION_TICKS = 6
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -720,6 +722,9 @@ class MainWindow(QMainWindow):
         self._history_ui_built = False
         self._history_page = 0
         self._history_records: dict[str, HistoryRecord] = {}
+        self._results_attention_pending = False
+        self._results_attention_tick = 0
+        self._results_attention_highlighted = False
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 850)
@@ -744,6 +749,13 @@ class MainWindow(QMainWindow):
         self._build_menu()
         central = QWidget(self)
         root = QVBoxLayout(central)
+        self.main_tabs = QTabWidget()
+        self.main_tabs.tabBar().setExpanding(True)
+        self.main_tabs.tabBar().setMinimumHeight(44)
+
+        ssh_tab = QWidget()
+        ssh_layout = QVBoxLayout(ssh_tab)
+        ssh_layout.setContentsMargins(0, 0, 0, 0)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
 
@@ -969,23 +981,36 @@ class MainWindow(QMainWindow):
 
         self.results_tabs.addTab(queue_tab, "Queue")
         self.results_tabs.addTab(device_results_tab, "Device Results")
+        self.results_tabs.currentChanged.connect(self._results_tab_changed)
+        results_layout.addWidget(self.results_tabs, 1)
+
         self.history_tab = QWidget()
         self.history_layout = QVBoxLayout(self.history_tab)
         self.history_placeholder = QLabel(
-            "Open this tab to load persistent audit history."
+            "Open History to load persistent audit history."
         )
         self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_layout.addWidget(self.history_placeholder, 1)
-        self.results_tabs.addTab(self.history_tab, "History")
-        self.results_tabs.currentChanged.connect(self._results_tab_changed)
-        results_layout.addWidget(self.results_tabs, 1)
 
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([480, 900])
-        root.addWidget(self.main_splitter)
+        ssh_layout.addWidget(self.main_splitter)
+
+        self.main_tabs.addTab(ssh_tab, "SSH")
+        self.main_tabs.addTab(self.history_tab, "History")
+        self.main_tabs.currentChanged.connect(self._main_tab_changed)
+        self.main_tabs.setCurrentWidget(ssh_tab)
+        self.ssh_tab = ssh_tab
+        root.addWidget(self.main_tabs)
+
+        self.results_attention_timer = QTimer(self)
+        self.results_attention_timer.setInterval(RESULTS_ATTENTION_INTERVAL_MS)
+        self.results_attention_timer.timeout.connect(
+            self._advance_results_attention_pulse
+        )
 
         self.setCentralWidget(central)
         self._update_destructive_button_styles()
@@ -1028,6 +1053,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("appearance/theme", self._theme_mode)
         self.settings.sync()
         self._update_destructive_button_styles()
+        self._refresh_results_attention_color()
         if self._history_ui_built and hasattr(self, "history_table"):
             self._refresh_history()
 
@@ -1611,7 +1637,7 @@ class MainWindow(QMainWindow):
         self._selected_job_id = job.job_id
         self._refresh_queue_table(select_job_id=job.job_id)
         self._show_job_results(job.job_id)
-        self.results_tabs.setCurrentIndex(1)
+        self._request_results_attention()
         self._start_worker(prepared, operation="run", job_id=job.job_id)
 
     def _start_audit_record(
@@ -2257,8 +2283,80 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _results_tab_changed(self, index: int) -> None:
-        if index == self.results_tabs.indexOf(self.history_tab):
+        del index
+        self._acknowledge_results_attention_if_visible()
+
+    @Slot(int)
+    def _main_tab_changed(self, index: int) -> None:
+        if index == self.main_tabs.indexOf(self.history_tab):
             self._ensure_history_ui()
+        self._acknowledge_results_attention_if_visible()
+
+    def _device_results_visible(self) -> bool:
+        return (
+            self.main_tabs.currentWidget() is self.ssh_tab
+            and self.results_tabs.currentIndex() == 1
+        )
+
+    def _request_results_attention(self) -> None:
+        if self._device_results_visible():
+            self._clear_results_attention()
+            return
+        self._results_attention_pending = True
+        self._results_attention_tick = 0
+        self._set_results_attention_labels(True)
+        self._set_results_attention_highlighted(True)
+        self.results_attention_timer.start()
+
+    def _advance_results_attention_pulse(self) -> None:
+        if not self._results_attention_pending:
+            self.results_attention_timer.stop()
+            return
+        self._results_attention_tick += 1
+        if self._results_attention_tick >= RESULTS_ATTENTION_TICKS:
+            self.results_attention_timer.stop()
+            self._set_results_attention_highlighted(False)
+            return
+        self._set_results_attention_highlighted(
+            self._results_attention_tick % 2 == 0
+        )
+
+    def _acknowledge_results_attention_if_visible(self) -> None:
+        if self._results_attention_pending and self._device_results_visible():
+            self._clear_results_attention()
+
+    def _clear_results_attention(self) -> None:
+        self.results_attention_timer.stop()
+        self._results_attention_pending = False
+        self._results_attention_tick = 0
+        self._set_results_attention_labels(False)
+        self._set_results_attention_highlighted(False)
+
+    def _set_results_attention_labels(self, pending: bool) -> None:
+        self.main_tabs.setTabText(
+            self.main_tabs.indexOf(self.ssh_tab), "SSH •" if pending else "SSH"
+        )
+        self.results_tabs.setTabText(
+            1, "Device Results •" if pending else "Device Results"
+        )
+
+    def _set_results_attention_highlighted(self, highlighted: bool) -> None:
+        self._results_attention_highlighted = highlighted
+        color = QColor()
+        if highlighted:
+            app = QApplication.instance()
+            palette = app.palette() if app is not None else self.palette()
+            color = palette.color(QPalette.ColorRole.Highlight)
+        self.main_tabs.tabBar().setTabTextColor(
+            self.main_tabs.indexOf(self.ssh_tab), color
+        )
+        self.results_tabs.tabBar().setTabTextColor(1, color)
+
+    def _refresh_results_attention_color(self) -> None:
+        if self._results_attention_pending:
+            self._set_results_attention_highlighted(
+                self._results_attention_highlighted
+            )
 
     def _ensure_history_ui(self) -> None:
         if self._history_ui_built:
@@ -2697,6 +2795,8 @@ class MainWindow(QMainWindow):
         }:
             if hasattr(self, "cancel_button"):
                 self._update_destructive_button_styles()
+            if hasattr(self, "results_attention_timer"):
+                self._refresh_results_attention_color()
             if self._history_ui_built and hasattr(self, "history_table"):
                 QTimer.singleShot(0, self._refresh_history)
 
@@ -2767,6 +2867,7 @@ class MainWindow(QMainWindow):
         self.totals_label.setText(record.result_text)
         self.open_output_button.setEnabled(Path(record.run_directory).is_dir())
         self.open_summary_button.setEnabled(Path(record.summary_path).is_file())
+        self.main_tabs.setCurrentWidget(self.ssh_tab)
         self.results_tabs.setCurrentIndex(1)
 
     @Slot()
@@ -2927,6 +3028,8 @@ class MainWindow(QMainWindow):
             self._save_settings()
             if hasattr(self, "scheduler_timer"):
                 self.scheduler_timer.stop()
+            if hasattr(self, "results_attention_timer"):
+                self.results_attention_timer.stop()
             if hasattr(self, "sleep_inhibitor"):
                 self.sleep_inhibitor.set_required(False)
             event.accept()
@@ -2961,6 +3064,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         if hasattr(self, "scheduler_timer"):
             self.scheduler_timer.stop()
+        if hasattr(self, "results_attention_timer"):
+            self.results_attention_timer.stop()
         if hasattr(self, "sleep_inhibitor"):
             self.sleep_inhibitor.set_required(False)
         event.accept()

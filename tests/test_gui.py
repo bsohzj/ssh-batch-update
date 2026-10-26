@@ -229,9 +229,15 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
+        self.assertEqual(self.window.main_tabs.count(), 2)
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(1), "History")
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertTrue(self.window.main_tabs.tabBar().expanding())
+        self.assertGreaterEqual(self.window.main_tabs.tabBar().minimumHeight(), 44)
+        self.assertEqual(self.window.results_tabs.count(), 2)
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
-        self.assertEqual(self.window.results_tabs.tabText(2), "History")
         self.assertEqual(self.window.queue_table.columnCount(), 8)
         self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
@@ -362,10 +368,13 @@ class MainWindowTests(unittest.TestCase):
     def test_history_tab_is_lazy_and_builds_cards_charts_and_table(self):
         self.assertFalse(self.window._history_ui_built)
 
-        self.window.results_tabs.setCurrentWidget(self.window.history_tab)
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
         self.app.processEvents()
 
         self.assertTrue(self.window._history_ui_built)
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
+        self.assertEqual(self.window.main_tabs.indexOf(self.window.history_tab), 1)
+        self.assertEqual(self.window.results_tabs.indexOf(self.window.history_tab), -1)
         self.assertEqual(self.window.history_table.columnCount(), 9)
         self.assertEqual(self.window.history_runs_value.text(), "0")
         self.assertEqual(len(self.window.history_line_view.chart().series()), 2)
@@ -373,6 +382,26 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.history_empty_label.isHidden())
         self.assertTrue(self.window.history_line_view.isHidden())
         self.assertTrue(self.window.history_pie_view.isHidden())
+
+    def test_reopened_window_defaults_to_ssh_instead_of_last_main_tab(self):
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+        self.window._save_settings()
+        self.window.close()
+        self.app.processEvents()
+
+        reopened_settings = QSettings(
+            str(self.base / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        self.window = gui.MainWindow(
+            reopened_settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=history.HistoryStore(self.base / "reopened-history.sqlite3"),
+            history_command_store=history.MemoryHistoryCommandStore(),
+        )
+
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertFalse(self.window._history_ui_built)
 
     def test_history_dashboard_filters_and_aggregates_records(self):
         self.add_history_record("good", "succeeded", successes=3, profile="Ops")
@@ -680,6 +709,106 @@ class MainWindowTests(unittest.TestCase):
         start_worker.assert_called_once()
         self.assertEqual(self.window.queue_controller.active_job_id, first.job_id)
 
+    def test_hidden_dispatch_keeps_history_visible_and_marks_results(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.paused = False
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+
+        with patch.object(self.window, "_start_worker") as start_worker:
+            self.window._queue_tick()
+
+        start_worker.assert_called_once()
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertTrue(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
+
+        self.window.main_tabs.setCurrentWidget(self.window.ssh_tab)
+
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertEqual(self.window.results_tabs.currentIndex(), 0)
+
+        self.window.results_tabs.setCurrentIndex(1)
+
+        self.assertFalse(self.window._results_attention_pending)
+        self.assertFalse(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+
+    def test_results_attention_pulses_three_times_then_leaves_dots(self):
+        self.window._request_results_attention()
+        timer = self.window.results_attention_timer
+        highlight = self.app.palette().color(QPalette.ColorRole.Highlight)
+
+        self.assertEqual(timer.interval(), 500)
+        self.assertEqual(gui.RESULTS_ATTENTION_TICKS, 6)
+        self.assertEqual(
+            self.window.main_tabs.tabBar().tabTextColor(0), highlight
+        )
+        self.assertEqual(
+            self.window.results_tabs.tabBar().tabTextColor(1), highlight
+        )
+
+        self.window._advance_results_attention_pulse()
+        self.window._request_results_attention()
+
+        self.assertIs(self.window.results_attention_timer, timer)
+        self.assertEqual(self.window._results_attention_tick, 0)
+        for _ in range(gui.RESULTS_ATTENTION_TICKS):
+            self.window._advance_results_attention_pulse()
+
+        self.assertFalse(timer.isActive())
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
+        self.assertFalse(
+            self.window.main_tabs.tabBar().tabTextColor(0).isValid()
+        )
+        self.assertFalse(
+            self.window.results_tabs.tabBar().tabTextColor(1).isValid()
+        )
+
+    def test_visible_results_do_not_request_attention(self):
+        self.window.results_tabs.setCurrentIndex(1)
+
+        self.window._request_results_attention()
+
+        self.assertFalse(self.window._results_attention_pending)
+        self.assertFalse(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+
+    def test_theme_change_updates_active_results_attention_color(self):
+        self.window._request_results_attention()
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        highlight = QColor("#0a84ff")
+        self.assertEqual(
+            self.window.main_tabs.tabBar().tabTextColor(0), highlight
+        )
+        self.assertEqual(
+            self.window.results_tabs.tabBar().tabTextColor(1), highlight
+        )
+
+    def test_close_stops_results_attention_timer(self):
+        self.window._request_results_attention()
+        self.assertTrue(self.window.results_attention_timer.isActive())
+
+        self.window.close()
+        self.app.processEvents()
+
+        self.assertFalse(self.window.results_attention_timer.isActive())
+
     def test_future_schedule_arms_idle_sleep_prevention(self):
         prepared = runner.prepare_run(
             self._valid_request("huawei", "192.0.2.1"),
@@ -894,10 +1023,14 @@ class MainWindowTests(unittest.TestCase):
         )
         self.window._ensure_history_ui()
         self.window.history_table.selectRow(0)
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+        self.window._request_results_attention()
 
         self.window.view_history_results()
 
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
         self.assertEqual(self.window.results_tabs.currentIndex(), 1)
+        self.assertFalse(self.window._results_attention_pending)
         self.assertEqual(self.window.device_table.rowCount(), 1)
         self.assertEqual(self.window.device_table.item(0, 0).text(), "192.0.2.5")
         self.assertEqual(self.window.device_table.item(0, 2).text(), "config / 2")
