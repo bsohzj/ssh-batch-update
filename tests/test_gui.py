@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import Qt, QSettings
+    from PySide6.QtCore import Qt, QSettings, QTime
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
 
@@ -179,22 +179,31 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
         self.assertEqual(self.window.queue_table.columnCount(), 8)
-        self.assertEqual(self.window.schedule_button.text(), "Schedule Batch")
+        self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
         self.assertFalse(hasattr(self.window, "queue_button"))
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
 
-    def test_schedule_dialog_displays_date_time_picker(self):
+    def test_schedule_dialog_displays_separate_date_and_time_fields(self):
         dialog = gui.ScheduleDialog()
         dialog.show()
         self.app.processEvents()
 
-        self.assertIs(dialog.date_time_edit.parentWidget(), dialog)
-        self.assertTrue(dialog.date_time_edit.isVisible())
-        self.assertTrue(dialog.date_time_edit.calendarPopup())
-        self.assertEqual(dialog.date_time_edit.displayFormat(), "yyyy-MM-dd HH:mm")
+        self.assertTrue(dialog.date_edit.isVisible())
+        self.assertTrue(dialog.time_edit.isVisible())
+        self.assertTrue(dialog.date_edit.calendarPopup())
+        self.assertEqual(dialog.date_edit.displayFormat(), "ddd, d MMM yyyy")
+        self.assertEqual(dialog.time_edit.displayFormat(), "h:mm AP")
+        self.assertTrue(dialog.preview_label.text().startswith("Scheduled for "))
+
+        dialog.date_edit.setDate(dialog.date_edit.date().addDays(1))
+        dialog.time_edit.setTime(QTime(18, 30))
+        self.app.processEvents()
+
+        self.assertIn("6:30 PM", dialog.preview_label.text())
+        self.assertGreater(dialog.selected_utc(), datetime.now(timezone.utc))
 
         dialog.close()
 

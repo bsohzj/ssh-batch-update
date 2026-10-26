@@ -29,9 +29,9 @@ from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
-    QDateTimeEdit,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -450,30 +451,62 @@ class ScheduleDialog(QDialog):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Schedule Batch")
+        self.setWindowTitle("Schedule Run")
+        self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
         label = QLabel("Run this batch at:")
         layout.addWidget(label)
-        self.date_time_edit = QDateTimeEdit()
-        self.date_time_edit.setCalendarPopup(True)
-        self.date_time_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
-        layout.addWidget(self.date_time_edit)
+
         minimum = QDateTime.currentDateTime().addSecs(60)
-        self.date_time_edit.setMinimumDateTime(minimum)
         if initial_utc is not None:
             selected = QDateTime.fromSecsSinceEpoch(int(initial_utc.timestamp())).toLocalTime()
-            self.date_time_edit.setDateTime(max(selected, minimum))
+            selected = max(selected, minimum)
         else:
-            self.date_time_edit.setDateTime(minimum)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            selected = minimum
+        if selected.time().second() or selected.time().msec():
+            selected = selected.addSecs(60 - selected.time().second())
+        selected.setTime(selected.time().addMSecs(-selected.time().msec()))
+
+        fields = QFormLayout()
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("ddd, d MMM yyyy")
+        self.date_edit.setMinimumDate(QDateTime.currentDateTime().date())
+        self.date_edit.setDate(selected.date())
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("h:mm AP")
+        self.time_edit.setTime(selected.time())
+        fields.addRow("Date", self.date_edit)
+        fields.addRow("Time", self.time_edit)
+        layout.addLayout(fields)
+
+        self.preview_label = QLabel()
+        self.preview_label.setWordWrap(True)
+        self.date_edit.dateChanged.connect(self._update_preview)
+        self.time_edit.timeChanged.connect(self._update_preview)
+        layout.addWidget(self.preview_label)
+        self._update_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        schedule_button = buttons.addButton(
+            "Schedule", QDialogButtonBox.ButtonRole.AcceptRole
         )
-        buttons.accepted.connect(self._accept_if_future)
+        schedule_button.clicked.connect(self._accept_if_future)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _selected_local(self) -> QDateTime:
+        return QDateTime(self.date_edit.date(), self.time_edit.time())
+
+    @Slot()
+    def _update_preview(self) -> None:
+        display = self._selected_local().toString(
+            "dddd, d MMMM yyyy 'at' h:mm AP"
+        )
+        self.preview_label.setText(f"Scheduled for {display}")
+
     def selected_utc(self) -> datetime:
-        local = self.date_time_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        local = self._selected_local().toPython().replace(second=0, microsecond=0)
         if local.tzinfo is None:
             local = local.astimezone()
         return local.astimezone(timezone.utc)
@@ -689,7 +722,7 @@ class MainWindow(QMainWindow):
         button_row = QGridLayout()
         self.validate_button = QPushButton("Validate Input")
         self.run_button = QPushButton("Run Live")
-        self.schedule_button = QPushButton("Schedule Batch")
+        self.schedule_button = QPushButton("Schedule Run")
         self.cancel_button = QPushButton("Stop Run")
         self.cancel_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.validate_button.clicked.connect(self.validate_inputs)

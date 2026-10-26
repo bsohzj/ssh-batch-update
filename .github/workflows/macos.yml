@@ -38,8 +38,8 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
-      - name: Run tests
-        run: python -m unittest -v
+      - name: Run core, queue, and GUI tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: Test interpreted GUI startup
         run: python gui.py --smoke-test

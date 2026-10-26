@@ -38,7 +38,7 @@ copied there. **Validate Input** performs no SSH connections. **Test
 Connections** logs in to each valid IP, detects the prompt, optionally verifies
 enable mode, and disconnects without running either command box. Its status,
 stage, full error, and diagnostic file appear in the same results table used by
-live runs. **Run Live** and **Schedule Batch** validate and confirm a complete
+live runs. **Run Live** and **Schedule Run** validate and confirm a complete
 batch snapshot before it can make changes. Per-device
 progress never displays literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
@@ -71,8 +71,9 @@ permissions, and never commit them to Git.
 The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
-earlier ready work. Use **Schedule Batch** to select one future local date and
-time. Future jobs do not block ready jobs, and batches scheduled for the same
+earlier ready work. Use **Schedule Run** to select a future local date from the
+calendar and a separate time field; the dialog shows a readable schedule
+preview before submission. Future jobs do not block ready jobs, and batches scheduled for the same
 time run in the visible queue order.
 
 The **Queue** tab shows order, device and command counts, schedule, status, and
