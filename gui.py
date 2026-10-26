@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from PySide6.QtCore import (
     QDateTime,
+    QEvent,
     QObject,
     QProcess,
     QSettings,
@@ -25,7 +26,16 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QCloseEvent, QColor, QDesktopServices, QPainter
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QDesktopServices,
+    QPainter,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -33,6 +43,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -103,6 +114,74 @@ from run_commands import (
 APP_NAME = "SSH Batch Update"
 ORGANIZATION_NAME = "SG4291"
 MANUAL_PROFILE_TEXT = "Manual"
+THEME_SYSTEM = "system"
+THEME_LIGHT = "light"
+THEME_DARK = "dark"
+THEME_MODES = (THEME_SYSTEM, THEME_LIGHT, THEME_DARK)
+
+
+def normalize_theme_mode(value: object) -> str:
+    """Return a supported persisted theme name, defaulting safely to System."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in THEME_MODES else THEME_SYSTEM
+
+
+def _forced_theme_palette(mode: str) -> QPalette:
+    """Build a complete application palette without replacing the native style."""
+    dark = mode == THEME_DARK
+    colors = {
+        QPalette.ColorRole.Window: "#202124" if dark else "#f5f5f5",
+        QPalette.ColorRole.WindowText: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.Base: "#151515" if dark else "#ffffff",
+        QPalette.ColorRole.AlternateBase: "#292a2d" if dark else "#eeeeee",
+        QPalette.ColorRole.ToolTipBase: "#303134" if dark else "#ffffdc",
+        QPalette.ColorRole.ToolTipText: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.Text: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.Button: "#303134" if dark else "#eeeeee",
+        QPalette.ColorRole.ButtonText: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.BrightText: "#ffffff",
+        QPalette.ColorRole.Link: "#8ab4f8" if dark else "#0067c0",
+        QPalette.ColorRole.Highlight: "#0a84ff" if dark else "#0067c0",
+        QPalette.ColorRole.HighlightedText: "#ffffff",
+        QPalette.ColorRole.PlaceholderText: "#9aa0a6" if dark else "#767676",
+        QPalette.ColorRole.Light: "#5f6368" if dark else "#ffffff",
+        QPalette.ColorRole.Midlight: "#3c4043" if dark else "#dadce0",
+        QPalette.ColorRole.Mid: "#5f6368" if dark else "#9aa0a6",
+        QPalette.ColorRole.Dark: "#121212" if dark else "#5f6368",
+        QPalette.ColorRole.Shadow: "#000000",
+    }
+    palette = QPalette()
+    for role, color in colors.items():
+        palette.setColor(role, QColor(color))
+    disabled = QColor("#80868b" if dark else "#777777")
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.PlaceholderText,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, disabled)
+    return palette
+
+
+def apply_application_theme(app: QApplication, mode: object) -> str:
+    """Apply a theme to every Qt window while retaining the platform widget style."""
+    normalized = normalize_theme_mode(mode)
+    scheme = {
+        THEME_SYSTEM: Qt.ColorScheme.Unknown,
+        THEME_LIGHT: Qt.ColorScheme.Light,
+        THEME_DARK: Qt.ColorScheme.Dark,
+    }[normalized]
+    app.styleHints().setColorScheme(scheme)
+    if normalized == THEME_SYSTEM:
+        # An unresolved palette hands color ownership back to the platform, so future
+        # macOS appearance changes continue to reach the application.
+        app.setPalette(QPalette())
+    else:
+        app.setPalette(_forced_theme_palette(normalized))
+    return normalized
+
+
 PROFILE_GROUP = "credential_profiles/items"
 LAST_PROFILE_KEY = "credential_profiles/last_selected"
 
@@ -586,6 +665,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.settings = settings or QSettings(ORGANIZATION_NAME, APP_NAME)
+        self._theme_mode = normalize_theme_mode(
+            self.settings.value("appearance/theme", THEME_SYSTEM, str)
+        )
+        app = QApplication.instance()
+        if app is not None:
+            apply_application_theme(app, self._theme_mode)
         self.profile_store = CredentialProfileStore(self.settings)
         self.queue_controller = QueueController(
             QueueMetadataStore(self.settings),
@@ -656,6 +741,7 @@ class MainWindow(QMainWindow):
             self.validation_label.setText(self._history_startup_warning)
 
     def _build_ui(self) -> None:
+        self._build_menu()
         central = QWidget(self)
         root = QVBoxLayout(central)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -764,7 +850,6 @@ class MainWindow(QMainWindow):
         self.run_button = QPushButton("Run Live")
         self.schedule_button = QPushButton("Schedule Run")
         self.cancel_button = QPushButton("Stop Run")
-        self.cancel_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.validate_button.clicked.connect(self.validate_inputs)
         self.run_button.clicked.connect(self.start_run)
         self.schedule_button.clicked.connect(self.schedule_batch)
@@ -819,7 +904,6 @@ class MainWindow(QMainWindow):
         self.retry_button = QPushButton("Retry")
         self.remove_batch_button = QPushButton("Remove")
         self.clear_completed_button = QPushButton("Clear Completed")
-        self.clear_completed_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
         self.move_up_button.clicked.connect(lambda: self.move_selected_batch(-1))
         self.move_down_button.clicked.connect(lambda: self.move_selected_batch(1))
@@ -904,6 +988,65 @@ class MainWindow(QMainWindow):
         root.addWidget(self.main_splitter)
 
         self.setCentralWidget(central)
+        self._update_destructive_button_styles()
+
+    def _build_menu(self) -> None:
+        self.view_menu = self.menuBar().addMenu("&View")
+        self.theme_menu = self.view_menu.addMenu("&Theme")
+        self.theme_action_group = QActionGroup(self)
+        self.theme_action_group.setExclusive(True)
+        self.theme_actions: dict[str, QAction] = {}
+        for mode, label in (
+            (THEME_SYSTEM, "System"),
+            (THEME_LIGHT, "Light"),
+            (THEME_DARK, "Dark"),
+        ):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setChecked(mode == self._theme_mode)
+            action.triggered.connect(
+                lambda checked=False, selected=mode: self._select_theme(
+                    selected, checked
+                )
+            )
+            self.theme_action_group.addAction(action)
+            self.theme_menu.addAction(action)
+            self.theme_actions[mode] = action
+        self.theme_system_action = self.theme_actions[THEME_SYSTEM]
+        self.theme_light_action = self.theme_actions[THEME_LIGHT]
+        self.theme_dark_action = self.theme_actions[THEME_DARK]
+
+    @Slot(str, bool)
+    def _select_theme(self, mode: str, checked: bool = True) -> None:
+        if not checked:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._theme_mode = apply_application_theme(app, mode)
+        self.settings.setValue("appearance/theme", self._theme_mode)
+        self.settings.sync()
+        self._update_destructive_button_styles()
+        if self._history_ui_built and hasattr(self, "history_table"):
+            self._refresh_history()
+
+    def _update_destructive_button_styles(self) -> None:
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        color = "#ff6b6b" if dark else "#c62828"
+        style = f"QPushButton {{ color: {color}; }}"
+        for name in (
+            "cancel_button",
+            "clear_completed_button",
+            "history_remove_button",
+            "history_delete_outputs_button",
+            "history_clear_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setStyleSheet(style)
 
     def _path_row(self, placeholder: str, callback) -> tuple[QLineEdit, QWidget]:
         edit = QLineEdit()
@@ -2201,6 +2344,8 @@ class MainWindow(QMainWindow):
         self.history_pie_view = QChartView()
         self.history_line_view.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.history_pie_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.history_line_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.history_pie_view.setFrameShape(QFrame.Shape.NoFrame)
         self.history_line_view.setMinimumHeight(220)
         self.history_pie_view.setMinimumHeight(220)
         charts.addWidget(self.history_line_view, 3)
@@ -2259,11 +2404,6 @@ class MainWindow(QMainWindow):
         self.history_remove_button = QPushButton("Remove from History")
         self.history_delete_outputs_button = QPushButton("Delete History && Outputs")
         self.history_clear_button = QPushButton("Clear History")
-        self.history_remove_button.setStyleSheet("QPushButton { color: #c62828; }")
-        self.history_delete_outputs_button.setStyleSheet(
-            "QPushButton { color: #c62828; }"
-        )
-        self.history_clear_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.history_results_button.clicked.connect(self.view_history_results)
         self.history_commands_button.clicked.connect(self.view_history_commands)
         self.history_output_button.clicked.connect(self.open_history_output)
@@ -2286,6 +2426,7 @@ class MainWindow(QMainWindow):
         ):
             actions.addWidget(button, index // 4, index % 4)
         self.history_layout.addLayout(actions)
+        self._update_destructive_button_styles()
 
         self.history_search_edit.textChanged.connect(self._history_filters_changed)
         for combo in (
@@ -2403,6 +2544,8 @@ class MainWindow(QMainWindow):
                 self.history_table.setItem(row, column, item)
         self.history_table.blockSignals(False)
         self.history_empty_label.setVisible(total == 0)
+        self.history_line_view.setVisible(total > 0)
+        self.history_pie_view.setVisible(total > 0)
         pages = max(1, (total + 99) // 100)
         if self._history_page >= pages:
             self._history_page = pages - 1
@@ -2441,14 +2584,24 @@ class MainWindow(QMainWindow):
             QValueAxis,
         )
 
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        dark_mode = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        success_color = QColor("#66bb6a" if dark_mode else "#2e7d32")
+        failure_color = QColor("#ef5350" if dark_mode else "#c62828")
+
         chart = QChart()
         chart.setTitle("Successful and failed devices over time")
         success_series = QLineSeries()
         success_series.setName("Succeeded")
-        success_series.setColor(QColor("#2e7d32"))
+        success_series.setColor(success_color)
+        success_series.setPointsVisible(True)
+        success_series.setMarkerSize(8.0)
         failure_series = QLineSeries()
         failure_series.setName("Failed")
-        failure_series.setColor(QColor("#c62828"))
+        failure_series.setColor(failure_color)
+        failure_series.setPointsVisible(True)
+        failure_series.setMarkerSize(8.0)
         labels: list[str] = []
         maximum = 1
         for index, bucket in enumerate(timeline):
@@ -2470,26 +2623,82 @@ class MainWindow(QMainWindow):
         success_series.attachAxis(y_axis)
         failure_series.attachAxis(x_axis)
         failure_series.attachAxis(y_axis)
+        self._style_history_chart(chart, (x_axis, y_axis))
+        self.history_line_view.setBackgroundBrush(
+            QBrush(palette.color(QPalette.ColorRole.Window))
+        )
         self.history_line_view.setChart(chart)
 
         pie_chart = QChart()
         pie_chart.setTitle("Run status")
         pie = QPieSeries()
         pie.setHoleSize(0.45)
-        colors = {
-            "succeeded": "#2e7d32",
-            "completed_with_failures": "#f9a825",
-            "failed": "#c62828",
-            "cancelled": "#616161",
-            "interrupted": "#6a1b9a",
-            "running": "#1565c0",
-        }
+        colors = (
+            {
+                "succeeded": "#66bb6a",
+                "completed_with_failures": "#ffca28",
+                "failed": "#ef5350",
+                "cancelled": "#b0bec5",
+                "interrupted": "#ba68c8",
+                "running": "#64b5f6",
+            }
+            if dark_mode
+            else {
+                "succeeded": "#2e7d32",
+                "completed_with_failures": "#f9a825",
+                "failed": "#c62828",
+                "cancelled": "#616161",
+                "interrupted": "#6a1b9a",
+                "running": "#1565c0",
+            }
+        )
         for status, count in statuses.items():
             if count:
                 piece = pie.append(status.replace("_", " ").title(), count)
                 piece.setColor(QColor(colors.get(status, "#546e7a")))
+                piece.setBorderColor(palette.color(QPalette.ColorRole.Base))
+                piece.setLabelColor(palette.color(QPalette.ColorRole.WindowText))
         pie_chart.addSeries(pie)
+        self._style_history_chart(pie_chart)
+        self.history_pie_view.setBackgroundBrush(
+            QBrush(palette.color(QPalette.ColorRole.Window))
+        )
         self.history_pie_view.setChart(pie_chart)
+
+    def _style_history_chart(self, chart, axes=()) -> None:
+        """Match Qt Charts, which does not inherit QWidget dark-mode colors."""
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        window = palette.color(QPalette.ColorRole.Window)
+        base = palette.color(QPalette.ColorRole.Base)
+        text = palette.color(QPalette.ColorRole.WindowText)
+        mid = palette.color(QPalette.ColorRole.Mid)
+        chart.setBackgroundVisible(True)
+        chart.setBackgroundBrush(QBrush(window))
+        chart.setBackgroundRoundness(4)
+        chart.setDropShadowEnabled(False)
+        chart.setPlotAreaBackgroundVisible(True)
+        chart.setPlotAreaBackgroundBrush(QBrush(base))
+        chart.setTitleBrush(QBrush(text))
+        chart.legend().setLabelColor(text)
+        chart.legend().setBackgroundVisible(False)
+        for axis in axes:
+            axis.setLabelsColor(text)
+            axis.setTitleBrush(QBrush(text))
+            axis.setLinePenColor(mid)
+            axis.setGridLineColor(mid)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.ThemeChange,
+        }:
+            if hasattr(self, "cancel_button"):
+                self._update_destructive_button_styles()
+            if self._history_ui_built and hasattr(self, "history_table"):
+                QTimer.singleShot(0, self._refresh_history)
 
     def _change_history_page(self, direction: int) -> None:
         self._history_page = max(0, self._history_page + direction)
@@ -2896,6 +3105,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 str(Path(temporary) / "smoke-settings.ini"),
                 QSettings.Format.IniFormat,
             )
+            apply_application_theme(
+                app,
+                smoke_settings.value("appearance/theme", THEME_SYSTEM, str),
+            )
             window = MainWindow(
                 smoke_settings,
                 secret_store=MemorySecretStore(),
@@ -2909,7 +3122,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             window.close()
             app.processEvents()
         return 0
-    window = MainWindow()
+    settings = QSettings(ORGANIZATION_NAME, APP_NAME)
+    apply_application_theme(
+        app,
+        settings.value("appearance/theme", THEME_SYSTEM, str),
+    )
+    window = MainWindow(settings)
     window.show()
     return app.exec()
 

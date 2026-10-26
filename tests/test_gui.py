@@ -9,8 +9,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import Qt, QSettings, QTime
-    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtCore import QEvent, Qt, QSettings, QTime
+    from PySide6.QtGui import QCloseEvent, QColor, QPalette
     from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
 
     import batch_queue
@@ -240,6 +240,125 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
 
+    def test_theme_menu_defaults_to_system_and_actions_are_exclusive(self):
+        self.assertEqual(self.window.view_menu.title().replace("&", ""), "View")
+        self.assertEqual(self.window.theme_menu.title().replace("&", ""), "Theme")
+        self.assertTrue(self.window.theme_action_group.isExclusive())
+        self.assertTrue(self.window.theme_system_action.isChecked())
+        self.assertFalse(self.window.theme_light_action.isChecked())
+        self.assertFalse(self.window.theme_dark_action.isChecked())
+
+        self.window.theme_dark_action.trigger()
+
+        self.assertFalse(self.window.theme_system_action.isChecked())
+        self.assertFalse(self.window.theme_light_action.isChecked())
+        self.assertTrue(self.window.theme_dark_action.isChecked())
+        self.assertEqual(self.settings.value("appearance/theme"), "dark")
+        self.settings.beginGroup("appearance")
+        self.assertEqual(self.settings.childKeys(), ["theme"])
+        self.settings.endGroup()
+
+    def test_runtime_theme_is_application_wide_and_system_restores_native_palette(self):
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        app_palette = self.app.palette()
+        self.assertEqual(
+            app_palette.color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+        self.assertEqual(
+            self.window.palette().color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+        dialog = QDialog(self.window)
+        self.assertEqual(
+            dialog.palette().color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+        self.assertGreater(self.app.palette().resolveMask(), 0)
+
+        self.window.theme_light_action.trigger()
+        self.app.processEvents()
+
+        self.assertTrue(self.window.theme_light_action.isChecked())
+        self.assertEqual(
+            self.app.palette().color(QPalette.ColorRole.Window), QColor("#f5f5f5")
+        )
+        self.assertEqual(self.settings.value("appearance/theme"), "light")
+
+        self.window.theme_system_action.trigger()
+        self.app.processEvents()
+
+        self.assertEqual(self.window._theme_mode, gui.THEME_SYSTEM)
+        self.assertTrue(self.window.theme_system_action.isChecked())
+        self.assertEqual(self.settings.value("appearance/theme"), "system")
+        self.assertEqual(self.app.palette().resolveMask(), 0)
+
+    def test_stored_theme_is_applied_when_a_window_is_reopened(self):
+        self.window.theme_dark_action.trigger()
+        self.settings.sync()
+        self.window.close()
+        self.app.processEvents()
+
+        reopened_settings = QSettings(
+            str(self.base / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        self.window = gui.MainWindow(
+            reopened_settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=history.HistoryStore(self.base / "reopened-history.sqlite3"),
+            history_command_store=history.MemoryHistoryCommandStore(),
+        )
+
+        self.assertEqual(self.window._theme_mode, gui.THEME_DARK)
+        self.assertTrue(self.window.theme_dark_action.isChecked())
+        self.assertEqual(
+            self.app.palette().color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+
+    def test_theme_switch_preserves_lazy_history_and_styles_it_when_created(self):
+        self.assertFalse(self.window._history_ui_built)
+
+        self.window.theme_dark_action.trigger()
+
+        self.assertFalse(self.window._history_ui_built)
+        self.add_history_record("lazy-dark")
+        self.window._ensure_history_ui()
+        line_chart = self.window.history_line_view.chart()
+        self.assertEqual(
+            line_chart.backgroundBrush().color(), QColor("#202124")
+        )
+        self.assertEqual(
+            [series.color().name() for series in line_chart.series()],
+            ["#66bb6a", "#ef5350"],
+        )
+
+    def test_runtime_theme_refreshes_existing_history_and_destructive_colors(self):
+        self.add_history_record("existing-theme")
+        self.window._ensure_history_ui()
+        self.assertIn("#c62828", self.window.cancel_button.styleSheet())
+        self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
+        self.assertIn("#c62828", self.window.history_clear_button.styleSheet())
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        line_chart = self.window.history_line_view.chart()
+        self.assertEqual(
+            line_chart.backgroundBrush().color(), QColor("#202124")
+        )
+        self.assertEqual(
+            [series.color().name() for series in line_chart.series()],
+            ["#66bb6a", "#ef5350"],
+        )
+        for button in (
+            self.window.cancel_button,
+            self.window.clear_completed_button,
+            self.window.history_remove_button,
+            self.window.history_delete_outputs_button,
+            self.window.history_clear_button,
+        ):
+            self.assertIn("#ff6b6b", button.styleSheet())
+
     def test_history_tab_is_lazy_and_builds_cards_charts_and_table(self):
         self.assertFalse(self.window._history_ui_built)
 
@@ -252,6 +371,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(len(self.window.history_line_view.chart().series()), 2)
         self.assertEqual(len(self.window.history_pie_view.chart().series()), 1)
         self.assertFalse(self.window.history_empty_label.isHidden())
+        self.assertTrue(self.window.history_line_view.isHidden())
+        self.assertTrue(self.window.history_pie_view.isHidden())
 
     def test_history_dashboard_filters_and_aggregates_records(self):
         self.add_history_record("good", "succeeded", successes=3, profile="Ops")
@@ -270,6 +391,19 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.history_failure_value.text(), "2")
         self.assertEqual(self.window.history_rate_value.text(), "66.7%")
         self.assertEqual(self.window.history_table.rowCount(), 2)
+        self.assertFalse(self.window.history_line_view.isHidden())
+        self.assertFalse(self.window.history_pie_view.isHidden())
+        line_series = self.window.history_line_view.chart().series()
+        self.assertEqual([series.count() for series in line_series], [1, 1])
+        self.assertTrue(all(series.pointsVisible() for series in line_series))
+        self.assertEqual([series.markerSize() for series in line_series], [8.0, 8.0])
+        self.assertEqual(
+            [
+                [(point.x(), point.y()) for point in series.points()]
+                for series in line_series
+            ],
+            [[(0.0, 4.0)], [(0.0, 2.0)]],
+        )
 
         index = self.window.history_status_combo.findData("completed_with_failures")
         self.window.history_status_combo.setCurrentIndex(index)
@@ -280,6 +414,53 @@ class MainWindowTests(unittest.TestCase):
             self.window.history_table.item(0, 7).text(),
             "Completed With Failures",
         )
+
+    def test_history_charts_use_dark_palette_and_accessible_colors(self):
+        palette = QPalette(self.window.palette())
+        palette.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#151515"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#f1f3f4"))
+        palette.setColor(QPalette.ColorRole.Mid, QColor("#5f6368"))
+        self.app.setPalette(palette)
+        self.add_history_record("dark", "completed_with_failures", 2, 1)
+
+        self.window._ensure_history_ui()
+
+        line_chart = self.window.history_line_view.chart()
+        self.assertEqual(
+            line_chart.backgroundBrush().color(), palette.color(QPalette.ColorRole.Window)
+        )
+        self.assertEqual(
+            line_chart.plotAreaBackgroundBrush().color(),
+            palette.color(QPalette.ColorRole.Base),
+        )
+        self.assertEqual(
+            line_chart.titleBrush().color(), palette.color(QPalette.ColorRole.WindowText)
+        )
+        for axis in line_chart.axes():
+            self.assertEqual(
+                axis.labelsColor(), palette.color(QPalette.ColorRole.WindowText)
+            )
+            self.assertEqual(axis.gridLineColor(), palette.color(QPalette.ColorRole.Mid))
+        line_colors = [series.color().name() for series in line_chart.series()]
+        self.assertEqual(line_colors, ["#66bb6a", "#ef5350"])
+
+        pie_chart = self.window.history_pie_view.chart()
+        self.assertEqual(
+            pie_chart.backgroundBrush().color(), palette.color(QPalette.ColorRole.Window)
+        )
+        pie_colors = [piece.color().name() for piece in pie_chart.series()[0].slices()]
+        self.assertEqual(pie_colors, ["#ffca28"])
+
+    def test_palette_change_refreshes_already_created_history_charts(self):
+        self.add_history_record("palette")
+        self.window._ensure_history_ui()
+
+        with patch.object(self.window, "_refresh_history") as refresh:
+            self.window.changeEvent(QEvent(QEvent.Type.PaletteChange))
+            self.app.processEvents()
+
+        refresh.assert_called_once_with()
 
     def test_scheduled_audit_start_snapshots_profile_and_encrypted_commands(self):
         prepared = runner.prepare_run(
