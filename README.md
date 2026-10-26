@@ -107,6 +107,47 @@ network, and leave the application open for unattended work.
 Verify queue ordering, cancellation, and scheduled live changes against approved
 lab switches before using the feature on production access switches.
 
+### Audit history dashboard
+
+The **History** tab keeps a persistent audit index for live batches that run
+after the feature is installed. It does not import older output folders and
+does not record connection tests. History is loaded only when its tab is first
+opened, so it does not delay normal queue use or SSH execution.
+
+The dashboard defaults to the last 30 days and provides summary cards, a line
+chart of successful and failed devices, a run-status donut chart, searchable
+and filterable records, and 100-row pagination. Filters include date range,
+status, manual or scheduled source, device type, and credential-profile label.
+Selecting a record can load its `summary.csv` into **Device Results**, open its
+output or summary, or show its encrypted command snapshot after a sensitive
+content warning.
+
+Audit metadata is stored in an owner-private SQLite database at the app's
+macOS Application Support location. The database contains batch metadata,
+aggregate result counts, friendly profile labels, and output paths. It never
+contains usernames, passwords, enable secrets, command text, device addresses,
+or per-device error details. Device details are read from the existing
+`summary.csv` only when requested, so moved or deleted output is shown as
+unavailable rather than copied into another data store.
+
+Exact command snapshots are encrypted separately in macOS Keychain under
+service `com.sg4291.sshbatchupdate.history.commands`. They can include literal
+password commands, so **View Commands** displays a warning. Queue payloads and
+credential snapshots continue to be removed at the end of a run; the
+command-only history snapshot remains until its audit record is removed.
+
+**Remove from History** deletes the database reference and command snapshot but
+preserves transcripts and reports. **Clear History** does the same for every
+record. **Delete History & Outputs** is a separate per-run destructive action
+that requires confirmation and only operates on a validated, marked `run_`
+directory; there is no bulk output deletion. **Clear Completed** affects only
+the current Queue display and never deletes persistent audit history.
+
+History records are kept until manually removed. An unfinished record is
+marked **Interrupted** after the next launch and is never retried
+automatically. A history or Keychain error is reported in the interface but
+does not stop an already confirmed live batch.
+
 ## Use
 
 Put one IPv4 or IPv6 address per line in an inventory file. Hostnames are not
@@ -189,4 +230,5 @@ hidden files.
 
 The app is intentionally unsigned. Gatekeeper warnings are expected, and a
 company security policy may prevent unsigned applications from running. The app
-bundle never includes `.env`, inventory, command, transcript, or output files.
+bundle never includes `.env`, inventory, command, transcript, output,
+audit-database, or Keychain payload files.

@@ -11,10 +11,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtCore import Qt, QSettings, QTime
     from PySide6.QtGui import QCloseEvent
-    from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
+    from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
 
     import batch_queue
     import gui
+    import history
     import run_commands as runner
 except ImportError:
     GUI_AVAILABLE = False
@@ -36,7 +37,14 @@ class MainWindowTests(unittest.TestCase):
             QSettings.Format.IniFormat,
         )
         self.secret_store = batch_queue.MemorySecretStore()
-        self.window = gui.MainWindow(self.settings, secret_store=self.secret_store)
+        self.history_store = history.HistoryStore(self.base / "history.sqlite3")
+        self.history_commands = history.MemoryHistoryCommandStore()
+        self.window = gui.MainWindow(
+            self.settings,
+            secret_store=self.secret_store,
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
 
     def tearDown(self):
         with patch.object(
@@ -56,6 +64,51 @@ class MainWindowTests(unittest.TestCase):
         self.window.password_edit.setText("secret")
         self.window.output_edit.setText(str(self.base / "outputs"))
         self.window.device_type_combo.setCurrentText("cisco_ios")
+
+    def add_history_record(
+        self,
+        job_id="history-job",
+        status="succeeded",
+        successes=1,
+        failures=0,
+        cancelled=0,
+        source="manual",
+        profile="Manual",
+        run_directory="",
+        summary_path="",
+    ):
+        now = datetime.now(timezone.utc)
+        record = history.HistoryRecord(
+            job_id=job_id,
+            batch_name=f"cisco_ios — 1 devices — {job_id}",
+            created_utc=now - timedelta(minutes=2),
+            scheduled_utc=now - timedelta(minutes=1) if source == "scheduled" else None,
+            started_utc=now - timedelta(minutes=1),
+            completed_utc=None,
+            source=source,
+            profile_label=profile,
+            device_type="cisco_ios",
+            valid_devices=1,
+            invalid_devices=0,
+            command_count=2,
+        )
+        self.history_store.start(record)
+        if status != "running":
+            result_text = (
+                f"{successes} succeeded, {failures} failed, {cancelled} cancelled"
+            )
+            self.history_store.finalize(
+                job_id,
+                status,
+                successes,
+                failures,
+                cancelled,
+                result_text,
+                run_directory,
+                summary_path,
+                completed_utc=now,
+            )
+        return self.history_store.get(job_id)
 
     def test_validation_populates_devices_and_enables_live_run(self):
         self.populate_valid_inputs()
@@ -178,6 +231,7 @@ class MainWindowTests(unittest.TestCase):
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+        self.assertEqual(self.window.results_tabs.tabText(2), "History")
         self.assertEqual(self.window.queue_table.columnCount(), 8)
         self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
@@ -185,6 +239,153 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
+
+    def test_history_tab_is_lazy_and_builds_cards_charts_and_table(self):
+        self.assertFalse(self.window._history_ui_built)
+
+        self.window.results_tabs.setCurrentWidget(self.window.history_tab)
+        self.app.processEvents()
+
+        self.assertTrue(self.window._history_ui_built)
+        self.assertEqual(self.window.history_table.columnCount(), 9)
+        self.assertEqual(self.window.history_runs_value.text(), "0")
+        self.assertEqual(len(self.window.history_line_view.chart().series()), 2)
+        self.assertEqual(len(self.window.history_pie_view.chart().series()), 1)
+        self.assertFalse(self.window.history_empty_label.isHidden())
+
+    def test_history_dashboard_filters_and_aggregates_records(self):
+        self.add_history_record("good", "succeeded", successes=3, profile="Ops")
+        self.add_history_record(
+            "partial",
+            "completed_with_failures",
+            successes=1,
+            failures=2,
+            source="scheduled",
+            profile="Night",
+        )
+        self.window._ensure_history_ui()
+
+        self.assertEqual(self.window.history_runs_value.text(), "2")
+        self.assertEqual(self.window.history_success_value.text(), "4")
+        self.assertEqual(self.window.history_failure_value.text(), "2")
+        self.assertEqual(self.window.history_rate_value.text(), "66.7%")
+        self.assertEqual(self.window.history_table.rowCount(), 2)
+
+        index = self.window.history_status_combo.findData("completed_with_failures")
+        self.window.history_status_combo.setCurrentIndex(index)
+        self.app.processEvents()
+
+        self.assertEqual(self.window.history_table.rowCount(), 1)
+        self.assertEqual(
+            self.window.history_table.item(0, 7).text(),
+            "Completed With Failures",
+        )
+
+    def test_scheduled_audit_start_snapshots_profile_and_encrypted_commands(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Night Ops")
+        scheduled = datetime.now(timezone.utc) + timedelta(hours=1)
+        job = self.window.queue_controller.add(payload, prepared, scheduled)
+
+        self.window._start_audit_record(job, payload, prepared)
+
+        record = self.history_store.get(job.job_id)
+        self.assertEqual(record.source, "scheduled")
+        self.assertEqual(record.profile_label, "Night Ops")
+        snapshot = self.history_commands.get(job.job_id)
+        self.assertEqual(
+            [(command.section, command.text) for command in snapshot.commands],
+            [("exec", "show version"), ("config", "interface loopback 1")],
+        )
+
+    def test_completed_run_finalizes_history_and_writes_protected_marker(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Ops")
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+        run_directory = self.base / "outputs" / "run_history"
+        run_directory.mkdir(parents=True)
+        transcript = run_directory / "192.0.2.1.txt"
+        transcript.write_text("ok", encoding="utf-8")
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.1", "success", "", transcript_file=str(transcript)
+        )
+        runner.write_summary(summary, [device])
+
+        self.window._run_completed(
+            runner.BatchResult((device,), run_directory, summary)
+        )
+
+        record = self.history_store.get(job.job_id)
+        self.assertEqual(record.status, "succeeded")
+        self.assertEqual(record.success_count, 1)
+        self.assertEqual(Path(record.summary_path), summary)
+        self.assertTrue((run_directory / history.HISTORY_MARKER).is_file())
+
+    def test_cancelled_run_is_finalized_in_audit_history(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+        run_directory = self.base / "outputs" / "run_cancelled"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.1", "cancelled", "", error="cancelled by user"
+        )
+        runner.write_summary(summary, [device])
+
+        self.window._run_completed(
+            runner.BatchResult((device,), run_directory, summary)
+        )
+
+        record = self.history_store.get(job.job_id)
+        self.assertEqual(record.status, "cancelled")
+        self.assertEqual(record.cancelled_count, 1)
+
+    def test_worker_failure_history_redacts_credentials_and_addresses(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Manual")
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+
+        self.window._run_failed("secret rejected by 192.0.2.1 for admin")
+
+        result = self.history_store.get(job.job_id).result_text
+        self.assertNotIn("secret", result)
+        self.assertNotIn("192.0.2.1", result)
+        self.assertNotIn("admin", result)
+        self.assertIn("[redacted]", result)
+        self.assertIn("[device]", result)
 
     def test_schedule_dialog_displays_separate_date_and_time_fields(self):
         dialog = gui.ScheduleDialog()
@@ -463,6 +664,157 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertEqual(self.window.queue_table.rowCount(), 1)
 
+    def test_clear_completed_queue_entries_does_not_remove_audit_history(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        job = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window.queue_controller.mark_terminal(job.job_id, "succeeded", "complete")
+        self.add_history_record(job.job_id)
+        self.window._refresh_queue_table(select_job_id=job.job_id)
+
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.clear_completed_batches()
+
+        self.assertIsNone(self.window.queue_controller.job(job.job_id))
+        self.assertIsNotNone(self.history_store.get(job.job_id))
+
+    def test_history_device_results_load_from_summary_on_demand(self):
+        run_directory = self.base / "outputs" / "run_results"
+        run_directory.mkdir(parents=True)
+        transcript = run_directory / "192.0.2.5.txt"
+        transcript.write_text("device output", encoding="utf-8")
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.5",
+            "failed",
+            "",
+            failed_section="config",
+            failed_line="2",
+            transcript_file=str(transcript),
+            error="configuration rejected",
+        )
+        runner.write_summary(summary, [device])
+        self.add_history_record(
+            "results",
+            "completed_with_failures",
+            failures=1,
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        self.window.view_history_results()
+
+        self.assertEqual(self.window.results_tabs.currentIndex(), 1)
+        self.assertEqual(self.window.device_table.rowCount(), 1)
+        self.assertEqual(self.window.device_table.item(0, 0).text(), "192.0.2.5")
+        self.assertEqual(self.window.device_table.item(0, 2).text(), "config / 2")
+        self.assertEqual(
+            self.window.device_table.item(0, 3).text(), "configuration rejected"
+        )
+        self.assertEqual(self.window.device_table.item(0, 4).text(), str(transcript))
+
+    def test_missing_history_summary_is_shown_as_output_unavailable(self):
+        self.add_history_record(
+            "missing-output",
+            run_directory=str(self.base / "gone"),
+            summary_path=str(self.base / "gone" / "summary.csv"),
+        )
+        self.window._ensure_history_ui()
+
+        self.assertIn("Output unavailable", self.window.history_table.item(0, 8).text())
+        self.window.history_table.selectRow(0)
+        self.assertFalse(self.window.history_results_button.isEnabled())
+        self.assertFalse(self.window.history_output_button.isEnabled())
+
+    def test_view_history_commands_reads_encrypted_snapshot_after_warning(self):
+        record = self.add_history_record("commands")
+        snapshot = history.HistoryCommandSnapshot(
+            (
+                runner.Command("exec", "show clock", 1),
+                runner.Command("config", "hostname access-1", 2),
+            )
+        )
+        self.history_commands.set(record.job_id, snapshot)
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        with (
+            patch.object(
+                gui.QMessageBox,
+                "warning",
+                return_value=QMessageBox.StandardButton.Open,
+            ),
+            patch.object(self.history_commands, "get", wraps=self.history_commands.get) as get,
+            patch.object(gui.QDialog, "exec", return_value=QDialog.DialogCode.Rejected),
+        ):
+            self.window.view_history_commands()
+
+        get.assert_called_once_with(record.job_id)
+
+    def test_remove_history_preserves_output_and_deletes_command_snapshot(self):
+        run_directory = self.base / "outputs" / "run_preserved"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        runner.write_summary(summary, [])
+        record = self.add_history_record(
+            "remove",
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        self.history_commands.set(record.job_id, history.HistoryCommandSnapshot(()))
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.remove_history_record()
+
+        self.assertIsNone(self.history_store.get(record.job_id))
+        self.assertTrue(run_directory.is_dir())
+        with self.assertRaises(history.HistoryError):
+            self.history_commands.get(record.job_id)
+
+    def test_delete_history_outputs_requires_marker_and_deletes_exact_run(self):
+        run_directory = self.base / "outputs" / "run_delete"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        runner.write_summary(summary, [])
+        record = self.add_history_record(
+            "delete",
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        history.write_output_marker(record)
+        self.history_commands.set(record.job_id, history.HistoryCommandSnapshot(()))
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+        self.assertTrue(self.window.history_delete_outputs_button.isEnabled())
+
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.delete_history_outputs()
+
+        self.assertFalse(run_directory.exists())
+        self.assertIsNone(self.history_store.get(record.job_id))
+
     def _valid_request(self, device_type, address):
         return runner.RunRequest(
             inventory=None,
@@ -681,7 +1033,12 @@ class MainWindowTests(unittest.TestCase):
         self.window._refresh_profile_combo(profile.profile_id)
         self.window._profile_activated(self.window.profile_combo.findData(profile.profile_id))
 
-        reopened = gui.MainWindow(self.settings)
+        reopened = gui.MainWindow(
+            self.settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
         try:
             self.assertEqual(reopened.profile_combo.currentData(), profile.profile_id)
             self.assertEqual(reopened.username_edit.text(), "remembered-user")
@@ -694,7 +1051,12 @@ class MainWindowTests(unittest.TestCase):
         profile = self.window.profile_store.add("Missing", missing_file)
         self.window.profile_store.set_selected_id(profile.profile_id)
 
-        reopened = gui.MainWindow(self.settings)
+        reopened = gui.MainWindow(
+            self.settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
         try:
             self.assertIsNone(reopened.profile_combo.currentData())
             self.assertEqual(reopened.username_edit.text(), "")

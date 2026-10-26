@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -58,9 +59,10 @@ class BatchQueueTests(unittest.TestCase):
 
     def test_payload_round_trip_reconstructs_complete_prepared_run(self):
         prepared = self.prepared("cisco_ios")
-        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Operations")
 
-        restored = batch_queue.BatchPayload.from_json(payload.to_json()).prepare()
+        restored_payload = batch_queue.BatchPayload.from_json(payload.to_json())
+        restored = restored_payload.prepare()
 
         self.assertEqual(restored.request.device_type, "cisco_ios")
         self.assertEqual(restored.settings.username, "queue-user")
@@ -69,6 +71,18 @@ class BatchQueueTests(unittest.TestCase):
         self.assertEqual(restored.settings.port, 2200)
         self.assertEqual(restored.settings.timeout, 30)
         self.assertEqual(len(restored.commands), 2)
+        self.assertEqual(restored_payload.profile_label, "Operations")
+
+    def test_version_one_payload_remains_readable_with_legacy_profile(self):
+        payload = batch_queue.BatchPayload.from_prepared(self.prepared())
+        data = json.loads(payload.to_json())
+        data["version"] = 1
+        data.pop("profile_label")
+
+        restored = batch_queue.BatchPayload.from_json(json.dumps(data))
+
+        self.assertEqual(restored.profile_label, "Unknown (legacy)")
+        self.assertEqual(restored.username, "queue-user")
 
     def test_settings_metadata_contains_no_payload_or_secrets(self):
         job = self.add()
