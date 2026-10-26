@@ -111,10 +111,10 @@ lab switches before using the feature on production access switches.
 
 The full-window **History** screen keeps a persistent audit index for live
 batches that run after the feature is installed. It does not import older
-output folders and does not record connection tests. Use the main **SSH** and
-**History** tabs to switch between execution and audit review. History is
-loaded only when its screen is first opened, so it does not delay normal queue
-use or SSH execution.
+output folders and does not record connection tests. The three top-level tabs
+are **SSH**, **History**, and **Dictionary**; the app always starts on **SSH**.
+History is loaded only when its screen is first opened, so it does not delay
+normal queue use or SSH execution.
 
 Queued and scheduled work continues while History is visible. When a batch
 starts and its device results begin updating, the **SSH** and **Device Results**
@@ -154,6 +154,29 @@ History records are kept until manually removed. An unfinished record is
 marked **Interrupted** after the next launch and is never retried
 automatically. A history or Keychain error is reported in the interface but
 does not stop an already confirmed live batch.
+
+### Command dictionary
+
+The full-window **Command Dictionary** is an offline reference containing 40
+read-only exec-mode entries, organized as 20 cross-vendor pairs for Cisco
+Catalyst 9300L and Huawei CloudEngine S5755-S. Its scope is deliberately exact:
+
+- Catalyst 9300L documented for IOS XE 17.3.x, with deployed target 17.3.3
+- CloudEngine S5755-S documented for V600R024C10, with deployed target
+  V600R024C10SPC500 / YunShan OS 1.24.1.1
+
+Search uses command text, purpose, aliases, keywords, and related metadata.
+Platform and category filters can be combined with it. Selecting a row shows
+the exact syntax, purpose, applicability, deployed target, mode, risk, and
+notes. **Copy Command** copies literal syntax; entries containing an angle-
+bracket placeholder instead show **Copy Template** and a replacement warning.
+
+Browsing or copying a dictionary entry never inserts it into the command boxes,
+executes it, records it in History, persists a selection, or makes a network
+request. The dictionary is a release-scoped reference, not proof that a command
+is supported or safe on every image, license, hardware revision, role, or site
+configuration. Replace every `<PLACEHOLDER>` deliberately and validate the
+result on an approved lab switch before production use.
 
 ## Use
 

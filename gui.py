@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -57,6 +58,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -76,6 +78,8 @@ from batch_queue import (
     QueueStorageError,
     SecretStore,
 )
+
+from command_dictionary import COMMAND_ENTRIES, CommandEntry, search_commands
 
 from history import (
     HistoryCommandSnapshot,
@@ -720,6 +724,7 @@ class MainWindow(QMainWindow):
         self._last_credential_import = ""
         self._credential_file: Optional[Path] = None
         self._history_ui_built = False
+        self._dictionary_ui_built = False
         self._history_page = 0
         self._history_records: dict[str, HistoryRecord] = {}
         self._results_attention_pending = False
@@ -992,6 +997,14 @@ class MainWindow(QMainWindow):
         self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_layout.addWidget(self.history_placeholder, 1)
 
+        self.dictionary_tab = QWidget()
+        self.dictionary_layout = QVBoxLayout(self.dictionary_tab)
+        self.dictionary_placeholder = QLabel(
+            "Open Command Dictionary to browse supported network commands."
+        )
+        self.dictionary_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dictionary_layout.addWidget(self.dictionary_placeholder, 1)
+
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
@@ -1001,6 +1014,7 @@ class MainWindow(QMainWindow):
 
         self.main_tabs.addTab(ssh_tab, "SSH")
         self.main_tabs.addTab(self.history_tab, "History")
+        self.main_tabs.addTab(self.dictionary_tab, "Dictionary")
         self.main_tabs.currentChanged.connect(self._main_tab_changed)
         self.main_tabs.setCurrentWidget(ssh_tab)
         self.ssh_tab = ssh_tab
@@ -2290,6 +2304,9 @@ class MainWindow(QMainWindow):
     def _main_tab_changed(self, index: int) -> None:
         if index == self.main_tabs.indexOf(self.history_tab):
             self._ensure_history_ui()
+        elif index == self.main_tabs.indexOf(self.dictionary_tab):
+            self._ensure_dictionary_ui()
+            QTimer.singleShot(0, self.dictionary_search_edit.setFocus)
         self._acknowledge_results_attention_if_visible()
 
     def _device_results_visible(self) -> bool:
@@ -2357,6 +2374,261 @@ class MainWindow(QMainWindow):
             self._set_results_attention_highlighted(
                 self._results_attention_highlighted
             )
+
+    def _ensure_dictionary_ui(self) -> None:
+        if self._dictionary_ui_built:
+            return
+        self._dictionary_ui_built = True
+        self.dictionary_layout.removeWidget(self.dictionary_placeholder)
+        self.dictionary_placeholder.deleteLater()
+
+        filters = QHBoxLayout()
+        self.dictionary_search_edit = QLineEdit()
+        self.dictionary_search_edit.setPlaceholderText(
+            "Search commands, purposes, aliases, and keywords…"
+        )
+        self.dictionary_search_edit.setClearButtonEnabled(True)
+        self.dictionary_platform_combo = QComboBox()
+        self.dictionary_platform_combo.addItem("All", None)
+        self.dictionary_platform_combo.addItem("Catalyst 9300L", "Catalyst 9300L")
+        self.dictionary_platform_combo.addItem(
+            "CloudEngine S5755-S", "CloudEngine S5755-S"
+        )
+        self.dictionary_category_combo = QComboBox()
+        self.dictionary_category_combo.addItem("All", None)
+        for category in sorted(
+            {entry.category for entry in COMMAND_ENTRIES}, key=str.casefold
+        ):
+            self.dictionary_category_combo.addItem(category, category)
+        self.dictionary_count_label = QLabel()
+        filters.addWidget(QLabel("Search"))
+        filters.addWidget(self.dictionary_search_edit, 1)
+        filters.addWidget(QLabel("Platform"))
+        filters.addWidget(self.dictionary_platform_combo)
+        filters.addWidget(QLabel("Category"))
+        filters.addWidget(self.dictionary_category_combo)
+        filters.addWidget(self.dictionary_count_label)
+        self.dictionary_layout.addLayout(filters)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        self.dictionary_table = QTableWidget(0, 3)
+        self.dictionary_table.setHorizontalHeaderLabels(
+            ["Platform", "Category", "Command"]
+        )
+        self.dictionary_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.dictionary_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.dictionary_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.dictionary_table.setAlternatingRowColors(True)
+        self.dictionary_table.verticalHeader().setVisible(False)
+        dictionary_header = self.dictionary_table.horizontalHeader()
+        dictionary_header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        dictionary_header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        dictionary_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        splitter.addWidget(self.dictionary_table)
+
+        self.dictionary_details_panel = QWidget()
+        self.dictionary_details_panel.setAccessibleName("Command details")
+        details_panel_layout = QVBoxLayout(self.dictionary_details_panel)
+        self.dictionary_details_scroll = QScrollArea()
+        self.dictionary_details_scroll.setWidgetResizable(True)
+        self.dictionary_details_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.dictionary_details_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        details_content = QWidget()
+        details_layout = QVBoxLayout(details_content)
+        self.dictionary_title_label = QLabel("Select a command")
+        self.dictionary_title_label.setWordWrap(True)
+        self.dictionary_title_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        details_layout.addWidget(self.dictionary_title_label)
+
+        self.dictionary_purpose_heading_label = QLabel("Purpose")
+        details_layout.addWidget(self.dictionary_purpose_heading_label)
+        self.dictionary_description_label = QLabel()
+        self.dictionary_description_label.setWordWrap(True)
+        self.dictionary_description_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        details_layout.addWidget(self.dictionary_description_label)
+
+        self.dictionary_syntax_heading_label = QLabel("Syntax")
+        details_layout.addWidget(self.dictionary_syntax_heading_label)
+        self.dictionary_syntax_edit = QPlainTextEdit()
+        self.dictionary_syntax_edit.setReadOnly(True)
+        self.dictionary_syntax_edit.setMaximumHeight(100)
+        details_layout.addWidget(self.dictionary_syntax_edit)
+
+        self.dictionary_notes_heading_label = QLabel("Notes")
+        details_layout.addWidget(self.dictionary_notes_heading_label)
+        self.dictionary_notes_label = QLabel()
+        self.dictionary_notes_label.setWordWrap(True)
+        self.dictionary_notes_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        details_layout.addWidget(self.dictionary_notes_label)
+
+        self.dictionary_placeholder_warning = QLabel(
+            "This is a template. Replace every <PLACEHOLDER> before use."
+        )
+        self.dictionary_placeholder_warning.setWordWrap(True)
+        self.dictionary_placeholder_warning.setStyleSheet("font-weight: 600;")
+        self.dictionary_placeholder_warning.hide()
+        details_layout.addWidget(self.dictionary_placeholder_warning)
+
+        copy_row = QHBoxLayout()
+        self.dictionary_copy_button = QPushButton("Copy Command")
+        self.dictionary_copy_button.setEnabled(False)
+        self.dictionary_copy_confirmation = QLabel()
+        copy_row.addWidget(self.dictionary_copy_button)
+        copy_row.addWidget(self.dictionary_copy_confirmation)
+        copy_row.addStretch()
+        details_layout.addLayout(copy_row)
+
+        metadata = QFormLayout()
+        self.dictionary_applicability_label = QLabel()
+        self.dictionary_target_label = QLabel()
+        self.dictionary_mode_label = QLabel()
+        self.dictionary_risk_label = QLabel()
+        for label in (
+            self.dictionary_applicability_label,
+            self.dictionary_target_label,
+            self.dictionary_mode_label,
+            self.dictionary_risk_label,
+        ):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        metadata.addRow("Applicability", self.dictionary_applicability_label)
+        metadata.addRow("Deployed target", self.dictionary_target_label)
+        metadata.addRow("Mode", self.dictionary_mode_label)
+        metadata.addRow("Risk", self.dictionary_risk_label)
+        details_layout.addLayout(metadata)
+        details_layout.addStretch()
+        self.dictionary_details_scroll.setWidget(details_content)
+        details_panel_layout.addWidget(self.dictionary_details_scroll)
+        splitter.addWidget(self.dictionary_details_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([820, 520])
+        self.dictionary_splitter = splitter
+        self.dictionary_layout.addWidget(splitter, 1)
+
+        self.dictionary_empty_label = QLabel(
+            "No commands match the current search and filters."
+        )
+        self.dictionary_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dictionary_empty_label.hide()
+        self.dictionary_layout.addWidget(self.dictionary_empty_label)
+
+        self.dictionary_search_edit.textChanged.connect(
+            self._refresh_dictionary_table
+        )
+        self.dictionary_platform_combo.currentIndexChanged.connect(
+            self._refresh_dictionary_table
+        )
+        self.dictionary_category_combo.currentIndexChanged.connect(
+            self._refresh_dictionary_table
+        )
+        self.dictionary_table.itemSelectionChanged.connect(
+            self._dictionary_selection_changed
+        )
+        self.dictionary_copy_button.clicked.connect(self._copy_dictionary_command)
+        self._refresh_dictionary_table()
+
+    @Slot()
+    def _refresh_dictionary_table(self) -> None:
+        if not self._dictionary_ui_built:
+            return
+        query = self.dictionary_search_edit.text()
+        platform = self.dictionary_platform_combo.currentData()
+        category = self.dictionary_category_combo.currentData()
+        entries = tuple(search_commands(query, platform, category))
+        self.dictionary_table.blockSignals(True)
+        self.dictionary_table.setRowCount(0)
+        for row, entry in enumerate(entries):
+            self.dictionary_table.insertRow(row)
+            values = (entry.platform, entry.category, entry.syntax)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, entry)
+                self.dictionary_table.setItem(row, column, item)
+        self.dictionary_table.blockSignals(False)
+        count = len(entries)
+        self.dictionary_count_label.setText(
+            f"{count} command" if count == 1 else f"{count} commands"
+        )
+        self.dictionary_empty_label.setVisible(count == 0)
+        self.dictionary_copy_confirmation.clear()
+        if entries:
+            self.dictionary_table.selectRow(0)
+        else:
+            self._show_dictionary_entry(None)
+
+    @Slot()
+    def _dictionary_selection_changed(self) -> None:
+        row = self.dictionary_table.currentRow()
+        item = self.dictionary_table.item(row, 0) if row >= 0 else None
+        entry = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        self._show_dictionary_entry(entry if isinstance(entry, CommandEntry) else None)
+
+    def _show_dictionary_entry(self, entry: Optional[CommandEntry]) -> None:
+        self._selected_dictionary_entry = entry
+        if entry is None:
+            self.dictionary_title_label.setText("No command selected")
+            self.dictionary_description_label.clear()
+            self.dictionary_applicability_label.clear()
+            self.dictionary_target_label.clear()
+            self.dictionary_mode_label.clear()
+            self.dictionary_risk_label.clear()
+            self.dictionary_notes_label.clear()
+            self.dictionary_syntax_edit.clear()
+            self.dictionary_placeholder_warning.hide()
+            self.dictionary_copy_button.setText("Copy Command")
+            self.dictionary_copy_button.setEnabled(False)
+            return
+        applicability = f"{entry.vendor} {entry.platform}"
+        if entry.documented_release:
+            applicability += f" — documented for {entry.documented_release}"
+        self.dictionary_title_label.setText(entry.title)
+        self.dictionary_description_label.setText(entry.description)
+        self.dictionary_applicability_label.setText(applicability)
+        self.dictionary_target_label.setText(entry.deployed_target)
+        self.dictionary_mode_label.setText(entry.mode)
+        self.dictionary_risk_label.setText(entry.risk)
+        self.dictionary_notes_label.setText(entry.applicability_notes)
+        self.dictionary_syntax_edit.setPlainText(entry.syntax)
+        is_template = re.search(r"<[^<>\n]+>", entry.syntax) is not None
+        self.dictionary_placeholder_warning.setVisible(is_template)
+        self.dictionary_copy_button.setText(
+            "Copy Template" if is_template else "Copy Command"
+        )
+        self.dictionary_copy_button.setEnabled(True)
+        self.dictionary_copy_confirmation.clear()
+
+    @Slot()
+    def _copy_dictionary_command(self) -> None:
+        entry = getattr(self, "_selected_dictionary_entry", None)
+        if entry is None:
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        clipboard.setText(entry.syntax)
+        is_template = re.search(r"<[^<>\n]+>", entry.syntax) is not None
+        self.dictionary_copy_confirmation.setText(
+            "Template copied." if is_template else "Command copied."
+        )
 
     def _ensure_history_ui(self) -> None:
         if self._history_ui_built:
@@ -3223,6 +3495,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             window.show()
             app.processEvents()
             window._ensure_history_ui()
+            window._ensure_dictionary_ui()
+            window.dictionary_search_edit.setText("interface")
             app.processEvents()
             window.close()
             app.processEvents()

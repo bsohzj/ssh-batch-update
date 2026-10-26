@@ -229,9 +229,10 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
-        self.assertEqual(self.window.main_tabs.count(), 2)
+        self.assertEqual(self.window.main_tabs.count(), 3)
         self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
         self.assertEqual(self.window.main_tabs.tabText(1), "History")
+        self.assertEqual(self.window.main_tabs.tabText(2), "Dictionary")
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
         self.assertTrue(self.window.main_tabs.tabBar().expanding())
         self.assertGreaterEqual(self.window.main_tabs.tabBar().minimumHeight(), 44)
@@ -373,7 +374,8 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertTrue(self.window._history_ui_built)
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
-        self.assertEqual(self.window.main_tabs.indexOf(self.window.history_tab), 1)
+        history_index = self.window.main_tabs.indexOf(self.window.history_tab)
+        self.assertEqual(self.window.main_tabs.tabText(history_index), "History")
         self.assertEqual(self.window.results_tabs.indexOf(self.window.history_tab), -1)
         self.assertEqual(self.window.history_table.columnCount(), 9)
         self.assertEqual(self.window.history_runs_value.text(), "0")
@@ -382,6 +384,248 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.history_empty_label.isHidden())
         self.assertTrue(self.window.history_line_view.isHidden())
         self.assertTrue(self.window.history_pie_view.isHidden())
+
+    def test_command_dictionary_is_third_lazy_top_level_tab_and_focuses_search(self):
+        self.assertFalse(self.window._dictionary_ui_built)
+        self.assertFalse(hasattr(self.window, "dictionary_table"))
+
+        self.window.show()
+        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.app.processEvents()
+
+        self.assertTrue(self.window._dictionary_ui_built)
+        self.assertIs(
+            self.window.main_tabs.currentWidget(), self.window.dictionary_tab
+        )
+        dictionary_index = self.window.main_tabs.indexOf(self.window.dictionary_tab)
+        self.assertEqual(dictionary_index, 2)
+        self.assertEqual(self.window.main_tabs.tabText(dictionary_index), "Dictionary")
+        self.assertTrue(self.window.dictionary_search_edit.hasFocus())
+        self.assertEqual(self.window.dictionary_table.columnCount(), 3)
+        self.assertEqual(
+            [
+                self.window.dictionary_table.horizontalHeaderItem(column).text()
+                for column in range(3)
+            ],
+            ["Platform", "Category", "Command"],
+        )
+        self.assertFalse(
+            any(
+                group.title() == "Command Details"
+                for group in self.window.findChildren(gui.QGroupBox)
+            )
+        )
+        self.assertEqual(
+            self.window.dictionary_details_panel.accessibleName(), "Command details"
+        )
+        self.assertEqual(
+            self.window.dictionary_table.rowCount(), len(gui.COMMAND_ENTRIES)
+        )
+
+    def test_command_dictionary_search_filters_count_and_details(self):
+        self.window._ensure_dictionary_ui()
+        entry = gui.COMMAND_ENTRIES[-1]
+        expected = tuple(
+            gui.search_commands(entry.syntax, entry.platform, entry.category)
+        )
+
+        self.window.dictionary_platform_combo.setCurrentText(entry.platform)
+        self.window.dictionary_category_combo.setCurrentText(entry.category)
+        self.window.dictionary_search_edit.setText(entry.syntax)
+        self.app.processEvents()
+
+        self.assertEqual(self.window.dictionary_table.rowCount(), len(expected))
+        self.assertEqual(
+            self.window.dictionary_count_label.text(),
+            f"{len(expected)} command" if len(expected) == 1 else f"{len(expected)} commands",
+        )
+        self.assertGreater(len(expected), 0)
+        shown = self.window.dictionary_table.item(0, 0).data(
+            Qt.ItemDataRole.UserRole
+        )
+        self.assertEqual(self.window.dictionary_table.item(0, 0).text(), shown.platform)
+        self.assertEqual(self.window.dictionary_table.item(0, 1).text(), shown.category)
+        self.assertEqual(self.window.dictionary_table.item(0, 2).text(), shown.syntax)
+        self.assertEqual(self.window.dictionary_title_label.text(), shown.title)
+        self.assertEqual(self.window.dictionary_purpose_heading_label.text(), "Purpose")
+        self.assertEqual(
+            self.window.dictionary_description_label.text(), shown.description
+        )
+        self.assertEqual(
+            self.window.dictionary_syntax_edit.toPlainText(), shown.syntax
+        )
+        self.assertIn(shown.platform, self.window.dictionary_applicability_label.text())
+        self.assertEqual(
+            self.window.dictionary_target_label.text(), shown.deployed_target
+        )
+        self.assertEqual(self.window.dictionary_mode_label.text(), shown.mode)
+        self.assertEqual(self.window.dictionary_risk_label.text(), shown.risk)
+        self.assertEqual(
+            self.window.dictionary_notes_label.text(), shown.applicability_notes
+        )
+        details_layout = (
+            self.window.dictionary_purpose_heading_label.parentWidget().layout()
+        )
+        purpose_index = details_layout.indexOf(
+            self.window.dictionary_purpose_heading_label
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_description_label),
+            purpose_index + 1,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_syntax_heading_label),
+            purpose_index + 2,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_syntax_edit),
+            purpose_index + 3,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_notes_heading_label),
+            purpose_index + 4,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_notes_label),
+            purpose_index + 5,
+        )
+
+    def test_command_dictionary_live_search_accepts_partial_tokens(self):
+        self.window._ensure_dictionary_ui()
+        self.window.dictionary_platform_combo.setCurrentText("CloudEngine S5755-S")
+        self.window.dictionary_search_edit.setText("dis")
+        self.app.processEvents()
+
+        syntaxes = [
+            self.window.dictionary_table.item(row, 2).text()
+            for row in range(self.window.dictionary_table.rowCount())
+        ]
+        self.assertEqual(len(syntaxes), 20)
+        self.assertEqual(syntaxes[0], "display version")
+        self.assertIn("display interface brief", syntaxes)
+
+    def test_command_dictionary_notes_wrap_in_scrollable_details_at_supported_sizes(self):
+        self.window._ensure_dictionary_ui()
+        entry = max(
+            gui.COMMAND_ENTRIES,
+            key=lambda candidate: len(candidate.applicability_notes),
+        )
+        self.window.dictionary_search_edit.setText(entry.syntax)
+
+        self.window.show()
+        for width, height in ((1400, 850), (1050, 680)):
+            with self.subTest(size=(width, height)):
+                self.window.resize(width, height)
+                self.app.processEvents()
+                notes = self.window.dictionary_notes_label
+                self.assertEqual(notes.text(), entry.applicability_notes)
+                self.assertTrue(notes.wordWrap())
+                self.assertGreaterEqual(
+                    notes.height(), notes.heightForWidth(notes.width())
+                )
+                self.window.dictionary_details_scroll.ensureWidgetVisible(notes)
+                self.app.processEvents()
+                self.assertFalse(notes.isHidden())
+
+    def test_command_dictionary_copy_is_exact_and_warns_for_templates(self):
+        self.window._ensure_dictionary_ui()
+        template = next(
+            entry
+            for entry in gui.COMMAND_ENTRIES
+            if "<" in entry.syntax and ">" in entry.syntax
+        )
+        self.window.dictionary_search_edit.setText(template.syntax)
+        self.app.processEvents()
+
+        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy Template")
+        self.assertFalse(self.window.dictionary_placeholder_warning.isHidden())
+        self.assertIn(
+            "<PLACEHOLDER>", self.window.dictionary_placeholder_warning.text()
+        )
+        self.window.dictionary_copy_button.click()
+
+        self.assertEqual(self.app.clipboard().text(), template.syntax)
+        self.assertEqual(
+            self.window.dictionary_copy_confirmation.text(), "Template copied."
+        )
+        plain = next(
+            entry
+            for entry in gui.COMMAND_ENTRIES
+            if not ("<" in entry.syntax and ">" in entry.syntax)
+        )
+        self.window.dictionary_search_edit.setText(plain.syntax)
+        self.app.processEvents()
+        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy Command")
+        self.assertTrue(self.window.dictionary_placeholder_warning.isHidden())
+        self.window.dictionary_copy_button.click()
+        self.assertEqual(self.app.clipboard().text(), plain.syntax)
+
+    def test_command_dictionary_empty_state(self):
+        self.window._ensure_dictionary_ui()
+
+        self.window.dictionary_search_edit.setText(
+            "no-such-command-7f4bd27d-585b-4dde-a05f-8e2f043b269a"
+        )
+        self.app.processEvents()
+
+        self.assertEqual(self.window.dictionary_table.rowCount(), 0)
+        self.assertEqual(self.window.dictionary_count_label.text(), "0 commands")
+        self.assertFalse(self.window.dictionary_empty_label.isHidden())
+        self.assertEqual(
+            self.window.dictionary_empty_label.text(),
+            "No commands match the current search and filters.",
+        )
+        self.assertFalse(self.window.dictionary_table.isHidden())
+        self.assertFalse(self.window.dictionary_table.horizontalHeader().isHidden())
+        self.assertFalse(self.window.dictionary_copy_button.isEnabled())
+        self.assertEqual(
+            self.window.dictionary_title_label.text(), "No command selected"
+        )
+
+    def test_command_dictionary_constructs_and_switches_with_native_palettes(self):
+        self.window._ensure_dictionary_ui()
+        self.window.theme_light_action.trigger()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
+            QColor("#ffffff"),
+        )
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        self.assertEqual(
+            self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
+            QColor("#151515"),
+        )
+        self.assertEqual(self.window.dictionary_table.styleSheet(), "")
+
+    def test_opening_dictionary_does_not_change_queue_or_results_attention(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        queued = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window._refresh_queue_table(select_job_id=queued.job_id)
+        queue_rows = self.window.queue_table.rowCount()
+        selected_job_id = self.window._selected_job_id
+        self.window._request_results_attention()
+
+        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.window.dictionary_search_edit.setText("interface")
+        self.app.processEvents()
+
+        self.assertEqual(self.window.queue_table.rowCount(), queue_rows)
+        self.assertEqual(self.window._selected_job_id, selected_job_id)
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertTrue(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(
+            self.window.results_tabs.tabText(1), "Device Results •"
+        )
 
     def test_reopened_window_defaults_to_ssh_instead_of_last_main_tab(self):
         self.window.main_tabs.setCurrentWidget(self.window.history_tab)
@@ -402,6 +646,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
         self.assertFalse(self.window._history_ui_built)
+        self.assertFalse(self.window._dictionary_ui_built)
 
     def test_history_dashboard_filters_and_aggregates_records(self):
         self.add_history_record("good", "succeeded", successes=3, profile="Ops")
