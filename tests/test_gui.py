@@ -11,6 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 try:
     from PySide6.QtCore import QEvent, Qt, QSettings, QTime
     from PySide6.QtGui import QCloseEvent, QColor, QPalette
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
 
     import batch_queue
@@ -463,6 +464,14 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window.dictionary_notes_label.text(), shown.applicability_notes
         )
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.text(), "Additional info"
+        )
+        self.assertFalse(self.window.dictionary_additional_info_button.isChecked())
+        self.assertTrue(self.window.dictionary_additional_info_widget.isHidden())
+        self.assertFalse(self.window.dictionary_purpose_heading_label.isHidden())
+        self.assertFalse(self.window.dictionary_syntax_heading_label.isHidden())
+        self.assertFalse(self.window.dictionary_notes_heading_label.isHidden())
         details_layout = (
             self.window.dictionary_purpose_heading_label.parentWidget().layout()
         )
@@ -490,6 +499,83 @@ class MainWindowTests(unittest.TestCase):
             purpose_index + 5,
         )
 
+    def test_command_dictionary_additional_info_click_and_keyboard_disclosure(self):
+        self.window._ensure_dictionary_ui()
+        button = self.window.dictionary_additional_info_button
+        additional_info = self.window.dictionary_additional_info_widget
+
+        self.assertTrue(button.isCheckable())
+        self.assertEqual(button.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+        self.assertEqual(button.accessibleName(), "Additional info")
+        self.assertIn("risk", button.accessibleDescription())
+        self.assertIs(type(button), type(self.window.dictionary_copy_button))
+        self.assertEqual(
+            button.sizePolicy().horizontalPolicy(),
+            self.window.dictionary_copy_button.sizePolicy().horizontalPolicy(),
+        )
+        self.assertEqual(
+            button.sizePolicy().verticalPolicy(),
+            self.window.dictionary_copy_button.sizePolicy().verticalPolicy(),
+        )
+        self.assertEqual(
+            button.sizeHint().height(),
+            self.window.dictionary_copy_button.sizeHint().height(),
+        )
+        self.assertEqual(
+            button.styleSheet(), self.window.dictionary_copy_button.styleSheet()
+        )
+
+        button.click()
+        self.assertTrue(button.isChecked())
+        self.assertEqual(button.text(), "Hide additional info")
+        self.assertFalse(additional_info.isHidden())
+
+        button.click()
+        self.assertFalse(button.isChecked())
+        self.assertEqual(button.text(), "Additional info")
+        self.assertTrue(additional_info.isHidden())
+
+        self.window.show()
+        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.app.processEvents()
+        button.setFocus()
+        self.app.processEvents()
+        self.assertTrue(button.hasFocus())
+        QTest.keyClick(button, Qt.Key.Key_Space)
+        self.assertTrue(button.isChecked())
+        self.assertEqual(button.text(), "Hide additional info")
+        self.assertFalse(additional_info.isHidden())
+
+    def test_command_dictionary_additional_info_state_survives_selection_and_filters(self):
+        self.window._ensure_dictionary_ui()
+        button = self.window.dictionary_additional_info_button
+        additional_info = self.window.dictionary_additional_info_widget
+        button.click()
+
+        self.window.dictionary_table.selectRow(1)
+        self.app.processEvents()
+        selected = self.window.dictionary_table.item(1, 0).data(
+            Qt.ItemDataRole.UserRole
+        )
+        self.assertTrue(button.isChecked())
+        self.assertFalse(additional_info.isHidden())
+        self.assertEqual(self.window.dictionary_mode_label.text(), selected.mode)
+
+        self.window.dictionary_search_edit.setText(
+            "no-such-command-7f4bd27d-585b-4dde-a05f-8e2f043b269a"
+        )
+        self.app.processEvents()
+        self.assertTrue(button.isChecked())
+        self.assertTrue(button.isHidden())
+        self.assertTrue(additional_info.isHidden())
+
+        self.window.dictionary_search_edit.clear()
+        self.app.processEvents()
+        self.assertTrue(button.isChecked())
+        self.assertFalse(button.isHidden())
+        self.assertFalse(additional_info.isHidden())
+        self.assertEqual(button.text(), "Hide additional info")
+
     def test_command_dictionary_live_search_accepts_partial_tokens(self):
         self.window._ensure_dictionary_ui()
         self.window.dictionary_platform_combo.setCurrentText("CloudEngine S5755-S")
@@ -511,6 +597,7 @@ class MainWindowTests(unittest.TestCase):
             key=lambda candidate: len(candidate.applicability_notes),
         )
         self.window.dictionary_search_edit.setText(entry.syntax)
+        self.window.dictionary_additional_info_button.click()
 
         self.window.show()
         for width, height in ((1400, 850), (1050, 680)):
@@ -526,6 +613,15 @@ class MainWindowTests(unittest.TestCase):
                 self.window.dictionary_details_scroll.ensureWidgetVisible(notes)
                 self.app.processEvents()
                 self.assertFalse(notes.isHidden())
+                risk = self.window.dictionary_risk_label
+                self.window.dictionary_details_scroll.ensureWidgetVisible(risk)
+                self.app.processEvents()
+                self.assertFalse(risk.isHidden())
+                self.assertTrue(risk.wordWrap())
+                self.assertEqual(
+                    self.window.dictionary_details_scroll.horizontalScrollBarPolicy(),
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+                )
 
     def test_command_dictionary_copy_is_exact_and_warns_for_templates(self):
         self.window._ensure_dictionary_ui()
@@ -581,6 +677,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window.dictionary_title_label.text(), "No command selected"
         )
+        self.assertTrue(self.window.dictionary_additional_info_button.isHidden())
+        self.assertTrue(self.window.dictionary_additional_info_widget.isHidden())
 
     def test_command_dictionary_constructs_and_switches_with_native_palettes(self):
         self.window._ensure_dictionary_ui()
@@ -589,6 +687,12 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
             QColor("#ffffff"),
+        )
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            QColor("#eeeeee"),
         )
 
         self.window.theme_dark_action.trigger()
@@ -599,6 +703,16 @@ class MainWindowTests(unittest.TestCase):
             QColor("#151515"),
         )
         self.assertEqual(self.window.dictionary_table.styleSheet(), "")
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            QColor("#303134"),
+        )
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.styleSheet(), ""
+        )
+        self.assertEqual(self.window.dictionary_additional_info_widget.styleSheet(), "")
 
     def test_opening_dictionary_does_not_change_queue_or_results_attention(self):
         prepared = runner.prepare_run(

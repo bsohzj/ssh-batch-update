@@ -2495,7 +2495,26 @@ class MainWindow(QMainWindow):
         copy_row.addStretch()
         details_layout.addLayout(copy_row)
 
-        metadata = QFormLayout()
+        self.dictionary_additional_info_button = QPushButton("Additional info")
+        self.dictionary_additional_info_button.setCheckable(True)
+        self.dictionary_additional_info_button.setFocusPolicy(
+            Qt.FocusPolicy.StrongFocus
+        )
+        self.dictionary_additional_info_button.setAccessibleName("Additional info")
+        self.dictionary_additional_info_button.setAccessibleDescription(
+            "Shows applicability, deployed target, mode, and risk."
+        )
+        details_layout.addWidget(
+            self.dictionary_additional_info_button,
+            0,
+            Qt.AlignmentFlag.AlignLeft,
+        )
+
+        self.dictionary_additional_info_widget = QWidget()
+        self.dictionary_additional_info_widget.setAccessibleName(
+            "Additional command information"
+        )
+        metadata = QFormLayout(self.dictionary_additional_info_widget)
         self.dictionary_applicability_label = QLabel()
         self.dictionary_target_label = QLabel()
         self.dictionary_mode_label = QLabel()
@@ -2512,7 +2531,8 @@ class MainWindow(QMainWindow):
         metadata.addRow("Deployed target", self.dictionary_target_label)
         metadata.addRow("Mode", self.dictionary_mode_label)
         metadata.addRow("Risk", self.dictionary_risk_label)
-        details_layout.addLayout(metadata)
+        self.dictionary_additional_info_widget.hide()
+        details_layout.addWidget(self.dictionary_additional_info_widget)
         details_layout.addStretch()
         self.dictionary_details_scroll.setWidget(details_content)
         details_panel_layout.addWidget(self.dictionary_details_scroll)
@@ -2543,6 +2563,9 @@ class MainWindow(QMainWindow):
             self._dictionary_selection_changed
         )
         self.dictionary_copy_button.clicked.connect(self._copy_dictionary_command)
+        self.dictionary_additional_info_button.toggled.connect(
+            self._set_dictionary_additional_info_expanded
+        )
         self._refresh_dictionary_table()
 
     @Slot()
@@ -2582,9 +2605,20 @@ class MainWindow(QMainWindow):
         entry = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         self._show_dictionary_entry(entry if isinstance(entry, CommandEntry) else None)
 
+    @Slot(bool)
+    def _set_dictionary_additional_info_expanded(self, expanded: bool) -> None:
+        self.dictionary_additional_info_button.setText(
+            "Hide additional info" if expanded else "Additional info"
+        )
+        self.dictionary_additional_info_widget.setVisible(
+            expanded and self._selected_dictionary_entry is not None
+        )
+
     def _show_dictionary_entry(self, entry: Optional[CommandEntry]) -> None:
         self._selected_dictionary_entry = entry
         if entry is None:
+            self.dictionary_additional_info_button.hide()
+            self.dictionary_additional_info_widget.hide()
             self.dictionary_title_label.setText("No command selected")
             self.dictionary_description_label.clear()
             self.dictionary_applicability_label.clear()
@@ -2597,6 +2631,10 @@ class MainWindow(QMainWindow):
             self.dictionary_copy_button.setText("Copy Command")
             self.dictionary_copy_button.setEnabled(False)
             return
+        self.dictionary_additional_info_button.show()
+        self._set_dictionary_additional_info_expanded(
+            self.dictionary_additional_info_button.isChecked()
+        )
         applicability = f"{entry.vendor} {entry.platform}"
         if entry.documented_release:
             applicability += f" — documented for {entry.documented_release}"
