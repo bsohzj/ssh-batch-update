@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import QEvent, Qt, QSettings, QTime
+    from PySide6.QtCore import QEvent, QPointF, Qt, QSettings, QTime
     from PySide6.QtGui import QCloseEvent, QColor, QPalette
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
@@ -467,7 +467,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window.dictionary_additional_info_button.text(), "Additional info"
         )
-        self.assertFalse(self.window.dictionary_additional_info_button.isChecked())
+        self.assertFalse(self.window._dictionary_additional_info_expanded)
         self.assertTrue(self.window.dictionary_additional_info_widget.isHidden())
         self.assertFalse(self.window.dictionary_purpose_heading_label.isHidden())
         self.assertFalse(self.window.dictionary_syntax_heading_label.isHidden())
@@ -504,7 +504,8 @@ class MainWindowTests(unittest.TestCase):
         button = self.window.dictionary_additional_info_button
         additional_info = self.window.dictionary_additional_info_widget
 
-        self.assertTrue(button.isCheckable())
+        self.assertFalse(button.isCheckable())
+        self.assertFalse(button.isChecked())
         self.assertEqual(button.focusPolicy(), Qt.FocusPolicy.StrongFocus)
         self.assertEqual(button.accessibleName(), "Additional info")
         self.assertIn("risk", button.accessibleDescription())
@@ -526,12 +527,16 @@ class MainWindowTests(unittest.TestCase):
         )
 
         button.click()
-        self.assertTrue(button.isChecked())
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(button.isChecked())
+        self.assertFalse(button.isDown())
         self.assertEqual(button.text(), "Hide additional info")
         self.assertFalse(additional_info.isHidden())
 
         button.click()
+        self.assertFalse(self.window._dictionary_additional_info_expanded)
         self.assertFalse(button.isChecked())
+        self.assertFalse(button.isDown())
         self.assertEqual(button.text(), "Additional info")
         self.assertTrue(additional_info.isHidden())
 
@@ -542,7 +547,9 @@ class MainWindowTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(button.hasFocus())
         QTest.keyClick(button, Qt.Key.Key_Space)
-        self.assertTrue(button.isChecked())
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(button.isChecked())
+        self.assertFalse(button.isDown())
         self.assertEqual(button.text(), "Hide additional info")
         self.assertFalse(additional_info.isHidden())
 
@@ -557,7 +564,7 @@ class MainWindowTests(unittest.TestCase):
         selected = self.window.dictionary_table.item(1, 0).data(
             Qt.ItemDataRole.UserRole
         )
-        self.assertTrue(button.isChecked())
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
         self.assertFalse(additional_info.isHidden())
         self.assertEqual(self.window.dictionary_mode_label.text(), selected.mode)
 
@@ -565,13 +572,13 @@ class MainWindowTests(unittest.TestCase):
             "no-such-command-7f4bd27d-585b-4dde-a05f-8e2f043b269a"
         )
         self.app.processEvents()
-        self.assertTrue(button.isChecked())
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
         self.assertTrue(button.isHidden())
         self.assertTrue(additional_info.isHidden())
 
         self.window.dictionary_search_edit.clear()
         self.app.processEvents()
-        self.assertTrue(button.isChecked())
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
         self.assertFalse(button.isHidden())
         self.assertFalse(additional_info.isHidden())
         self.assertEqual(button.text(), "Hide additional info")
@@ -682,6 +689,19 @@ class MainWindowTests(unittest.TestCase):
 
     def test_command_dictionary_constructs_and_switches_with_native_palettes(self):
         self.window._ensure_dictionary_ui()
+        button = self.window.dictionary_additional_info_button
+        copy_button = self.window.dictionary_copy_button
+
+        def assert_matches_copy_button():
+            self.assertEqual(button.palette(), copy_button.palette())
+            self.assertEqual(button.styleSheet(), copy_button.styleSheet())
+            self.assertEqual(button.isFlat(), copy_button.isFlat())
+            self.assertEqual(button.autoDefault(), copy_button.autoDefault())
+            self.assertEqual(button.isDefault(), copy_button.isDefault())
+            self.assertEqual(button.isDown(), copy_button.isDown())
+            self.assertFalse(button.isCheckable())
+            self.assertFalse(button.isChecked())
+
         self.window.theme_light_action.trigger()
         self.app.processEvents()
         self.assertEqual(
@@ -694,6 +714,13 @@ class MainWindowTests(unittest.TestCase):
             ),
             QColor("#eeeeee"),
         )
+        self.assertEqual(button.text(), "Additional info")
+        assert_matches_copy_button()
+
+        button.click()
+        self.assertEqual(button.text(), "Hide additional info")
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        assert_matches_copy_button()
 
         self.window.theme_dark_action.trigger()
         self.app.processEvents()
@@ -713,6 +740,13 @@ class MainWindowTests(unittest.TestCase):
             self.window.dictionary_additional_info_button.styleSheet(), ""
         )
         self.assertEqual(self.window.dictionary_additional_info_widget.styleSheet(), "")
+        self.assertEqual(button.text(), "Hide additional info")
+        assert_matches_copy_button()
+
+        button.click()
+        self.assertEqual(button.text(), "Additional info")
+        self.assertFalse(self.window._dictionary_additional_info_expanded)
+        assert_matches_copy_button()
 
     def test_opening_dictionary_does_not_change_queue_or_results_attention(self):
         prepared = runner.prepare_run(
@@ -802,6 +836,141 @@ class MainWindowTests(unittest.TestCase):
             self.window.history_table.item(0, 7).text(),
             "Completed With Failures",
         )
+
+    def test_history_chart_hover_click_and_accessible_details(self):
+        self.add_history_record("good", "succeeded", successes=3)
+        self.add_history_record(
+            "partial", "completed_with_failures", successes=1, failures=2
+        )
+        self.window._ensure_history_ui()
+
+        timeline = self.history_store.timeline(history.HistoryFilter(), "daily")
+        label = timeline[0].label
+        succeeded, failed = self.window.history_line_view.chart().series()
+        with patch.object(gui.QToolTip, "showText") as show:
+            succeeded.hovered.emit(QPointF(0, 4), True)
+            self.assertEqual(show.call_args.args[1], f"{label}\nSucceeded: 4 devices")
+            self.assertIs(show.call_args.args[2], self.window.history_line_view)
+
+            failed.hovered.emit(QPointF(0, 2), True)
+            self.assertEqual(show.call_args.args[1], f"{label}\nFailed: 2 devices")
+
+            succeeded.clicked.emit(QPointF(0, 4))
+            self.assertEqual(show.call_args.args[1], f"{label}\nSucceeded: 4 devices")
+
+        with patch.object(gui.QToolTip, "hideText") as hide:
+            failed.hovered.emit(QPointF(0, 2), False)
+            hide.assert_called_once_with()
+
+        slices = {
+            piece.label(): piece
+            for piece in self.window.history_pie_view.chart().series()[0].slices()
+        }
+        with patch.object(gui.QToolTip, "showText") as show:
+            slices["Succeeded"].hovered.emit(True)
+            self.assertEqual(show.call_args.args[1], "Succeeded\n1 run (50.0%)")
+            self.assertIs(show.call_args.args[2], self.window.history_pie_view)
+
+            slices["Completed With Failures"].clicked.emit()
+            self.assertEqual(
+                show.call_args.args[1],
+                "Completed With Failures\n1 run (50.0%)",
+            )
+
+        with patch.object(gui.QToolTip, "hideText") as hide:
+            slices["Succeeded"].hovered.emit(False)
+            hide.assert_called_once_with()
+
+        self.assertEqual(
+            self.window.history_line_view.accessibleName(),
+            "Successful and failed devices over time",
+        )
+        self.assertIn(
+            f"{label}: 4 succeeded devices, 2 failed devices",
+            self.window.history_line_view.accessibleDescription(),
+        )
+        self.assertEqual(self.window.history_pie_view.accessibleName(), "Run status")
+        self.assertIn(
+            "Succeeded: 1 run (50.0%)",
+            self.window.history_pie_view.accessibleDescription(),
+        )
+        self.assertIn(
+            "Completed With Failures: 1 run (50.0%)",
+            self.window.history_pie_view.accessibleDescription(),
+        )
+
+    def test_history_chart_tooltip_formatting_and_guards(self):
+        self.assertEqual(
+            self.window._history_line_detail(
+                "2026-10-27", "daily", "Succeeded", 1
+            ),
+            "2026-10-27\nSucceeded: 1 device",
+        )
+        self.assertEqual(
+            self.window._history_line_detail(
+                "2026-10-26", "weekly", "Failed", 0
+            ),
+            "Week of 2026-10-26\nFailed: 0 devices",
+        )
+        self.assertEqual(
+            self.window._history_line_detail(
+                "2026-10", "monthly", "Succeeded", 2
+            ),
+            "Month 2026-10\nSucceeded: 2 devices",
+        )
+        self.assertEqual(
+            self.window._history_status_detail("Failed", 1, 0),
+            "Failed\n1 run",
+        )
+
+        self.add_history_record("guard", "succeeded", successes=1)
+        self.window._ensure_history_ui()
+        series = self.window.history_line_view.chart().series()[0]
+        with (
+            patch.object(gui.QToolTip, "showText") as show,
+            patch.object(gui.QToolTip, "hideText") as hide,
+        ):
+            series.hovered.emit(QPointF(99, 1), True)
+            show.assert_not_called()
+            hide.assert_called_once_with()
+
+    def test_history_chart_interactions_survive_filter_and_theme_rebuilds(self):
+        self.add_history_record("good", "succeeded", successes=1)
+        self.add_history_record(
+            "partial", "completed_with_failures", successes=1, failures=1
+        )
+        self.window._ensure_history_ui()
+        original_series = self.window.history_line_view.chart().series()[0]
+
+        with patch.object(gui.QToolTip, "hideText") as hide:
+            index = self.window.history_status_combo.findData(
+                "completed_with_failures"
+            )
+            self.window.history_status_combo.setCurrentIndex(index)
+            self.app.processEvents()
+            hide.assert_called()
+
+        filtered_series = self.window.history_line_view.chart().series()[0]
+        self.assertIsNot(filtered_series, original_series)
+        with patch.object(gui.QToolTip, "showText") as show:
+            filtered_series.clicked.emit(QPointF(0, 1))
+            self.assertEqual(show.call_args.args[1].splitlines()[1], "Succeeded: 1 device")
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+        themed_series = self.window.history_line_view.chart().series()[1]
+        self.assertIsNot(themed_series, filtered_series)
+        with patch.object(gui.QToolTip, "showText") as show:
+            themed_series.hovered.emit(QPointF(0, 1), True)
+            self.assertEqual(show.call_args.args[1].splitlines()[1], "Failed: 1 device")
+
+        themed_slice = self.window.history_pie_view.chart().series()[0].slices()[0]
+        with patch.object(gui.QToolTip, "showText") as show:
+            themed_slice.clicked.emit()
+            self.assertEqual(
+                show.call_args.args[1],
+                "Completed With Failures\n1 run (100.0%)",
+            )
 
     def test_history_charts_use_dark_palette_and_accessible_colors(self):
         palette = QPalette(self.window.palette())

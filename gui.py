@@ -33,6 +33,7 @@ from PySide6.QtGui import (
     QBrush,
     QCloseEvent,
     QColor,
+    QCursor,
     QDesktopServices,
     QPainter,
     QPalette,
@@ -64,6 +65,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTimeEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -2496,7 +2498,6 @@ class MainWindow(QMainWindow):
         details_layout.addLayout(copy_row)
 
         self.dictionary_additional_info_button = QPushButton("Additional info")
-        self.dictionary_additional_info_button.setCheckable(True)
         self.dictionary_additional_info_button.setFocusPolicy(
             Qt.FocusPolicy.StrongFocus
         )
@@ -2531,6 +2532,7 @@ class MainWindow(QMainWindow):
         metadata.addRow("Deployed target", self.dictionary_target_label)
         metadata.addRow("Mode", self.dictionary_mode_label)
         metadata.addRow("Risk", self.dictionary_risk_label)
+        self._dictionary_additional_info_expanded = False
         self.dictionary_additional_info_widget.hide()
         details_layout.addWidget(self.dictionary_additional_info_widget)
         details_layout.addStretch()
@@ -2563,8 +2565,8 @@ class MainWindow(QMainWindow):
             self._dictionary_selection_changed
         )
         self.dictionary_copy_button.clicked.connect(self._copy_dictionary_command)
-        self.dictionary_additional_info_button.toggled.connect(
-            self._set_dictionary_additional_info_expanded
+        self.dictionary_additional_info_button.clicked.connect(
+            self._toggle_dictionary_additional_info
         )
         self._refresh_dictionary_table()
 
@@ -2605,8 +2607,14 @@ class MainWindow(QMainWindow):
         entry = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         self._show_dictionary_entry(entry if isinstance(entry, CommandEntry) else None)
 
-    @Slot(bool)
+    @Slot()
+    def _toggle_dictionary_additional_info(self) -> None:
+        self._set_dictionary_additional_info_expanded(
+            not self._dictionary_additional_info_expanded
+        )
+
     def _set_dictionary_additional_info_expanded(self, expanded: bool) -> None:
+        self._dictionary_additional_info_expanded = expanded
         self.dictionary_additional_info_button.setText(
             "Hide additional info" if expanded else "Additional info"
         )
@@ -2633,7 +2641,7 @@ class MainWindow(QMainWindow):
             return
         self.dictionary_additional_info_button.show()
         self._set_dictionary_additional_info_expanded(
-            self.dictionary_additional_info_button.isChecked()
+            self._dictionary_additional_info_expanded
         )
         applicability = f"{entry.vendor} {entry.platform}"
         if entry.documented_release:
@@ -2907,9 +2915,8 @@ class MainWindow(QMainWindow):
                 filters, limit=100, offset=self._history_page * 100
             )
             stats = self.history_store.stats(filters)
-            timeline = self.history_store.timeline(
-                filters, self._history_granularity()
-            )
+            granularity = self._history_granularity()
+            timeline = self.history_store.timeline(filters, granularity)
             statuses = self.history_store.status_counts(filters)
         except HistoryError as exc:
             self.validation_label.setText(f"Audit history warning: {exc}")
@@ -2919,7 +2926,7 @@ class MainWindow(QMainWindow):
         self.history_success_value.setText(str(stats.successes))
         self.history_failure_value.setText(str(stats.failures))
         self.history_rate_value.setText(f"{stats.success_rate:.1f}%")
-        self._update_history_charts(timeline, statuses)
+        self._update_history_charts(timeline, statuses, granularity)
 
         self.history_table.blockSignals(True)
         self.history_table.setRowCount(0)
@@ -2983,7 +2990,49 @@ class MainWindow(QMainWindow):
             return f"{minutes}m {remaining}s"
         return f"{remaining}s"
 
-    def _update_history_charts(self, timeline, statuses: dict[str, int]) -> None:
+    @staticmethod
+    def _history_bucket_heading(label: str, granularity: str) -> str:
+        if granularity == "weekly":
+            return f"Week of {label}"
+        if granularity == "monthly":
+            return f"Month {label}"
+        return label
+
+    @classmethod
+    def _history_line_detail(
+        cls,
+        label: str,
+        granularity: str,
+        series_name: str,
+        count: int,
+    ) -> str:
+        noun = "device" if count == 1 else "devices"
+        return (
+            f"{cls._history_bucket_heading(label, granularity)}\n"
+            f"{series_name}: {count} {noun}"
+        )
+
+    @staticmethod
+    def _history_status_detail(label: str, count: int, total: int) -> str:
+        noun = "run" if count == 1 else "runs"
+        detail = f"{label}\n{count} {noun}"
+        if total > 0:
+            detail += f" ({count / total:.1%})"
+        return detail
+
+    @staticmethod
+    def _show_history_chart_tooltip(view: QWidget, detail: str) -> None:
+        if detail:
+            QToolTip.showText(QCursor.pos(), detail, view)
+        else:
+            QToolTip.hideText()
+
+    def _update_history_charts(
+        self,
+        timeline,
+        statuses: dict[str, int],
+        granularity: str = "daily",
+    ) -> None:
         from PySide6.QtCharts import (
             QBarCategoryAxis,
             QChart,
@@ -2992,6 +3041,7 @@ class MainWindow(QMainWindow):
             QValueAxis,
         )
 
+        QToolTip.hideText()
         app = QApplication.instance()
         palette = app.palette() if app is not None else self.palette()
         dark_mode = palette.color(QPalette.ColorRole.Window).lightness() < 128
@@ -3017,6 +3067,45 @@ class MainWindow(QMainWindow):
             success_series.append(index, bucket.successes)
             failure_series.append(index, bucket.failures)
             maximum = max(maximum, bucket.successes, bucket.failures)
+
+        timeline_values = tuple(
+            (bucket.label, int(bucket.successes), int(bucket.failures))
+            for bucket in timeline
+        )
+
+        def line_detail(point, series_name: str, value_index: int) -> str:
+            try:
+                index = int(round(point.x()))
+            except (OverflowError, TypeError, ValueError):
+                return ""
+            if index < 0 or index >= len(timeline_values):
+                return ""
+            label, successes, failures = timeline_values[index]
+            count = (successes, failures)[value_index]
+            return self._history_line_detail(
+                label, granularity, series_name, count
+            )
+
+        for series, series_name, value_index in (
+            (success_series, "Succeeded", 0),
+            (failure_series, "Failed", 1),
+        ):
+            series.hovered.connect(
+                lambda point, state, name=series_name, index=value_index: (
+                    self._show_history_chart_tooltip(
+                        self.history_line_view,
+                        line_detail(point, name, index) if state else "",
+                    )
+                )
+            )
+            series.clicked.connect(
+                lambda point, name=series_name, index=value_index: (
+                    self._show_history_chart_tooltip(
+                        self.history_line_view,
+                        line_detail(point, name, index),
+                    )
+                )
+            )
         chart.addSeries(success_series)
         chart.addSeries(failure_series)
         x_axis = QBarCategoryAxis()
@@ -3034,6 +3123,21 @@ class MainWindow(QMainWindow):
         self._style_history_chart(chart, (x_axis, y_axis))
         self.history_line_view.setBackgroundBrush(
             QBrush(palette.color(QPalette.ColorRole.Window))
+        )
+        self.history_line_view.setAccessibleName(
+            "Successful and failed devices over time"
+        )
+        line_accessible = []
+        for label, successes, failures in timeline_values:
+            heading = self._history_bucket_heading(label, granularity)
+            success_noun = "device" if successes == 1 else "devices"
+            failure_noun = "device" if failures == 1 else "devices"
+            line_accessible.append(
+                f"{heading}: {successes} succeeded {success_noun}, "
+                f"{failures} failed {failure_noun}"
+            )
+        self.history_line_view.setAccessibleDescription(
+            "; ".join(line_accessible) or "No timeline data"
         )
         self.history_line_view.setChart(chart)
 
@@ -3060,16 +3164,35 @@ class MainWindow(QMainWindow):
                 "running": "#1565c0",
             }
         )
+        status_total = sum(count for count in statuses.values() if count > 0)
+        status_accessible = []
         for status, count in statuses.items():
             if count:
-                piece = pie.append(status.replace("_", " ").title(), count)
+                label = status.replace("_", " ").title()
+                piece = pie.append(label, count)
                 piece.setColor(QColor(colors.get(status, "#546e7a")))
                 piece.setBorderColor(palette.color(QPalette.ColorRole.Base))
                 piece.setLabelColor(palette.color(QPalette.ColorRole.WindowText))
+                detail = self._history_status_detail(label, count, status_total)
+                status_accessible.append(detail.replace("\n", ": "))
+                piece.hovered.connect(
+                    lambda state, text=detail: self._show_history_chart_tooltip(
+                        self.history_pie_view, text if state else ""
+                    )
+                )
+                piece.clicked.connect(
+                    lambda text=detail: self._show_history_chart_tooltip(
+                        self.history_pie_view, text
+                    )
+                )
         pie_chart.addSeries(pie)
         self._style_history_chart(pie_chart)
         self.history_pie_view.setBackgroundBrush(
             QBrush(palette.color(QPalette.ColorRole.Window))
+        )
+        self.history_pie_view.setAccessibleName("Run status")
+        self.history_pie_view.setAccessibleDescription(
+            "; ".join(status_accessible) or "No run status data"
         )
         self.history_pie_view.setChart(pie_chart)
 
