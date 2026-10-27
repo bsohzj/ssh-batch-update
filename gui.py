@@ -2471,14 +2471,19 @@ class MainWindow(QMainWindow):
         self.dictionary_syntax_edit.setMaximumHeight(100)
         details_layout.addWidget(self.dictionary_syntax_edit)
 
-        self.dictionary_notes_heading_label = QLabel("Notes")
-        details_layout.addWidget(self.dictionary_notes_heading_label)
-        self.dictionary_notes_label = QLabel()
-        self.dictionary_notes_label.setWordWrap(True)
-        self.dictionary_notes_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
+        primary_copy_row = QHBoxLayout()
+        self.dictionary_copy_button = QPushButton("Copy")
+        self.dictionary_copy_button.setAccessibleName("Copy primary syntax")
+        self.dictionary_copy_button.setAccessibleDescription(
+            "Copies the selected primary command or template syntax."
         )
-        details_layout.addWidget(self.dictionary_notes_label)
+        self.dictionary_copy_button.setEnabled(False)
+        self.dictionary_copy_confirmation = QLabel()
+        primary_copy_row.addWidget(self.dictionary_copy_button)
+        primary_copy_row.addWidget(self.dictionary_copy_confirmation)
+        primary_copy_row.addStretch()
+        details_layout.addLayout(primary_copy_row)
+        self.dictionary_primary_copy_row = primary_copy_row
 
         self.dictionary_placeholder_warning = QLabel(
             "This is a template. Replace every <PLACEHOLDER> before use."
@@ -2488,14 +2493,41 @@ class MainWindow(QMainWindow):
         self.dictionary_placeholder_warning.hide()
         details_layout.addWidget(self.dictionary_placeholder_warning)
 
-        copy_row = QHBoxLayout()
-        self.dictionary_copy_button = QPushButton("Copy Command")
-        self.dictionary_copy_button.setEnabled(False)
-        self.dictionary_copy_confirmation = QLabel()
-        copy_row.addWidget(self.dictionary_copy_button)
-        copy_row.addWidget(self.dictionary_copy_confirmation)
-        copy_row.addStretch()
-        details_layout.addLayout(copy_row)
+        self.dictionary_rollback_heading_label = QLabel("Rollback syntax")
+        self.dictionary_rollback_heading_label.hide()
+        details_layout.addWidget(self.dictionary_rollback_heading_label)
+        self.dictionary_rollback_edit = QPlainTextEdit()
+        self.dictionary_rollback_edit.setReadOnly(True)
+        self.dictionary_rollback_edit.setMaximumHeight(100)
+        self.dictionary_rollback_edit.hide()
+        details_layout.addWidget(self.dictionary_rollback_edit)
+
+        rollback_copy_row = QHBoxLayout()
+        self.dictionary_copy_rollback_button = QPushButton("Copy")
+        self.dictionary_copy_rollback_button.setAccessibleName(
+            "Copy rollback syntax"
+        )
+        self.dictionary_copy_rollback_button.setAccessibleDescription(
+            "Copies the selected rollback command syntax."
+        )
+        self.dictionary_copy_rollback_button.setEnabled(False)
+        self.dictionary_copy_rollback_button.hide()
+        self.dictionary_copy_rollback_confirmation = QLabel()
+        self.dictionary_copy_rollback_confirmation.hide()
+        rollback_copy_row.addWidget(self.dictionary_copy_rollback_button)
+        rollback_copy_row.addWidget(self.dictionary_copy_rollback_confirmation)
+        rollback_copy_row.addStretch()
+        details_layout.addLayout(rollback_copy_row)
+        self.dictionary_rollback_copy_row = rollback_copy_row
+
+        self.dictionary_notes_heading_label = QLabel("Notes")
+        details_layout.addWidget(self.dictionary_notes_heading_label)
+        self.dictionary_notes_label = QLabel()
+        self.dictionary_notes_label.setWordWrap(True)
+        self.dictionary_notes_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        details_layout.addWidget(self.dictionary_notes_label)
 
         self.dictionary_additional_info_button = QPushButton("Additional info")
         self.dictionary_additional_info_button.setFocusPolicy(
@@ -2565,6 +2597,9 @@ class MainWindow(QMainWindow):
             self._dictionary_selection_changed
         )
         self.dictionary_copy_button.clicked.connect(self._copy_dictionary_command)
+        self.dictionary_copy_rollback_button.clicked.connect(
+            self._copy_dictionary_rollback
+        )
         self.dictionary_additional_info_button.clicked.connect(
             self._toggle_dictionary_additional_info
         )
@@ -2595,6 +2630,7 @@ class MainWindow(QMainWindow):
         )
         self.dictionary_empty_label.setVisible(count == 0)
         self.dictionary_copy_confirmation.clear()
+        self.dictionary_copy_rollback_confirmation.clear()
         if entries:
             self.dictionary_table.selectRow(0)
         else:
@@ -2634,10 +2670,18 @@ class MainWindow(QMainWindow):
             self.dictionary_mode_label.clear()
             self.dictionary_risk_label.clear()
             self.dictionary_notes_label.clear()
+            self.dictionary_notes_label.setMinimumHeight(0)
             self.dictionary_syntax_edit.clear()
+            self.dictionary_rollback_edit.clear()
+            self.dictionary_rollback_heading_label.hide()
+            self.dictionary_rollback_edit.hide()
             self.dictionary_placeholder_warning.hide()
-            self.dictionary_copy_button.setText("Copy Command")
             self.dictionary_copy_button.setEnabled(False)
+            self.dictionary_copy_confirmation.clear()
+            self.dictionary_copy_rollback_button.setEnabled(False)
+            self.dictionary_copy_rollback_button.hide()
+            self.dictionary_copy_rollback_confirmation.clear()
+            self.dictionary_copy_rollback_confirmation.hide()
             return
         self.dictionary_additional_info_button.show()
         self._set_dictionary_additional_info_expanded(
@@ -2653,14 +2697,21 @@ class MainWindow(QMainWindow):
         self.dictionary_mode_label.setText(entry.mode)
         self.dictionary_risk_label.setText(entry.risk)
         self.dictionary_notes_label.setText(entry.applicability_notes)
+        wrapped_notes_height = self.dictionary_notes_label.heightForWidth(280)
+        self.dictionary_notes_label.setMinimumHeight(max(0, wrapped_notes_height))
         self.dictionary_syntax_edit.setPlainText(entry.syntax)
+        has_rollback = bool(entry.rollback_syntax)
+        self.dictionary_rollback_heading_label.setVisible(has_rollback)
+        self.dictionary_rollback_edit.setVisible(has_rollback)
+        self.dictionary_rollback_edit.setPlainText(entry.rollback_syntax)
+        self.dictionary_copy_rollback_button.setVisible(has_rollback)
+        self.dictionary_copy_rollback_button.setEnabled(has_rollback)
+        self.dictionary_copy_rollback_confirmation.setVisible(has_rollback)
         is_template = re.search(r"<[^<>\n]+>", entry.syntax) is not None
         self.dictionary_placeholder_warning.setVisible(is_template)
-        self.dictionary_copy_button.setText(
-            "Copy Template" if is_template else "Copy Command"
-        )
         self.dictionary_copy_button.setEnabled(True)
         self.dictionary_copy_confirmation.clear()
+        self.dictionary_copy_rollback_confirmation.clear()
 
     @Slot()
     def _copy_dictionary_command(self) -> None:
@@ -2675,6 +2726,19 @@ class MainWindow(QMainWindow):
         self.dictionary_copy_confirmation.setText(
             "Template copied." if is_template else "Command copied."
         )
+        self.dictionary_copy_rollback_confirmation.clear()
+
+    @Slot()
+    def _copy_dictionary_rollback(self) -> None:
+        entry = getattr(self, "_selected_dictionary_entry", None)
+        if entry is None or not entry.rollback_syntax:
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        clipboard.setText(entry.rollback_syntax)
+        self.dictionary_copy_confirmation.clear()
+        self.dictionary_copy_rollback_confirmation.setText("Rollback copied.")
 
     def _ensure_history_ui(self) -> None:
         if self._history_ui_built:

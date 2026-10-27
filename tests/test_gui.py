@@ -425,7 +425,11 @@ class MainWindowTests(unittest.TestCase):
 
     def test_command_dictionary_search_filters_count_and_details(self):
         self.window._ensure_dictionary_ui()
-        entry = gui.COMMAND_ENTRIES[-1]
+        entry = next(
+            item
+            for item in gui.COMMAND_ENTRIES
+            if item.id == "huawei.port-link-type"
+        )
         expected = tuple(
             gui.search_commands(entry.syntax, entry.platform, entry.category)
         )
@@ -461,6 +465,15 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertEqual(self.window.dictionary_mode_label.text(), shown.mode)
         self.assertEqual(self.window.dictionary_risk_label.text(), shown.risk)
+        self.assertEqual(shown.id, "huawei.port-link-type")
+        self.assertEqual(self.window.dictionary_mode_label.text(), "interface view")
+        self.assertEqual(self.window.dictionary_risk_label.text(), "changes-state")
+        self.assertFalse(self.window.dictionary_rollback_heading_label.isHidden())
+        self.assertFalse(self.window.dictionary_rollback_edit.isHidden())
+        self.assertEqual(
+            self.window.dictionary_rollback_edit.toPlainText(),
+            "undo port link-type",
+        )
         self.assertEqual(
             self.window.dictionary_notes_label.text(), shown.applicability_notes
         )
@@ -491,12 +504,32 @@ class MainWindowTests(unittest.TestCase):
             purpose_index + 3,
         )
         self.assertEqual(
-            details_layout.indexOf(self.window.dictionary_notes_heading_label),
+            details_layout.indexOf(self.window.dictionary_primary_copy_row),
             purpose_index + 4,
         )
         self.assertEqual(
-            details_layout.indexOf(self.window.dictionary_notes_label),
+            details_layout.indexOf(self.window.dictionary_placeholder_warning),
             purpose_index + 5,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_rollback_heading_label),
+            purpose_index + 6,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_rollback_edit),
+            purpose_index + 7,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_rollback_copy_row),
+            purpose_index + 8,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_notes_heading_label),
+            purpose_index + 9,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_notes_label),
+            purpose_index + 10,
         )
 
     def test_command_dictionary_additional_info_click_and_keyboard_disclosure(self):
@@ -586,16 +619,17 @@ class MainWindowTests(unittest.TestCase):
     def test_command_dictionary_live_search_accepts_partial_tokens(self):
         self.window._ensure_dictionary_ui()
         self.window.dictionary_platform_combo.setCurrentText("CloudEngine S5755-S")
-        self.window.dictionary_search_edit.setText("dis")
+        self.window.dictionary_search_edit.setText("display")
         self.app.processEvents()
 
         syntaxes = [
             self.window.dictionary_table.item(row, 2).text()
             for row in range(self.window.dictionary_table.rowCount())
         ]
-        self.assertEqual(len(syntaxes), 20)
+        self.assertEqual(len(syntaxes), 35)
         self.assertEqual(syntaxes[0], "display version")
         self.assertIn("display interface brief", syntaxes)
+        self.assertIn("display current-configuration", syntaxes)
 
     def test_command_dictionary_notes_wrap_in_scrollable_details_at_supported_sizes(self):
         self.window._ensure_dictionary_ui()
@@ -635,21 +669,61 @@ class MainWindowTests(unittest.TestCase):
         template = next(
             entry
             for entry in gui.COMMAND_ENTRIES
-            if "<" in entry.syntax and ">" in entry.syntax
+            if entry.id == "cisco.interface-description"
         )
         self.window.dictionary_search_edit.setText(template.syntax)
         self.app.processEvents()
 
-        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy Template")
+        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy")
+        self.assertEqual(self.window.dictionary_copy_rollback_button.text(), "Copy")
+        self.assertEqual(
+            self.window.dictionary_copy_button.accessibleName(),
+            "Copy primary syntax",
+        )
+        self.assertIn(
+            "primary", self.window.dictionary_copy_button.accessibleDescription()
+        )
+        self.assertEqual(
+            self.window.dictionary_copy_rollback_button.accessibleName(),
+            "Copy rollback syntax",
+        )
+        self.assertIn(
+            "rollback",
+            self.window.dictionary_copy_rollback_button.accessibleDescription(),
+        )
+        self.assertEqual(
+            self.window.dictionary_copy_button.focusPolicy(),
+            Qt.FocusPolicy.StrongFocus,
+        )
+        self.assertEqual(
+            self.window.dictionary_copy_rollback_button.focusPolicy(),
+            Qt.FocusPolicy.StrongFocus,
+        )
         self.assertFalse(self.window.dictionary_placeholder_warning.isHidden())
         self.assertIn(
             "<PLACEHOLDER>", self.window.dictionary_placeholder_warning.text()
         )
-        self.window.dictionary_copy_button.click()
+        self.window.dictionary_copy_button.setFocus()
+        QTest.keyClick(self.window.dictionary_copy_button, Qt.Key.Key_Space)
 
         self.assertEqual(self.app.clipboard().text(), template.syntax)
         self.assertEqual(
             self.window.dictionary_copy_confirmation.text(), "Template copied."
+        )
+        self.assertFalse(self.window.dictionary_copy_rollback_button.isHidden())
+        self.assertEqual(
+            self.window.dictionary_rollback_edit.toPlainText(),
+            template.rollback_syntax,
+        )
+        self.window.dictionary_copy_rollback_button.setFocus()
+        QTest.keyClick(
+            self.window.dictionary_copy_rollback_button,
+            Qt.Key.Key_Space,
+        )
+        self.assertEqual(self.app.clipboard().text(), template.rollback_syntax)
+        self.assertEqual(
+            self.window.dictionary_copy_rollback_confirmation.text(),
+            "Rollback copied.",
         )
         plain = next(
             entry
@@ -658,8 +732,14 @@ class MainWindowTests(unittest.TestCase):
         )
         self.window.dictionary_search_edit.setText(plain.syntax)
         self.app.processEvents()
-        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy Command")
+        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy")
         self.assertTrue(self.window.dictionary_placeholder_warning.isHidden())
+        self.assertTrue(self.window.dictionary_rollback_heading_label.isHidden())
+        self.assertTrue(self.window.dictionary_rollback_edit.isHidden())
+        self.assertTrue(self.window.dictionary_copy_rollback_button.isHidden())
+        self.assertTrue(
+            self.window.dictionary_copy_rollback_confirmation.isHidden()
+        )
         self.window.dictionary_copy_button.click()
         self.assertEqual(self.app.clipboard().text(), plain.syntax)
 
@@ -681,6 +761,13 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.dictionary_table.isHidden())
         self.assertFalse(self.window.dictionary_table.horizontalHeader().isHidden())
         self.assertFalse(self.window.dictionary_copy_button.isEnabled())
+        self.assertFalse(self.window.dictionary_copy_rollback_button.isEnabled())
+        self.assertTrue(self.window.dictionary_copy_rollback_button.isHidden())
+        self.assertTrue(
+            self.window.dictionary_copy_rollback_confirmation.isHidden()
+        )
+        self.assertTrue(self.window.dictionary_rollback_heading_label.isHidden())
+        self.assertTrue(self.window.dictionary_rollback_edit.isHidden())
         self.assertEqual(
             self.window.dictionary_title_label.text(), "No command selected"
         )

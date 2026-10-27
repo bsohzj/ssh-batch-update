@@ -157,9 +157,12 @@ does not stop an already confirmed live batch.
 
 ### Command dictionary
 
-The full-window **Command Dictionary** is an offline reference containing 40
-read-only exec-mode entries, organized as 20 cross-vendor pairs for Cisco
-Catalyst 9300L and Huawei CloudEngine S5755-S. Its scope is deliberately exact:
+The full-window **Command Dictionary** is an offline reference containing 96
+entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
+CloudEngine S5755-S. Seventy entries are read-only operational commands. The
+remaining entries are explicitly marked as configuration changes, service-
+impacting actions, active diagnostics, or interactive saves and show their
+required context. Its scope is deliberately exact:
 
 - Catalyst 9300L documented for IOS XE 17.3.x, with deployed target 17.3.3
 - CloudEngine S5755-S documented for V600R024C10, with deployed target
@@ -168,15 +171,21 @@ Catalyst 9300L and Huawei CloudEngine S5755-S. Its scope is deliberately exact:
 Search uses command text, purpose, aliases, keywords, and related metadata.
 Platform and category filters can be combined with it. Selecting a row shows
 the exact syntax, purpose, applicability, deployed target, mode, risk, and
-notes. **Copy Command** copies literal syntax; entries containing an angle-
-bracket placeholder instead show **Copy Template** and a replacement warning.
+notes. A **Copy** action directly below the primary syntax copies that literal
+syntax; entries containing an angle-bracket placeholder also show a replacement
+warning. Reversible entries show a separate rollback syntax with its own
+**Copy** action. Each action copies exactly one command and never inserts it
+into the execution form.
 
 Browsing or copying a dictionary entry never inserts it into the command boxes,
 executes it, records it in History, persists a selection, or makes a network
 request. The dictionary is a release-scoped reference, not proof that a command
 is supported or safe on every image, license, hardware revision, role, or site
-configuration. Replace every `<PLACEHOLDER>` deliberately and validate the
-result on an approved lab switch before production use.
+configuration. Replace every `<PLACEHOLDER>` deliberately, enter the documented
+command context first, treat rollback text as a reviewed aid rather than an
+automatic restoration of prior state, and validate the result on an approved
+lab switch before production use. Save commands may prompt interactively and
+must not be treated as unattended operations.
 
 ## Use
 
