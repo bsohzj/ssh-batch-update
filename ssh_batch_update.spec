@@ -15,7 +15,8 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=collect_submodules("netmiko") + ["keyring.backends.macOS"],
+    hiddenimports=collect_submodules("netmiko")
+    + ["history", "keyring.backends.macOS", "PySide6.QtCharts"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

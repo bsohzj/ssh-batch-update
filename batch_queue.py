@@ -17,7 +17,7 @@ from run_commands import PreparedRun, RunRequest, prepare_run
 KEYCHAIN_SERVICE = "com.sg4291.sshbatchupdate.queue"
 QUEUE_GROUP = "batch_queue/jobs"
 QUEUE_ORDER_KEY = "batch_queue/order"
-PAYLOAD_VERSION = 1
+PAYLOAD_VERSION = 2
 EDITABLE_STATUSES = {"ready", "scheduled", "blocked", "interrupted"}
 TERMINAL_STATUSES = {
     "succeeded",
@@ -114,9 +114,14 @@ class BatchPayload:
     port: int
     timeout: int
     failure_patterns: tuple[str, ...] = ()
+    profile_label: str = "Manual"
 
     @classmethod
-    def from_prepared(cls, prepared: PreparedRun) -> "BatchPayload":
+    def from_prepared(
+        cls,
+        prepared: PreparedRun,
+        profile_label: str = "Manual",
+    ) -> "BatchPayload":
         settings = prepared.settings
         if settings is None:
             raise QueueStorageError("The validated batch does not contain connection settings.")
@@ -133,6 +138,7 @@ class BatchPayload:
             port=settings.port,
             timeout=settings.timeout,
             failure_patterns=tuple(request.failure_patterns),
+            profile_label=profile_label or "Manual",
         )
 
     def to_json(self) -> str:
@@ -150,6 +156,7 @@ class BatchPayload:
                 "port": self.port,
                 "timeout": self.timeout,
                 "failure_patterns": list(self.failure_patterns),
+                "profile_label": self.profile_label,
             },
             separators=(",", ":"),
         )
@@ -158,7 +165,8 @@ class BatchPayload:
     def from_json(cls, value: str) -> "BatchPayload":
         try:
             data = json.loads(value)
-            if data.get("version") != PAYLOAD_VERSION:
+            version = int(data.get("version", 0))
+            if version not in {1, PAYLOAD_VERSION}:
                 raise ValueError("unsupported payload version")
             return cls(
                 inventory_text=str(data["inventory_text"]),
@@ -174,6 +182,11 @@ class BatchPayload:
                 port=int(data["port"]),
                 timeout=int(data["timeout"]),
                 failure_patterns=tuple(str(item) for item in data.get("failure_patterns", [])),
+                profile_label=(
+                    str(data.get("profile_label") or "Manual")
+                    if version == PAYLOAD_VERSION
+                    else "Unknown (legacy)"
+                ),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise QueueStorageError(f"The stored batch payload is invalid: {exc}") from exc

@@ -9,12 +9,14 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PySide6.QtCore import Qt, QSettings
-    from PySide6.QtGui import QCloseEvent
-    from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
+    from PySide6.QtCore import QEvent, QPointF, Qt, QSettings, QTime
+    from PySide6.QtGui import QCloseEvent, QColor, QPalette
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
 
     import batch_queue
     import gui
+    import history
     import run_commands as runner
 except ImportError:
     GUI_AVAILABLE = False
@@ -36,7 +38,14 @@ class MainWindowTests(unittest.TestCase):
             QSettings.Format.IniFormat,
         )
         self.secret_store = batch_queue.MemorySecretStore()
-        self.window = gui.MainWindow(self.settings, secret_store=self.secret_store)
+        self.history_store = history.HistoryStore(self.base / "history.sqlite3")
+        self.history_commands = history.MemoryHistoryCommandStore()
+        self.window = gui.MainWindow(
+            self.settings,
+            secret_store=self.secret_store,
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
 
     def tearDown(self):
         with patch.object(
@@ -56,6 +65,51 @@ class MainWindowTests(unittest.TestCase):
         self.window.password_edit.setText("secret")
         self.window.output_edit.setText(str(self.base / "outputs"))
         self.window.device_type_combo.setCurrentText("cisco_ios")
+
+    def add_history_record(
+        self,
+        job_id="history-job",
+        status="succeeded",
+        successes=1,
+        failures=0,
+        cancelled=0,
+        source="manual",
+        profile="Manual",
+        run_directory="",
+        summary_path="",
+    ):
+        now = datetime.now(timezone.utc)
+        record = history.HistoryRecord(
+            job_id=job_id,
+            batch_name=f"cisco_ios — 1 devices — {job_id}",
+            created_utc=now - timedelta(minutes=2),
+            scheduled_utc=now - timedelta(minutes=1) if source == "scheduled" else None,
+            started_utc=now - timedelta(minutes=1),
+            completed_utc=None,
+            source=source,
+            profile_label=profile,
+            device_type="cisco_ios",
+            valid_devices=1,
+            invalid_devices=0,
+            command_count=2,
+        )
+        self.history_store.start(record)
+        if status != "running":
+            result_text = (
+                f"{successes} succeeded, {failures} failed, {cancelled} cancelled"
+            )
+            self.history_store.finalize(
+                job_id,
+                status,
+                successes,
+                failures,
+                cancelled,
+                result_text,
+                run_directory,
+                summary_path,
+                completed_utc=now,
+            )
+        return self.history_store.get(job_id)
 
     def test_validation_populates_devices_and_enables_live_run(self):
         self.populate_valid_inputs()
@@ -176,25 +230,1006 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
+        self.assertEqual(self.window.main_tabs.count(), 3)
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(1), "History")
+        self.assertEqual(self.window.main_tabs.tabText(2), "Dictionary")
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertTrue(self.window.main_tabs.tabBar().expanding())
+        self.assertGreaterEqual(self.window.main_tabs.tabBar().minimumHeight(), 44)
+        self.assertEqual(self.window.results_tabs.count(), 2)
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
         self.assertEqual(self.window.queue_table.columnCount(), 8)
-        self.assertEqual(self.window.schedule_button.text(), "Schedule Batch")
+        self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
         self.assertFalse(hasattr(self.window, "queue_button"))
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
 
-    def test_schedule_dialog_displays_date_time_picker(self):
+    def test_theme_menu_defaults_to_system_and_actions_are_exclusive(self):
+        self.assertEqual(self.window.view_menu.title().replace("&", ""), "View")
+        self.assertEqual(self.window.theme_menu.title().replace("&", ""), "Theme")
+        self.assertTrue(self.window.theme_action_group.isExclusive())
+        self.assertTrue(self.window.theme_system_action.isChecked())
+        self.assertFalse(self.window.theme_light_action.isChecked())
+        self.assertFalse(self.window.theme_dark_action.isChecked())
+
+        self.window.theme_dark_action.trigger()
+
+        self.assertFalse(self.window.theme_system_action.isChecked())
+        self.assertFalse(self.window.theme_light_action.isChecked())
+        self.assertTrue(self.window.theme_dark_action.isChecked())
+        self.assertEqual(self.settings.value("appearance/theme"), "dark")
+        self.settings.beginGroup("appearance")
+        self.assertEqual(self.settings.childKeys(), ["theme"])
+        self.settings.endGroup()
+
+    def test_runtime_theme_is_application_wide_and_system_restores_native_palette(self):
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        app_palette = self.app.palette()
+        self.assertEqual(
+            app_palette.color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+        self.assertEqual(
+            self.window.palette().color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+        dialog = QDialog(self.window)
+        self.assertEqual(
+            dialog.palette().color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+        self.assertGreater(self.app.palette().resolveMask(), 0)
+
+        self.window.theme_light_action.trigger()
+        self.app.processEvents()
+
+        self.assertTrue(self.window.theme_light_action.isChecked())
+        self.assertEqual(
+            self.app.palette().color(QPalette.ColorRole.Window), QColor("#f5f5f5")
+        )
+        self.assertEqual(self.settings.value("appearance/theme"), "light")
+
+        self.window.theme_system_action.trigger()
+        self.app.processEvents()
+
+        self.assertEqual(self.window._theme_mode, gui.THEME_SYSTEM)
+        self.assertTrue(self.window.theme_system_action.isChecked())
+        self.assertEqual(self.settings.value("appearance/theme"), "system")
+        self.assertEqual(self.app.palette().resolveMask(), 0)
+
+    def test_stored_theme_is_applied_when_a_window_is_reopened(self):
+        self.window.theme_dark_action.trigger()
+        self.settings.sync()
+        self.window.close()
+        self.app.processEvents()
+
+        reopened_settings = QSettings(
+            str(self.base / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        self.window = gui.MainWindow(
+            reopened_settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=history.HistoryStore(self.base / "reopened-history.sqlite3"),
+            history_command_store=history.MemoryHistoryCommandStore(),
+        )
+
+        self.assertEqual(self.window._theme_mode, gui.THEME_DARK)
+        self.assertTrue(self.window.theme_dark_action.isChecked())
+        self.assertEqual(
+            self.app.palette().color(QPalette.ColorRole.Window), QColor("#202124")
+        )
+
+    def test_theme_switch_preserves_lazy_history_and_styles_it_when_created(self):
+        self.assertFalse(self.window._history_ui_built)
+
+        self.window.theme_dark_action.trigger()
+
+        self.assertFalse(self.window._history_ui_built)
+        self.add_history_record("lazy-dark")
+        self.window._ensure_history_ui()
+        line_chart = self.window.history_line_view.chart()
+        self.assertEqual(
+            line_chart.backgroundBrush().color(), QColor("#202124")
+        )
+        self.assertEqual(
+            [series.color().name() for series in line_chart.series()],
+            ["#66bb6a", "#ef5350"],
+        )
+
+    def test_runtime_theme_refreshes_existing_history_and_destructive_colors(self):
+        self.add_history_record("existing-theme")
+        self.window._ensure_history_ui()
+        self.assertIn("#c62828", self.window.cancel_button.styleSheet())
+        self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
+        self.assertIn("#c62828", self.window.history_clear_button.styleSheet())
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        line_chart = self.window.history_line_view.chart()
+        self.assertEqual(
+            line_chart.backgroundBrush().color(), QColor("#202124")
+        )
+        self.assertEqual(
+            [series.color().name() for series in line_chart.series()],
+            ["#66bb6a", "#ef5350"],
+        )
+        for button in (
+            self.window.cancel_button,
+            self.window.clear_completed_button,
+            self.window.history_remove_button,
+            self.window.history_delete_outputs_button,
+            self.window.history_clear_button,
+        ):
+            self.assertIn("#ff6b6b", button.styleSheet())
+
+    def test_history_tab_is_lazy_and_builds_cards_charts_and_table(self):
+        self.assertFalse(self.window._history_ui_built)
+
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+        self.app.processEvents()
+
+        self.assertTrue(self.window._history_ui_built)
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
+        history_index = self.window.main_tabs.indexOf(self.window.history_tab)
+        self.assertEqual(self.window.main_tabs.tabText(history_index), "History")
+        self.assertEqual(self.window.results_tabs.indexOf(self.window.history_tab), -1)
+        self.assertEqual(self.window.history_table.columnCount(), 9)
+        self.assertEqual(self.window.history_runs_value.text(), "0")
+        self.assertEqual(len(self.window.history_line_view.chart().series()), 2)
+        self.assertEqual(len(self.window.history_pie_view.chart().series()), 1)
+        self.assertFalse(self.window.history_empty_label.isHidden())
+        self.assertTrue(self.window.history_line_view.isHidden())
+        self.assertTrue(self.window.history_pie_view.isHidden())
+
+    def test_command_dictionary_is_third_lazy_top_level_tab_and_focuses_search(self):
+        self.assertFalse(self.window._dictionary_ui_built)
+        self.assertFalse(hasattr(self.window, "dictionary_table"))
+
+        self.window.show()
+        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.app.processEvents()
+
+        self.assertTrue(self.window._dictionary_ui_built)
+        self.assertIs(
+            self.window.main_tabs.currentWidget(), self.window.dictionary_tab
+        )
+        dictionary_index = self.window.main_tabs.indexOf(self.window.dictionary_tab)
+        self.assertEqual(dictionary_index, 2)
+        self.assertEqual(self.window.main_tabs.tabText(dictionary_index), "Dictionary")
+        self.assertTrue(self.window.dictionary_search_edit.hasFocus())
+        self.assertEqual(self.window.dictionary_table.columnCount(), 3)
+        self.assertEqual(
+            [
+                self.window.dictionary_table.horizontalHeaderItem(column).text()
+                for column in range(3)
+            ],
+            ["Platform", "Category", "Command"],
+        )
+        self.assertFalse(
+            any(
+                group.title() == "Command Details"
+                for group in self.window.findChildren(gui.QGroupBox)
+            )
+        )
+        self.assertEqual(
+            self.window.dictionary_details_panel.accessibleName(), "Command details"
+        )
+        self.assertEqual(
+            self.window.dictionary_table.rowCount(), len(gui.COMMAND_ENTRIES)
+        )
+
+    def test_command_dictionary_search_filters_count_and_details(self):
+        self.window._ensure_dictionary_ui()
+        entry = next(
+            item
+            for item in gui.COMMAND_ENTRIES
+            if item.id == "huawei.port-link-type"
+        )
+        expected = tuple(
+            gui.search_commands(entry.syntax, entry.platform, entry.category)
+        )
+
+        self.window.dictionary_platform_combo.setCurrentText(entry.platform)
+        self.window.dictionary_category_combo.setCurrentText(entry.category)
+        self.window.dictionary_search_edit.setText(entry.syntax)
+        self.app.processEvents()
+
+        self.assertEqual(self.window.dictionary_table.rowCount(), len(expected))
+        self.assertEqual(
+            self.window.dictionary_count_label.text(),
+            f"{len(expected)} command" if len(expected) == 1 else f"{len(expected)} commands",
+        )
+        self.assertGreater(len(expected), 0)
+        shown = self.window.dictionary_table.item(0, 0).data(
+            Qt.ItemDataRole.UserRole
+        )
+        self.assertEqual(self.window.dictionary_table.item(0, 0).text(), shown.platform)
+        self.assertEqual(self.window.dictionary_table.item(0, 1).text(), shown.category)
+        self.assertEqual(self.window.dictionary_table.item(0, 2).text(), shown.syntax)
+        self.assertEqual(self.window.dictionary_title_label.text(), shown.title)
+        self.assertEqual(self.window.dictionary_purpose_heading_label.text(), "Purpose")
+        self.assertEqual(
+            self.window.dictionary_description_label.text(), shown.description
+        )
+        self.assertEqual(
+            self.window.dictionary_syntax_edit.toPlainText(), shown.syntax
+        )
+        self.assertIn(shown.platform, self.window.dictionary_applicability_label.text())
+        self.assertEqual(
+            self.window.dictionary_target_label.text(), shown.deployed_target
+        )
+        self.assertEqual(self.window.dictionary_mode_label.text(), shown.mode)
+        self.assertEqual(self.window.dictionary_risk_label.text(), shown.risk)
+        self.assertEqual(shown.id, "huawei.port-link-type")
+        self.assertEqual(self.window.dictionary_mode_label.text(), "interface view")
+        self.assertEqual(self.window.dictionary_risk_label.text(), "changes-state")
+        self.assertFalse(self.window.dictionary_rollback_heading_label.isHidden())
+        self.assertFalse(self.window.dictionary_rollback_edit.isHidden())
+        self.assertEqual(
+            self.window.dictionary_rollback_edit.toPlainText(),
+            "undo port link-type",
+        )
+        self.assertEqual(
+            self.window.dictionary_notes_label.text(), shown.applicability_notes
+        )
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.text(), "Additional info"
+        )
+        self.assertFalse(self.window._dictionary_additional_info_expanded)
+        self.assertTrue(self.window.dictionary_additional_info_widget.isHidden())
+        self.assertFalse(self.window.dictionary_purpose_heading_label.isHidden())
+        self.assertFalse(self.window.dictionary_syntax_heading_label.isHidden())
+        self.assertFalse(self.window.dictionary_notes_heading_label.isHidden())
+        details_layout = (
+            self.window.dictionary_purpose_heading_label.parentWidget().layout()
+        )
+        purpose_index = details_layout.indexOf(
+            self.window.dictionary_purpose_heading_label
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_description_label),
+            purpose_index + 1,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_syntax_heading_label),
+            purpose_index + 2,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_syntax_edit),
+            purpose_index + 3,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_primary_copy_row),
+            purpose_index + 4,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_placeholder_warning),
+            purpose_index + 5,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_rollback_heading_label),
+            purpose_index + 6,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_rollback_edit),
+            purpose_index + 7,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_rollback_copy_row),
+            purpose_index + 8,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_notes_heading_label),
+            purpose_index + 9,
+        )
+        self.assertEqual(
+            details_layout.indexOf(self.window.dictionary_notes_label),
+            purpose_index + 10,
+        )
+
+    def test_command_dictionary_additional_info_click_and_keyboard_disclosure(self):
+        self.window._ensure_dictionary_ui()
+        button = self.window.dictionary_additional_info_button
+        additional_info = self.window.dictionary_additional_info_widget
+
+        self.assertFalse(button.isCheckable())
+        self.assertFalse(button.isChecked())
+        self.assertEqual(button.focusPolicy(), Qt.FocusPolicy.StrongFocus)
+        self.assertEqual(button.accessibleName(), "Additional info")
+        self.assertIn("risk", button.accessibleDescription())
+        self.assertIs(type(button), type(self.window.dictionary_copy_button))
+        self.assertEqual(
+            button.sizePolicy().horizontalPolicy(),
+            self.window.dictionary_copy_button.sizePolicy().horizontalPolicy(),
+        )
+        self.assertEqual(
+            button.sizePolicy().verticalPolicy(),
+            self.window.dictionary_copy_button.sizePolicy().verticalPolicy(),
+        )
+        self.assertEqual(
+            button.sizeHint().height(),
+            self.window.dictionary_copy_button.sizeHint().height(),
+        )
+        self.assertEqual(
+            button.styleSheet(), self.window.dictionary_copy_button.styleSheet()
+        )
+
+        button.click()
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(button.isChecked())
+        self.assertFalse(button.isDown())
+        self.assertEqual(button.text(), "Hide additional info")
+        self.assertFalse(additional_info.isHidden())
+
+        button.click()
+        self.assertFalse(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(button.isChecked())
+        self.assertFalse(button.isDown())
+        self.assertEqual(button.text(), "Additional info")
+        self.assertTrue(additional_info.isHidden())
+
+        self.window.show()
+        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.app.processEvents()
+        button.setFocus()
+        self.app.processEvents()
+        self.assertTrue(button.hasFocus())
+        QTest.keyClick(button, Qt.Key.Key_Space)
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(button.isChecked())
+        self.assertFalse(button.isDown())
+        self.assertEqual(button.text(), "Hide additional info")
+        self.assertFalse(additional_info.isHidden())
+
+    def test_command_dictionary_additional_info_state_survives_selection_and_filters(self):
+        self.window._ensure_dictionary_ui()
+        button = self.window.dictionary_additional_info_button
+        additional_info = self.window.dictionary_additional_info_widget
+        button.click()
+
+        self.window.dictionary_table.selectRow(1)
+        self.app.processEvents()
+        selected = self.window.dictionary_table.item(1, 0).data(
+            Qt.ItemDataRole.UserRole
+        )
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(additional_info.isHidden())
+        self.assertEqual(self.window.dictionary_mode_label.text(), selected.mode)
+
+        self.window.dictionary_search_edit.setText(
+            "no-such-command-7f4bd27d-585b-4dde-a05f-8e2f043b269a"
+        )
+        self.app.processEvents()
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertTrue(button.isHidden())
+        self.assertTrue(additional_info.isHidden())
+
+        self.window.dictionary_search_edit.clear()
+        self.app.processEvents()
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        self.assertFalse(button.isHidden())
+        self.assertFalse(additional_info.isHidden())
+        self.assertEqual(button.text(), "Hide additional info")
+
+    def test_command_dictionary_live_search_accepts_partial_tokens(self):
+        self.window._ensure_dictionary_ui()
+        self.window.dictionary_platform_combo.setCurrentText("CloudEngine S5755-S")
+        self.window.dictionary_search_edit.setText("display")
+        self.app.processEvents()
+
+        syntaxes = [
+            self.window.dictionary_table.item(row, 2).text()
+            for row in range(self.window.dictionary_table.rowCount())
+        ]
+        self.assertEqual(len(syntaxes), 35)
+        self.assertEqual(syntaxes[0], "display version")
+        self.assertIn("display interface brief", syntaxes)
+        self.assertIn("display current-configuration", syntaxes)
+
+    def test_command_dictionary_notes_wrap_in_scrollable_details_at_supported_sizes(self):
+        self.window._ensure_dictionary_ui()
+        entry = max(
+            gui.COMMAND_ENTRIES,
+            key=lambda candidate: len(candidate.applicability_notes),
+        )
+        self.window.dictionary_search_edit.setText(entry.syntax)
+        self.window.dictionary_additional_info_button.click()
+
+        self.window.show()
+        for width, height in ((1400, 850), (1050, 680)):
+            with self.subTest(size=(width, height)):
+                self.window.resize(width, height)
+                self.app.processEvents()
+                notes = self.window.dictionary_notes_label
+                self.assertEqual(notes.text(), entry.applicability_notes)
+                self.assertTrue(notes.wordWrap())
+                self.assertGreaterEqual(
+                    notes.height(), notes.heightForWidth(notes.width())
+                )
+                self.window.dictionary_details_scroll.ensureWidgetVisible(notes)
+                self.app.processEvents()
+                self.assertFalse(notes.isHidden())
+                risk = self.window.dictionary_risk_label
+                self.window.dictionary_details_scroll.ensureWidgetVisible(risk)
+                self.app.processEvents()
+                self.assertFalse(risk.isHidden())
+                self.assertTrue(risk.wordWrap())
+                self.assertEqual(
+                    self.window.dictionary_details_scroll.horizontalScrollBarPolicy(),
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+                )
+
+    def test_command_dictionary_copy_is_exact_and_warns_for_templates(self):
+        self.window._ensure_dictionary_ui()
+        template = next(
+            entry
+            for entry in gui.COMMAND_ENTRIES
+            if entry.id == "cisco.interface-description"
+        )
+        self.window.dictionary_search_edit.setText(template.syntax)
+        self.app.processEvents()
+
+        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy")
+        self.assertEqual(self.window.dictionary_copy_rollback_button.text(), "Copy")
+        self.assertEqual(
+            self.window.dictionary_copy_button.accessibleName(),
+            "Copy primary syntax",
+        )
+        self.assertIn(
+            "primary", self.window.dictionary_copy_button.accessibleDescription()
+        )
+        self.assertEqual(
+            self.window.dictionary_copy_rollback_button.accessibleName(),
+            "Copy rollback syntax",
+        )
+        self.assertIn(
+            "rollback",
+            self.window.dictionary_copy_rollback_button.accessibleDescription(),
+        )
+        self.assertEqual(
+            self.window.dictionary_copy_button.focusPolicy(),
+            Qt.FocusPolicy.StrongFocus,
+        )
+        self.assertEqual(
+            self.window.dictionary_copy_rollback_button.focusPolicy(),
+            Qt.FocusPolicy.StrongFocus,
+        )
+        self.assertFalse(self.window.dictionary_placeholder_warning.isHidden())
+        self.assertIn(
+            "<PLACEHOLDER>", self.window.dictionary_placeholder_warning.text()
+        )
+        self.window.dictionary_copy_button.setFocus()
+        QTest.keyClick(self.window.dictionary_copy_button, Qt.Key.Key_Space)
+
+        self.assertEqual(self.app.clipboard().text(), template.syntax)
+        self.assertEqual(
+            self.window.dictionary_copy_confirmation.text(), "Template copied."
+        )
+        self.assertFalse(self.window.dictionary_copy_rollback_button.isHidden())
+        self.assertEqual(
+            self.window.dictionary_rollback_edit.toPlainText(),
+            template.rollback_syntax,
+        )
+        self.window.dictionary_copy_rollback_button.setFocus()
+        QTest.keyClick(
+            self.window.dictionary_copy_rollback_button,
+            Qt.Key.Key_Space,
+        )
+        self.assertEqual(self.app.clipboard().text(), template.rollback_syntax)
+        self.assertEqual(
+            self.window.dictionary_copy_rollback_confirmation.text(),
+            "Rollback copied.",
+        )
+        plain = next(
+            entry
+            for entry in gui.COMMAND_ENTRIES
+            if not ("<" in entry.syntax and ">" in entry.syntax)
+        )
+        self.window.dictionary_search_edit.setText(plain.syntax)
+        self.app.processEvents()
+        self.assertEqual(self.window.dictionary_copy_button.text(), "Copy")
+        self.assertTrue(self.window.dictionary_placeholder_warning.isHidden())
+        self.assertTrue(self.window.dictionary_rollback_heading_label.isHidden())
+        self.assertTrue(self.window.dictionary_rollback_edit.isHidden())
+        self.assertTrue(self.window.dictionary_copy_rollback_button.isHidden())
+        self.assertTrue(
+            self.window.dictionary_copy_rollback_confirmation.isHidden()
+        )
+        self.window.dictionary_copy_button.click()
+        self.assertEqual(self.app.clipboard().text(), plain.syntax)
+
+    def test_command_dictionary_empty_state(self):
+        self.window._ensure_dictionary_ui()
+
+        self.window.dictionary_search_edit.setText(
+            "no-such-command-7f4bd27d-585b-4dde-a05f-8e2f043b269a"
+        )
+        self.app.processEvents()
+
+        self.assertEqual(self.window.dictionary_table.rowCount(), 0)
+        self.assertEqual(self.window.dictionary_count_label.text(), "0 commands")
+        self.assertFalse(self.window.dictionary_empty_label.isHidden())
+        self.assertEqual(
+            self.window.dictionary_empty_label.text(),
+            "No commands match the current search and filters.",
+        )
+        self.assertFalse(self.window.dictionary_table.isHidden())
+        self.assertFalse(self.window.dictionary_table.horizontalHeader().isHidden())
+        self.assertFalse(self.window.dictionary_copy_button.isEnabled())
+        self.assertFalse(self.window.dictionary_copy_rollback_button.isEnabled())
+        self.assertTrue(self.window.dictionary_copy_rollback_button.isHidden())
+        self.assertTrue(
+            self.window.dictionary_copy_rollback_confirmation.isHidden()
+        )
+        self.assertTrue(self.window.dictionary_rollback_heading_label.isHidden())
+        self.assertTrue(self.window.dictionary_rollback_edit.isHidden())
+        self.assertEqual(
+            self.window.dictionary_title_label.text(), "No command selected"
+        )
+        self.assertTrue(self.window.dictionary_additional_info_button.isHidden())
+        self.assertTrue(self.window.dictionary_additional_info_widget.isHidden())
+
+    def test_command_dictionary_constructs_and_switches_with_native_palettes(self):
+        self.window._ensure_dictionary_ui()
+        button = self.window.dictionary_additional_info_button
+        copy_button = self.window.dictionary_copy_button
+
+        def assert_matches_copy_button():
+            self.assertEqual(button.palette(), copy_button.palette())
+            self.assertEqual(button.styleSheet(), copy_button.styleSheet())
+            self.assertEqual(button.isFlat(), copy_button.isFlat())
+            self.assertEqual(button.autoDefault(), copy_button.autoDefault())
+            self.assertEqual(button.isDefault(), copy_button.isDefault())
+            self.assertEqual(button.isDown(), copy_button.isDown())
+            self.assertFalse(button.isCheckable())
+            self.assertFalse(button.isChecked())
+
+        self.window.theme_light_action.trigger()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
+            QColor("#ffffff"),
+        )
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            QColor("#eeeeee"),
+        )
+        self.assertEqual(button.text(), "Additional info")
+        assert_matches_copy_button()
+
+        button.click()
+        self.assertEqual(button.text(), "Hide additional info")
+        self.assertTrue(self.window._dictionary_additional_info_expanded)
+        assert_matches_copy_button()
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        self.assertEqual(
+            self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
+            QColor("#151515"),
+        )
+        self.assertEqual(self.window.dictionary_table.styleSheet(), "")
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.palette().color(
+                QPalette.ColorRole.Button
+            ),
+            QColor("#303134"),
+        )
+        self.assertEqual(
+            self.window.dictionary_additional_info_button.styleSheet(), ""
+        )
+        self.assertEqual(self.window.dictionary_additional_info_widget.styleSheet(), "")
+        self.assertEqual(button.text(), "Hide additional info")
+        assert_matches_copy_button()
+
+        button.click()
+        self.assertEqual(button.text(), "Additional info")
+        self.assertFalse(self.window._dictionary_additional_info_expanded)
+        assert_matches_copy_button()
+
+    def test_opening_dictionary_does_not_change_queue_or_results_attention(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        queued = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window._refresh_queue_table(select_job_id=queued.job_id)
+        queue_rows = self.window.queue_table.rowCount()
+        selected_job_id = self.window._selected_job_id
+        self.window._request_results_attention()
+
+        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.window.dictionary_search_edit.setText("interface")
+        self.app.processEvents()
+
+        self.assertEqual(self.window.queue_table.rowCount(), queue_rows)
+        self.assertEqual(self.window._selected_job_id, selected_job_id)
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertTrue(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(
+            self.window.results_tabs.tabText(1), "Device Results •"
+        )
+
+    def test_reopened_window_defaults_to_ssh_instead_of_last_main_tab(self):
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+        self.window._save_settings()
+        self.window.close()
+        self.app.processEvents()
+
+        reopened_settings = QSettings(
+            str(self.base / "settings.ini"),
+            QSettings.Format.IniFormat,
+        )
+        self.window = gui.MainWindow(
+            reopened_settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=history.HistoryStore(self.base / "reopened-history.sqlite3"),
+            history_command_store=history.MemoryHistoryCommandStore(),
+        )
+
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertFalse(self.window._history_ui_built)
+        self.assertFalse(self.window._dictionary_ui_built)
+
+    def test_history_dashboard_filters_and_aggregates_records(self):
+        self.add_history_record("good", "succeeded", successes=3, profile="Ops")
+        self.add_history_record(
+            "partial",
+            "completed_with_failures",
+            successes=1,
+            failures=2,
+            source="scheduled",
+            profile="Night",
+        )
+        self.window._ensure_history_ui()
+
+        self.assertEqual(self.window.history_runs_value.text(), "2")
+        self.assertEqual(self.window.history_success_value.text(), "4")
+        self.assertEqual(self.window.history_failure_value.text(), "2")
+        self.assertEqual(self.window.history_rate_value.text(), "66.7%")
+        self.assertEqual(self.window.history_table.rowCount(), 2)
+        self.assertFalse(self.window.history_line_view.isHidden())
+        self.assertFalse(self.window.history_pie_view.isHidden())
+        line_series = self.window.history_line_view.chart().series()
+        self.assertEqual([series.count() for series in line_series], [1, 1])
+        self.assertTrue(all(series.pointsVisible() for series in line_series))
+        self.assertEqual([series.markerSize() for series in line_series], [8.0, 8.0])
+        self.assertEqual(
+            [
+                [(point.x(), point.y()) for point in series.points()]
+                for series in line_series
+            ],
+            [[(0.0, 4.0)], [(0.0, 2.0)]],
+        )
+
+        index = self.window.history_status_combo.findData("completed_with_failures")
+        self.window.history_status_combo.setCurrentIndex(index)
+        self.app.processEvents()
+
+        self.assertEqual(self.window.history_table.rowCount(), 1)
+        self.assertEqual(
+            self.window.history_table.item(0, 7).text(),
+            "Completed With Failures",
+        )
+
+    def test_history_chart_hover_click_and_accessible_details(self):
+        self.add_history_record("good", "succeeded", successes=3)
+        self.add_history_record(
+            "partial", "completed_with_failures", successes=1, failures=2
+        )
+        self.window._ensure_history_ui()
+
+        timeline = self.history_store.timeline(history.HistoryFilter(), "daily")
+        label = timeline[0].label
+        succeeded, failed = self.window.history_line_view.chart().series()
+        with patch.object(gui.QToolTip, "showText") as show:
+            succeeded.hovered.emit(QPointF(0, 4), True)
+            self.assertEqual(show.call_args.args[1], f"{label}\nSucceeded: 4 devices")
+            self.assertIs(show.call_args.args[2], self.window.history_line_view)
+
+            failed.hovered.emit(QPointF(0, 2), True)
+            self.assertEqual(show.call_args.args[1], f"{label}\nFailed: 2 devices")
+
+            succeeded.clicked.emit(QPointF(0, 4))
+            self.assertEqual(show.call_args.args[1], f"{label}\nSucceeded: 4 devices")
+
+        with patch.object(gui.QToolTip, "hideText") as hide:
+            failed.hovered.emit(QPointF(0, 2), False)
+            hide.assert_called_once_with()
+
+        slices = {
+            piece.label(): piece
+            for piece in self.window.history_pie_view.chart().series()[0].slices()
+        }
+        with patch.object(gui.QToolTip, "showText") as show:
+            slices["Succeeded"].hovered.emit(True)
+            self.assertEqual(show.call_args.args[1], "Succeeded\n1 run (50.0%)")
+            self.assertIs(show.call_args.args[2], self.window.history_pie_view)
+
+            slices["Completed With Failures"].clicked.emit()
+            self.assertEqual(
+                show.call_args.args[1],
+                "Completed With Failures\n1 run (50.0%)",
+            )
+
+        with patch.object(gui.QToolTip, "hideText") as hide:
+            slices["Succeeded"].hovered.emit(False)
+            hide.assert_called_once_with()
+
+        self.assertEqual(
+            self.window.history_line_view.accessibleName(),
+            "Successful and failed devices over time",
+        )
+        self.assertIn(
+            f"{label}: 4 succeeded devices, 2 failed devices",
+            self.window.history_line_view.accessibleDescription(),
+        )
+        self.assertEqual(self.window.history_pie_view.accessibleName(), "Run status")
+        self.assertIn(
+            "Succeeded: 1 run (50.0%)",
+            self.window.history_pie_view.accessibleDescription(),
+        )
+        self.assertIn(
+            "Completed With Failures: 1 run (50.0%)",
+            self.window.history_pie_view.accessibleDescription(),
+        )
+
+    def test_history_chart_tooltip_formatting_and_guards(self):
+        self.assertEqual(
+            self.window._history_line_detail(
+                "2026-10-27", "daily", "Succeeded", 1
+            ),
+            "2026-10-27\nSucceeded: 1 device",
+        )
+        self.assertEqual(
+            self.window._history_line_detail(
+                "2026-10-26", "weekly", "Failed", 0
+            ),
+            "Week of 2026-10-26\nFailed: 0 devices",
+        )
+        self.assertEqual(
+            self.window._history_line_detail(
+                "2026-10", "monthly", "Succeeded", 2
+            ),
+            "Month 2026-10\nSucceeded: 2 devices",
+        )
+        self.assertEqual(
+            self.window._history_status_detail("Failed", 1, 0),
+            "Failed\n1 run",
+        )
+
+        self.add_history_record("guard", "succeeded", successes=1)
+        self.window._ensure_history_ui()
+        series = self.window.history_line_view.chart().series()[0]
+        with (
+            patch.object(gui.QToolTip, "showText") as show,
+            patch.object(gui.QToolTip, "hideText") as hide,
+        ):
+            series.hovered.emit(QPointF(99, 1), True)
+            show.assert_not_called()
+            hide.assert_called_once_with()
+
+    def test_history_chart_interactions_survive_filter_and_theme_rebuilds(self):
+        self.add_history_record("good", "succeeded", successes=1)
+        self.add_history_record(
+            "partial", "completed_with_failures", successes=1, failures=1
+        )
+        self.window._ensure_history_ui()
+        original_series = self.window.history_line_view.chart().series()[0]
+
+        with patch.object(gui.QToolTip, "hideText") as hide:
+            index = self.window.history_status_combo.findData(
+                "completed_with_failures"
+            )
+            self.window.history_status_combo.setCurrentIndex(index)
+            self.app.processEvents()
+            hide.assert_called()
+
+        filtered_series = self.window.history_line_view.chart().series()[0]
+        self.assertIsNot(filtered_series, original_series)
+        with patch.object(gui.QToolTip, "showText") as show:
+            filtered_series.clicked.emit(QPointF(0, 1))
+            self.assertEqual(show.call_args.args[1].splitlines()[1], "Succeeded: 1 device")
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+        themed_series = self.window.history_line_view.chart().series()[1]
+        self.assertIsNot(themed_series, filtered_series)
+        with patch.object(gui.QToolTip, "showText") as show:
+            themed_series.hovered.emit(QPointF(0, 1), True)
+            self.assertEqual(show.call_args.args[1].splitlines()[1], "Failed: 1 device")
+
+        themed_slice = self.window.history_pie_view.chart().series()[0].slices()[0]
+        with patch.object(gui.QToolTip, "showText") as show:
+            themed_slice.clicked.emit()
+            self.assertEqual(
+                show.call_args.args[1],
+                "Completed With Failures\n1 run (100.0%)",
+            )
+
+    def test_history_charts_use_dark_palette_and_accessible_colors(self):
+        palette = QPalette(self.window.palette())
+        palette.setColor(QPalette.ColorRole.Window, QColor("#202124"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#151515"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#f1f3f4"))
+        palette.setColor(QPalette.ColorRole.Mid, QColor("#5f6368"))
+        self.app.setPalette(palette)
+        self.add_history_record("dark", "completed_with_failures", 2, 1)
+
+        self.window._ensure_history_ui()
+
+        line_chart = self.window.history_line_view.chart()
+        self.assertEqual(
+            line_chart.backgroundBrush().color(), palette.color(QPalette.ColorRole.Window)
+        )
+        self.assertEqual(
+            line_chart.plotAreaBackgroundBrush().color(),
+            palette.color(QPalette.ColorRole.Base),
+        )
+        self.assertEqual(
+            line_chart.titleBrush().color(), palette.color(QPalette.ColorRole.WindowText)
+        )
+        for axis in line_chart.axes():
+            self.assertEqual(
+                axis.labelsColor(), palette.color(QPalette.ColorRole.WindowText)
+            )
+            self.assertEqual(axis.gridLineColor(), palette.color(QPalette.ColorRole.Mid))
+        line_colors = [series.color().name() for series in line_chart.series()]
+        self.assertEqual(line_colors, ["#66bb6a", "#ef5350"])
+
+        pie_chart = self.window.history_pie_view.chart()
+        self.assertEqual(
+            pie_chart.backgroundBrush().color(), palette.color(QPalette.ColorRole.Window)
+        )
+        pie_colors = [piece.color().name() for piece in pie_chart.series()[0].slices()]
+        self.assertEqual(pie_colors, ["#ffca28"])
+
+    def test_palette_change_refreshes_already_created_history_charts(self):
+        self.add_history_record("palette")
+        self.window._ensure_history_ui()
+
+        with patch.object(self.window, "_refresh_history") as refresh:
+            self.window.changeEvent(QEvent(QEvent.Type.PaletteChange))
+            self.app.processEvents()
+
+        refresh.assert_called_once_with()
+
+    def test_scheduled_audit_start_snapshots_profile_and_encrypted_commands(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Night Ops")
+        scheduled = datetime.now(timezone.utc) + timedelta(hours=1)
+        job = self.window.queue_controller.add(payload, prepared, scheduled)
+
+        self.window._start_audit_record(job, payload, prepared)
+
+        record = self.history_store.get(job.job_id)
+        self.assertEqual(record.source, "scheduled")
+        self.assertEqual(record.profile_label, "Night Ops")
+        snapshot = self.history_commands.get(job.job_id)
+        self.assertEqual(
+            [(command.section, command.text) for command in snapshot.commands],
+            [("exec", "show version"), ("config", "interface loopback 1")],
+        )
+
+    def test_completed_run_finalizes_history_and_writes_protected_marker(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Ops")
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+        run_directory = self.base / "outputs" / "run_history"
+        run_directory.mkdir(parents=True)
+        transcript = run_directory / "192.0.2.1.txt"
+        transcript.write_text("ok", encoding="utf-8")
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.1", "success", "", transcript_file=str(transcript)
+        )
+        runner.write_summary(summary, [device])
+
+        self.window._run_completed(
+            runner.BatchResult((device,), run_directory, summary)
+        )
+
+        record = self.history_store.get(job.job_id)
+        self.assertEqual(record.status, "succeeded")
+        self.assertEqual(record.success_count, 1)
+        self.assertEqual(Path(record.summary_path), summary)
+        self.assertTrue((run_directory / history.HISTORY_MARKER).is_file())
+
+    def test_cancelled_run_is_finalized_in_audit_history(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+        run_directory = self.base / "outputs" / "run_cancelled"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.1", "cancelled", "", error="cancelled by user"
+        )
+        runner.write_summary(summary, [device])
+
+        self.window._run_completed(
+            runner.BatchResult((device,), run_directory, summary)
+        )
+
+        record = self.history_store.get(job.job_id)
+        self.assertEqual(record.status, "cancelled")
+        self.assertEqual(record.cancelled_count, 1)
+
+    def test_worker_failure_history_redacts_credentials_and_addresses(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Manual")
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+
+        self.window._run_failed("secret rejected by 192.0.2.1 for admin")
+
+        result = self.history_store.get(job.job_id).result_text
+        self.assertNotIn("secret", result)
+        self.assertNotIn("192.0.2.1", result)
+        self.assertNotIn("admin", result)
+        self.assertIn("[redacted]", result)
+        self.assertIn("[device]", result)
+
+    def test_schedule_dialog_displays_separate_date_and_time_fields(self):
         dialog = gui.ScheduleDialog()
         dialog.show()
         self.app.processEvents()
 
-        self.assertIs(dialog.date_time_edit.parentWidget(), dialog)
-        self.assertTrue(dialog.date_time_edit.isVisible())
-        self.assertTrue(dialog.date_time_edit.calendarPopup())
-        self.assertEqual(dialog.date_time_edit.displayFormat(), "yyyy-MM-dd HH:mm")
+        self.assertTrue(dialog.date_edit.isVisible())
+        self.assertTrue(dialog.time_edit.isVisible())
+        self.assertTrue(dialog.date_edit.calendarPopup())
+        self.assertEqual(dialog.date_edit.displayFormat(), "ddd, d MMM yyyy")
+        self.assertEqual(dialog.time_edit.displayFormat(), "h:mm AP")
+        self.assertTrue(dialog.preview_label.text().startswith("Scheduled for "))
+
+        dialog.date_edit.setDate(dialog.date_edit.date().addDays(1))
+        dialog.time_edit.setTime(QTime(18, 30))
+        self.app.processEvents()
+
+        self.assertIn("6:30 PM", dialog.preview_label.text())
+        self.assertGreater(dialog.selected_utc(), datetime.now(timezone.utc))
 
         dialog.close()
 
@@ -288,6 +1323,106 @@ class MainWindowTests(unittest.TestCase):
 
         start_worker.assert_called_once()
         self.assertEqual(self.window.queue_controller.active_job_id, first.job_id)
+
+    def test_hidden_dispatch_keeps_history_visible_and_marks_results(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.paused = False
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+
+        with patch.object(self.window, "_start_worker") as start_worker:
+            self.window._queue_tick()
+
+        start_worker.assert_called_once()
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertTrue(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
+
+        self.window.main_tabs.setCurrentWidget(self.window.ssh_tab)
+
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertEqual(self.window.results_tabs.currentIndex(), 0)
+
+        self.window.results_tabs.setCurrentIndex(1)
+
+        self.assertFalse(self.window._results_attention_pending)
+        self.assertFalse(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+
+    def test_results_attention_pulses_three_times_then_leaves_dots(self):
+        self.window._request_results_attention()
+        timer = self.window.results_attention_timer
+        highlight = self.app.palette().color(QPalette.ColorRole.Highlight)
+
+        self.assertEqual(timer.interval(), 500)
+        self.assertEqual(gui.RESULTS_ATTENTION_TICKS, 6)
+        self.assertEqual(
+            self.window.main_tabs.tabBar().tabTextColor(0), highlight
+        )
+        self.assertEqual(
+            self.window.results_tabs.tabBar().tabTextColor(1), highlight
+        )
+
+        self.window._advance_results_attention_pulse()
+        self.window._request_results_attention()
+
+        self.assertIs(self.window.results_attention_timer, timer)
+        self.assertEqual(self.window._results_attention_tick, 0)
+        for _ in range(gui.RESULTS_ATTENTION_TICKS):
+            self.window._advance_results_attention_pulse()
+
+        self.assertFalse(timer.isActive())
+        self.assertTrue(self.window._results_attention_pending)
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
+        self.assertFalse(
+            self.window.main_tabs.tabBar().tabTextColor(0).isValid()
+        )
+        self.assertFalse(
+            self.window.results_tabs.tabBar().tabTextColor(1).isValid()
+        )
+
+    def test_visible_results_do_not_request_attention(self):
+        self.window.results_tabs.setCurrentIndex(1)
+
+        self.window._request_results_attention()
+
+        self.assertFalse(self.window._results_attention_pending)
+        self.assertFalse(self.window.results_attention_timer.isActive())
+        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+
+    def test_theme_change_updates_active_results_attention_color(self):
+        self.window._request_results_attention()
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+
+        highlight = QColor("#0a84ff")
+        self.assertEqual(
+            self.window.main_tabs.tabBar().tabTextColor(0), highlight
+        )
+        self.assertEqual(
+            self.window.results_tabs.tabBar().tabTextColor(1), highlight
+        )
+
+    def test_close_stops_results_attention_timer(self):
+        self.window._request_results_attention()
+        self.assertTrue(self.window.results_attention_timer.isActive())
+
+        self.window.close()
+        self.app.processEvents()
+
+        self.assertFalse(self.window.results_attention_timer.isActive())
 
     def test_future_schedule_arms_idle_sleep_prevention(self):
         prepared = runner.prepare_run(
@@ -453,6 +1588,161 @@ class MainWindowTests(unittest.TestCase):
             self.window.queue_controller.job(scheduled.job_id).status, "scheduled"
         )
         self.assertEqual(self.window.queue_table.rowCount(), 1)
+
+    def test_clear_completed_queue_entries_does_not_remove_audit_history(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        job = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared), prepared
+        )
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window.queue_controller.mark_terminal(job.job_id, "succeeded", "complete")
+        self.add_history_record(job.job_id)
+        self.window._refresh_queue_table(select_job_id=job.job_id)
+
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.clear_completed_batches()
+
+        self.assertIsNone(self.window.queue_controller.job(job.job_id))
+        self.assertIsNotNone(self.history_store.get(job.job_id))
+
+    def test_history_device_results_load_from_summary_on_demand(self):
+        run_directory = self.base / "outputs" / "run_results"
+        run_directory.mkdir(parents=True)
+        transcript = run_directory / "192.0.2.5.txt"
+        transcript.write_text("device output", encoding="utf-8")
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.5",
+            "failed",
+            "",
+            failed_section="config",
+            failed_line="2",
+            transcript_file=str(transcript),
+            error="configuration rejected",
+        )
+        runner.write_summary(summary, [device])
+        self.add_history_record(
+            "results",
+            "completed_with_failures",
+            failures=1,
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+        self.window.main_tabs.setCurrentWidget(self.window.history_tab)
+        self.window._request_results_attention()
+
+        self.window.view_history_results()
+
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertEqual(self.window.results_tabs.currentIndex(), 1)
+        self.assertFalse(self.window._results_attention_pending)
+        self.assertEqual(self.window.device_table.rowCount(), 1)
+        self.assertEqual(self.window.device_table.item(0, 0).text(), "192.0.2.5")
+        self.assertEqual(self.window.device_table.item(0, 2).text(), "config / 2")
+        self.assertEqual(
+            self.window.device_table.item(0, 3).text(), "configuration rejected"
+        )
+        self.assertEqual(self.window.device_table.item(0, 4).text(), str(transcript))
+
+    def test_missing_history_summary_is_shown_as_output_unavailable(self):
+        self.add_history_record(
+            "missing-output",
+            run_directory=str(self.base / "gone"),
+            summary_path=str(self.base / "gone" / "summary.csv"),
+        )
+        self.window._ensure_history_ui()
+
+        self.assertIn("Output unavailable", self.window.history_table.item(0, 8).text())
+        self.window.history_table.selectRow(0)
+        self.assertFalse(self.window.history_results_button.isEnabled())
+        self.assertFalse(self.window.history_output_button.isEnabled())
+
+    def test_view_history_commands_reads_encrypted_snapshot_after_warning(self):
+        record = self.add_history_record("commands")
+        snapshot = history.HistoryCommandSnapshot(
+            (
+                runner.Command("exec", "show clock", 1),
+                runner.Command("config", "hostname access-1", 2),
+            )
+        )
+        self.history_commands.set(record.job_id, snapshot)
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        with (
+            patch.object(
+                gui.QMessageBox,
+                "warning",
+                return_value=QMessageBox.StandardButton.Open,
+            ),
+            patch.object(self.history_commands, "get", wraps=self.history_commands.get) as get,
+            patch.object(gui.QDialog, "exec", return_value=QDialog.DialogCode.Rejected),
+        ):
+            self.window.view_history_commands()
+
+        get.assert_called_once_with(record.job_id)
+
+    def test_remove_history_preserves_output_and_deletes_command_snapshot(self):
+        run_directory = self.base / "outputs" / "run_preserved"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        runner.write_summary(summary, [])
+        record = self.add_history_record(
+            "remove",
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        self.history_commands.set(record.job_id, history.HistoryCommandSnapshot(()))
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.remove_history_record()
+
+        self.assertIsNone(self.history_store.get(record.job_id))
+        self.assertTrue(run_directory.is_dir())
+        with self.assertRaises(history.HistoryError):
+            self.history_commands.get(record.job_id)
+
+    def test_delete_history_outputs_requires_marker_and_deletes_exact_run(self):
+        run_directory = self.base / "outputs" / "run_delete"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        runner.write_summary(summary, [])
+        record = self.add_history_record(
+            "delete",
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        history.write_output_marker(record)
+        self.history_commands.set(record.job_id, history.HistoryCommandSnapshot(()))
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+        self.assertTrue(self.window.history_delete_outputs_button.isEnabled())
+
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.delete_history_outputs()
+
+        self.assertFalse(run_directory.exists())
+        self.assertIsNone(self.history_store.get(record.job_id))
 
     def _valid_request(self, device_type, address):
         return runner.RunRequest(
@@ -672,7 +1962,12 @@ class MainWindowTests(unittest.TestCase):
         self.window._refresh_profile_combo(profile.profile_id)
         self.window._profile_activated(self.window.profile_combo.findData(profile.profile_id))
 
-        reopened = gui.MainWindow(self.settings)
+        reopened = gui.MainWindow(
+            self.settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
         try:
             self.assertEqual(reopened.profile_combo.currentData(), profile.profile_id)
             self.assertEqual(reopened.username_edit.text(), "remembered-user")
@@ -685,7 +1980,12 @@ class MainWindowTests(unittest.TestCase):
         profile = self.window.profile_store.add("Missing", missing_file)
         self.window.profile_store.set_selected_id(profile.profile_id)
 
-        reopened = gui.MainWindow(self.settings)
+        reopened = gui.MainWindow(
+            self.settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
         try:
             self.assertIsNone(reopened.profile_combo.currentData())
             self.assertEqual(reopened.username_edit.text(), "")

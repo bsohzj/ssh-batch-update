@@ -38,7 +38,7 @@ copied there. **Validate Input** performs no SSH connections. **Test
 Connections** logs in to each valid IP, detects the prompt, optionally verifies
 enable mode, and disconnects without running either command box. Its status,
 stage, full error, and diagnostic file appear in the same results table used by
-live runs. **Run Live** and **Schedule Batch** validate and confirm a complete
+live runs. **Run Live** and **Schedule Run** validate and confirm a complete
 batch snapshot before it can make changes. Per-device
 progress never displays literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
@@ -71,8 +71,9 @@ permissions, and never commit them to Git.
 The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
-earlier ready work. Use **Schedule Batch** to select one future local date and
-time. Future jobs do not block ready jobs, and batches scheduled for the same
+earlier ready work. Use **Schedule Run** to select a future local date from the
+calendar and a separate time field; the dialog shows a readable schedule
+preview before submission. Future jobs do not block ready jobs, and batches scheduled for the same
 time run in the visible queue order.
 
 The **Queue** tab shows order, device and command counts, schedule, status, and
@@ -105,6 +106,86 @@ its lid closed. Keep the Mac logged in, powered, awake, connected to the switch
 network, and leave the application open for unattended work.
 Verify queue ordering, cancellation, and scheduled live changes against approved
 lab switches before using the feature on production access switches.
+
+### Audit history dashboard
+
+The full-window **History** screen keeps a persistent audit index for live
+batches that run after the feature is installed. It does not import older
+output folders and does not record connection tests. The three top-level tabs
+are **SSH**, **History**, and **Dictionary**; the app always starts on **SSH**.
+History is loaded only when its screen is first opened, so it does not delay
+normal queue use or SSH execution.
+
+Queued and scheduled work continues while History is visible. When a batch
+starts and its device results begin updating, the **SSH** and **Device Results**
+tabs pulse briefly and retain a dot until **SSH** → **Device Results** is opened,
+without interrupting History review.
+
+The dashboard defaults to the last 30 days and provides summary cards, a line
+chart of successful and failed devices, a run-status donut chart, searchable
+and filterable records, and 100-row pagination. Filters include date range,
+status, manual or scheduled source, device type, and credential-profile label.
+Selecting a record can load its `summary.csv` into **Device Results**, open its
+output or summary, or show its encrypted command snapshot after a sensitive
+content warning.
+
+Audit metadata is stored in an owner-private SQLite database at the app's
+macOS Application Support location. The database contains batch metadata,
+aggregate result counts, friendly profile labels, and output paths. It never
+contains usernames, passwords, enable secrets, command text, device addresses,
+or per-device error details. Device details are read from the existing
+`summary.csv` only when requested, so moved or deleted output is shown as
+unavailable rather than copied into another data store.
+
+Exact command snapshots are encrypted separately in macOS Keychain under
+service `com.sg4291.sshbatchupdate.history.commands`. They can include literal
+password commands, so **View Commands** displays a warning. Queue payloads and
+credential snapshots continue to be removed at the end of a run; the
+command-only history snapshot remains until its audit record is removed.
+
+**Remove from History** deletes the database reference and command snapshot but
+preserves transcripts and reports. **Clear History** does the same for every
+record. **Delete History & Outputs** is a separate per-run destructive action
+that requires confirmation and only operates on a validated, marked `run_`
+directory; there is no bulk output deletion. **Clear Completed** affects only
+the current Queue display and never deletes persistent audit history.
+
+History records are kept until manually removed. An unfinished record is
+marked **Interrupted** after the next launch and is never retried
+automatically. A history or Keychain error is reported in the interface but
+does not stop an already confirmed live batch.
+
+### Command dictionary
+
+The full-window **Command Dictionary** is an offline reference containing 96
+entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
+CloudEngine S5755-S. Seventy entries are read-only operational commands. The
+remaining entries are explicitly marked as configuration changes, service-
+impacting actions, active diagnostics, or interactive saves and show their
+required context. Its scope is deliberately exact:
+
+- Catalyst 9300L documented for IOS XE 17.3.x, with deployed target 17.3.3
+- CloudEngine S5755-S documented for V600R024C10, with deployed target
+  V600R024C10SPC500 / YunShan OS 1.24.1.1
+
+Search uses command text, purpose, aliases, keywords, and related metadata.
+Platform and category filters can be combined with it. Selecting a row shows
+the exact syntax, purpose, applicability, deployed target, mode, risk, and
+notes. A **Copy** action directly below the primary syntax copies that literal
+syntax; entries containing an angle-bracket placeholder also show a replacement
+warning. Reversible entries show a separate rollback syntax with its own
+**Copy** action. Each action copies exactly one command and never inserts it
+into the execution form.
+
+Browsing or copying a dictionary entry never inserts it into the command boxes,
+executes it, records it in History, persists a selection, or makes a network
+request. The dictionary is a release-scoped reference, not proof that a command
+is supported or safe on every image, license, hardware revision, role, or site
+configuration. Replace every `<PLACEHOLDER>` deliberately, enter the documented
+command context first, treat rollback text as a reviewed aid rather than an
+automatic restoration of prior state, and validate the result on an approved
+lab switch before production use. Save commands may prompt interactively and
+must not be treated as unattended operations.
 
 ## Use
 
@@ -188,4 +269,5 @@ hidden files.
 
 The app is intentionally unsigned. Gatekeeper warnings are expected, and a
 company security policy may prevent unsigned applications from running. The app
-bundle never includes `.env`, inventory, command, transcript, or output files.
+bundle never includes `.env`, inventory, command, transcript, output,
+audit-database, or Keychain payload files.

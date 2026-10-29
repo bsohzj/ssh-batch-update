@@ -5,16 +5,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 from uuid import uuid4
 
 from PySide6.QtCore import (
     QDateTime,
+    QEvent,
     QObject,
     QProcess,
     QSettings,
@@ -25,14 +27,25 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QCloseEvent, QDesktopServices
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QPainter,
+    QPalette,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDateEdit,
     QDialog,
     QDialogButtonBox,
-    QDateTimeEdit,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -46,10 +59,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -63,6 +79,24 @@ from batch_queue import (
     QueueMetadataStore,
     QueueStorageError,
     SecretStore,
+)
+
+from command_dictionary import COMMAND_ENTRIES, CommandEntry, search_commands
+
+from history import (
+    HistoryCommandSnapshot,
+    HistoryCommandStore,
+    HistoryError,
+    HistoryFilter,
+    HistoryRecord,
+    HistoryStore,
+    KeychainHistoryCommandStore,
+    MemoryHistoryCommandStore,
+    default_history_path,
+    delete_output_directory,
+    read_summary,
+    validate_output_deletion,
+    write_output_marker,
 )
 
 from run_commands import (
@@ -86,6 +120,76 @@ from run_commands import (
 APP_NAME = "SSH Batch Update"
 ORGANIZATION_NAME = "SG4291"
 MANUAL_PROFILE_TEXT = "Manual"
+THEME_SYSTEM = "system"
+THEME_LIGHT = "light"
+THEME_DARK = "dark"
+THEME_MODES = (THEME_SYSTEM, THEME_LIGHT, THEME_DARK)
+RESULTS_ATTENTION_INTERVAL_MS = 500
+RESULTS_ATTENTION_TICKS = 6
+
+
+def normalize_theme_mode(value: object) -> str:
+    """Return a supported persisted theme name, defaulting safely to System."""
+    mode = str(value or "").strip().lower()
+    return mode if mode in THEME_MODES else THEME_SYSTEM
+
+
+def _forced_theme_palette(mode: str) -> QPalette:
+    """Build a complete application palette without replacing the native style."""
+    dark = mode == THEME_DARK
+    colors = {
+        QPalette.ColorRole.Window: "#202124" if dark else "#f5f5f5",
+        QPalette.ColorRole.WindowText: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.Base: "#151515" if dark else "#ffffff",
+        QPalette.ColorRole.AlternateBase: "#292a2d" if dark else "#eeeeee",
+        QPalette.ColorRole.ToolTipBase: "#303134" if dark else "#ffffdc",
+        QPalette.ColorRole.ToolTipText: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.Text: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.Button: "#303134" if dark else "#eeeeee",
+        QPalette.ColorRole.ButtonText: "#f1f3f4" if dark else "#202124",
+        QPalette.ColorRole.BrightText: "#ffffff",
+        QPalette.ColorRole.Link: "#8ab4f8" if dark else "#0067c0",
+        QPalette.ColorRole.Highlight: "#0a84ff" if dark else "#0067c0",
+        QPalette.ColorRole.HighlightedText: "#ffffff",
+        QPalette.ColorRole.PlaceholderText: "#9aa0a6" if dark else "#767676",
+        QPalette.ColorRole.Light: "#5f6368" if dark else "#ffffff",
+        QPalette.ColorRole.Midlight: "#3c4043" if dark else "#dadce0",
+        QPalette.ColorRole.Mid: "#5f6368" if dark else "#9aa0a6",
+        QPalette.ColorRole.Dark: "#121212" if dark else "#5f6368",
+        QPalette.ColorRole.Shadow: "#000000",
+    }
+    palette = QPalette()
+    for role, color in colors.items():
+        palette.setColor(role, QColor(color))
+    disabled = QColor("#80868b" if dark else "#777777")
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+        QPalette.ColorRole.PlaceholderText,
+    ):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, disabled)
+    return palette
+
+
+def apply_application_theme(app: QApplication, mode: object) -> str:
+    """Apply a theme to every Qt window while retaining the platform widget style."""
+    normalized = normalize_theme_mode(mode)
+    scheme = {
+        THEME_SYSTEM: Qt.ColorScheme.Unknown,
+        THEME_LIGHT: Qt.ColorScheme.Light,
+        THEME_DARK: Qt.ColorScheme.Dark,
+    }[normalized]
+    app.styleHints().setColorScheme(scheme)
+    if normalized == THEME_SYSTEM:
+        # An unresolved palette hands color ownership back to the platform, so future
+        # macOS appearance changes continue to reach the application.
+        app.setPalette(QPalette())
+    else:
+        app.setPalette(_forced_theme_palette(normalized))
+    return normalized
+
+
 PROFILE_GROUP = "credential_profiles/items"
 LAST_PROFILE_KEY = "credential_profiles/last_selected"
 
@@ -450,30 +554,62 @@ class ScheduleDialog(QDialog):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Schedule Batch")
+        self.setWindowTitle("Schedule Run")
+        self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
         label = QLabel("Run this batch at:")
         layout.addWidget(label)
-        self.date_time_edit = QDateTimeEdit()
-        self.date_time_edit.setCalendarPopup(True)
-        self.date_time_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
-        layout.addWidget(self.date_time_edit)
+
         minimum = QDateTime.currentDateTime().addSecs(60)
-        self.date_time_edit.setMinimumDateTime(minimum)
         if initial_utc is not None:
             selected = QDateTime.fromSecsSinceEpoch(int(initial_utc.timestamp())).toLocalTime()
-            self.date_time_edit.setDateTime(max(selected, minimum))
+            selected = max(selected, minimum)
         else:
-            self.date_time_edit.setDateTime(minimum)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+            selected = minimum
+        if selected.time().second() or selected.time().msec():
+            selected = selected.addSecs(60 - selected.time().second())
+        selected.setTime(selected.time().addMSecs(-selected.time().msec()))
+
+        fields = QFormLayout()
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("ddd, d MMM yyyy")
+        self.date_edit.setMinimumDate(QDateTime.currentDateTime().date())
+        self.date_edit.setDate(selected.date())
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("h:mm AP")
+        self.time_edit.setTime(selected.time())
+        fields.addRow("Date", self.date_edit)
+        fields.addRow("Time", self.time_edit)
+        layout.addLayout(fields)
+
+        self.preview_label = QLabel()
+        self.preview_label.setWordWrap(True)
+        self.date_edit.dateChanged.connect(self._update_preview)
+        self.time_edit.timeChanged.connect(self._update_preview)
+        layout.addWidget(self.preview_label)
+        self._update_preview()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        schedule_button = buttons.addButton(
+            "Schedule", QDialogButtonBox.ButtonRole.AcceptRole
         )
-        buttons.accepted.connect(self._accept_if_future)
+        schedule_button.clicked.connect(self._accept_if_future)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _selected_local(self) -> QDateTime:
+        return QDateTime(self.date_edit.date(), self.time_edit.time())
+
+    @Slot()
+    def _update_preview(self) -> None:
+        display = self._selected_local().toString(
+            "dddd, d MMMM yyyy 'at' h:mm AP"
+        )
+        self.preview_label.setText(f"Scheduled for {display}")
+
     def selected_utc(self) -> datetime:
-        local = self.date_time_edit.dateTime().toPython().replace(second=0, microsecond=0)
+        local = self._selected_local().toPython().replace(second=0, microsecond=0)
         if local.tzinfo is None:
             local = local.astimezone()
         return local.astimezone(timezone.utc)
@@ -531,14 +667,39 @@ class MainWindow(QMainWindow):
         settings: Optional[QSettings] = None,
         secret_store: Optional[SecretStore] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        history_store: Optional[HistoryStore] = None,
+        history_command_store: Optional[HistoryCommandStore] = None,
     ) -> None:
         super().__init__()
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.settings = settings or QSettings(ORGANIZATION_NAME, APP_NAME)
+        self._theme_mode = normalize_theme_mode(
+            self.settings.value("appearance/theme", THEME_SYSTEM, str)
+        )
+        app = QApplication.instance()
+        if app is not None:
+            apply_application_theme(app, self._theme_mode)
         self.profile_store = CredentialProfileStore(self.settings)
         self.queue_controller = QueueController(
             QueueMetadataStore(self.settings),
             secret_store or KeychainSecretStore(),
-            clock=clock,
+            clock=self._clock,
+        )
+        self._history_startup_warning = ""
+        try:
+            self.history_store: Optional[HistoryStore] = history_store or HistoryStore(
+                default_history_path(), clock=self._clock
+            )
+            interrupted = self.history_store.recover_interrupted()
+            if interrupted:
+                self._history_startup_warning = (
+                    f"Recovered {interrupted} interrupted audit history record(s)."
+                )
+        except HistoryError as exc:
+            self.history_store = None
+            self._history_startup_warning = str(exc)
+        self.history_command_store = (
+            history_command_store or KeychainHistoryCommandStore()
         )
         self._prepared: Optional[PreparedRun] = None
         self._batch_result: Optional[BatchResult] = None
@@ -564,6 +725,13 @@ class MainWindow(QMainWindow):
         self._last_command_import = ""
         self._last_credential_import = ""
         self._credential_file: Optional[Path] = None
+        self._history_ui_built = False
+        self._dictionary_ui_built = False
+        self._history_page = 0
+        self._history_records: dict[str, HistoryRecord] = {}
+        self._results_attention_pending = False
+        self._results_attention_tick = 0
+        self._results_attention_highlighted = False
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 850)
@@ -581,10 +749,20 @@ class MainWindow(QMainWindow):
         self.scheduler_timer.timeout.connect(self._queue_tick)
         self.scheduler_timer.start()
         self._update_queue_controls()
+        if self._history_startup_warning:
+            self.validation_label.setText(self._history_startup_warning)
 
     def _build_ui(self) -> None:
+        self._build_menu()
         central = QWidget(self)
         root = QVBoxLayout(central)
+        self.main_tabs = QTabWidget()
+        self.main_tabs.tabBar().setExpanding(True)
+        self.main_tabs.tabBar().setMinimumHeight(44)
+
+        ssh_tab = QWidget()
+        ssh_layout = QVBoxLayout(ssh_tab)
+        ssh_layout.setContentsMargins(0, 0, 0, 0)
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.main_splitter.setChildrenCollapsible(False)
 
@@ -689,9 +867,8 @@ class MainWindow(QMainWindow):
         button_row = QGridLayout()
         self.validate_button = QPushButton("Validate Input")
         self.run_button = QPushButton("Run Live")
-        self.schedule_button = QPushButton("Schedule Batch")
+        self.schedule_button = QPushButton("Schedule Run")
         self.cancel_button = QPushButton("Stop Run")
-        self.cancel_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.validate_button.clicked.connect(self.validate_inputs)
         self.run_button.clicked.connect(self.start_run)
         self.schedule_button.clicked.connect(self.schedule_batch)
@@ -746,7 +923,6 @@ class MainWindow(QMainWindow):
         self.retry_button = QPushButton("Retry")
         self.remove_batch_button = QPushButton("Remove")
         self.clear_completed_button = QPushButton("Clear Completed")
-        self.clear_completed_button.setStyleSheet("QPushButton { color: #c62828; }")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
         self.move_up_button.clicked.connect(lambda: self.move_selected_batch(-1))
         self.move_down_button.clicked.connect(lambda: self.move_selected_batch(1))
@@ -812,16 +988,107 @@ class MainWindow(QMainWindow):
 
         self.results_tabs.addTab(queue_tab, "Queue")
         self.results_tabs.addTab(device_results_tab, "Device Results")
+        self.results_tabs.currentChanged.connect(self._results_tab_changed)
         results_layout.addWidget(self.results_tabs, 1)
+
+        self.history_tab = QWidget()
+        self.history_layout = QVBoxLayout(self.history_tab)
+        self.history_placeholder = QLabel(
+            "Open History to load persistent audit history."
+        )
+        self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.history_layout.addWidget(self.history_placeholder, 1)
+
+        self.dictionary_tab = QWidget()
+        self.dictionary_layout = QVBoxLayout(self.dictionary_tab)
+        self.dictionary_placeholder = QLabel(
+            "Open Command Dictionary to browse supported network commands."
+        )
+        self.dictionary_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dictionary_layout.addWidget(self.dictionary_placeholder, 1)
 
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([480, 900])
-        root.addWidget(self.main_splitter)
+        ssh_layout.addWidget(self.main_splitter)
+
+        self.main_tabs.addTab(ssh_tab, "SSH")
+        self.main_tabs.addTab(self.history_tab, "History")
+        self.main_tabs.addTab(self.dictionary_tab, "Dictionary")
+        self.main_tabs.currentChanged.connect(self._main_tab_changed)
+        self.main_tabs.setCurrentWidget(ssh_tab)
+        self.ssh_tab = ssh_tab
+        root.addWidget(self.main_tabs)
+
+        self.results_attention_timer = QTimer(self)
+        self.results_attention_timer.setInterval(RESULTS_ATTENTION_INTERVAL_MS)
+        self.results_attention_timer.timeout.connect(
+            self._advance_results_attention_pulse
+        )
 
         self.setCentralWidget(central)
+        self._update_destructive_button_styles()
+
+    def _build_menu(self) -> None:
+        self.view_menu = self.menuBar().addMenu("&View")
+        self.theme_menu = self.view_menu.addMenu("&Theme")
+        self.theme_action_group = QActionGroup(self)
+        self.theme_action_group.setExclusive(True)
+        self.theme_actions: dict[str, QAction] = {}
+        for mode, label in (
+            (THEME_SYSTEM, "System"),
+            (THEME_LIGHT, "Light"),
+            (THEME_DARK, "Dark"),
+        ):
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setData(mode)
+            action.setChecked(mode == self._theme_mode)
+            action.triggered.connect(
+                lambda checked=False, selected=mode: self._select_theme(
+                    selected, checked
+                )
+            )
+            self.theme_action_group.addAction(action)
+            self.theme_menu.addAction(action)
+            self.theme_actions[mode] = action
+        self.theme_system_action = self.theme_actions[THEME_SYSTEM]
+        self.theme_light_action = self.theme_actions[THEME_LIGHT]
+        self.theme_dark_action = self.theme_actions[THEME_DARK]
+
+    @Slot(str, bool)
+    def _select_theme(self, mode: str, checked: bool = True) -> None:
+        if not checked:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        self._theme_mode = apply_application_theme(app, mode)
+        self.settings.setValue("appearance/theme", self._theme_mode)
+        self.settings.sync()
+        self._update_destructive_button_styles()
+        self._refresh_results_attention_color()
+        if self._history_ui_built and hasattr(self, "history_table"):
+            self._refresh_history()
+
+    def _update_destructive_button_styles(self) -> None:
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        color = "#ff6b6b" if dark else "#c62828"
+        style = f"QPushButton {{ color: {color}; }}"
+        for name in (
+            "cancel_button",
+            "clear_completed_button",
+            "history_remove_button",
+            "history_delete_outputs_button",
+            "history_clear_button",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setStyleSheet(style)
 
     def _path_row(self, placeholder: str, callback) -> tuple[QLineEdit, QWidget]:
         edit = QLineEdit()
@@ -1331,7 +1598,10 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            payload = BatchPayload.from_prepared(prepared)
+            payload = BatchPayload.from_prepared(
+                prepared,
+                self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
+            )
             job = self.queue_controller.add(payload, prepared, scheduled_utc)
         except (QueueStorageError, OSError) as exc:
             QMessageBox.critical(self, "Could not queue batch", str(exc))
@@ -1364,9 +1634,10 @@ class MainWindow(QMainWindow):
             self._update_queue_controls()
             return
         try:
+            payload = self.queue_controller.payload(job.job_id)
             prepared = self._job_prepared.get(job.job_id)
             if prepared is None:
-                prepared = self.queue_controller.payload(job.job_id).prepare()
+                prepared = payload.prepare()
         except (QueueStorageError, ConfigurationError, OSError) as exc:
             self.queue_controller.mark_blocked(job.job_id, str(exc))
             self._refresh_queue_table(select_job_id=job.job_id)
@@ -1377,12 +1648,99 @@ class MainWindow(QMainWindow):
         if job.job_id not in self._job_rows:
             self._initialize_job_rows(job.job_id, prepared)
         self.queue_controller.mark_running(job.job_id)
+        self._start_audit_record(job, payload, prepared)
         self._active_job_id = job.job_id
         self._selected_job_id = job.job_id
         self._refresh_queue_table(select_job_id=job.job_id)
         self._show_job_results(job.job_id)
-        self.results_tabs.setCurrentIndex(1)
+        self._request_results_attention()
         self._start_worker(prepared, operation="run", job_id=job.job_id)
+
+    def _start_audit_record(
+        self,
+        job,
+        payload: BatchPayload,
+        prepared: PreparedRun,
+    ) -> None:
+        if self.history_store is None:
+            if self._history_startup_warning:
+                self.validation_label.setText(self._history_startup_warning)
+            return
+        record = HistoryRecord(
+            job_id=job.job_id,
+            batch_name=job.name,
+            created_utc=job.created_utc,
+            scheduled_utc=job.scheduled_utc,
+            started_utc=self._clock(),
+            completed_utc=None,
+            source="scheduled" if job.scheduled_utc else "manual",
+            profile_label=payload.profile_label,
+            device_type=job.device_type,
+            valid_devices=job.valid_devices,
+            invalid_devices=job.invalid_devices,
+            command_count=job.command_count,
+        )
+        warnings: list[str] = []
+        try:
+            self.history_store.start(record)
+        except HistoryError as exc:
+            warnings.append(str(exc))
+        else:
+            try:
+                self.history_command_store.set(
+                    job.job_id, HistoryCommandSnapshot(tuple(prepared.commands))
+                )
+            except HistoryError as exc:
+                warnings.append(str(exc))
+        if warnings:
+            self.validation_label.setText("Audit history warning: " + " ".join(warnings))
+        self._refresh_history_if_loaded()
+
+    def _safe_history_message(self, job_id: str, message: str) -> str:
+        prepared = self._job_prepared.get(job_id)
+        safe = str(message)
+        if prepared is None:
+            return safe
+        if prepared.settings is not None:
+            for secret in (
+                prepared.settings.username,
+                prepared.settings.password,
+                prepared.settings.enable_secret,
+            ):
+                if secret:
+                    safe = safe.replace(secret, "[redacted]")
+        for entry in prepared.entries:
+            if entry.address:
+                safe = safe.replace(entry.address, "[device]")
+        return safe
+
+    def _finalize_audit_record(
+        self,
+        job_id: str,
+        status: str,
+        result_text: str,
+        result: Optional[BatchResult] = None,
+    ) -> None:
+        if self.history_store is None:
+            return
+        try:
+            self.history_store.finalize(
+                job_id,
+                status,
+                result.successes if result else 0,
+                result.failures if result else 0,
+                result.cancelled if result else 0,
+                self._safe_history_message(job_id, result_text),
+                str(result.run_directory) if result else "",
+                str(result.summary_path) if result else "",
+                completed_utc=self._clock(),
+            )
+            record = self.history_store.get(job_id)
+            if record and record.run_directory:
+                write_output_marker(record)
+        except (HistoryError, OSError) as exc:
+            self.validation_label.setText(f"Audit history warning: {exc}")
+        self._refresh_history_if_loaded()
 
     def _start_worker(
         self,
@@ -1533,6 +1891,9 @@ class MainWindow(QMainWindow):
                 f"{result.successes} succeeded, {result.failures} failed, "
                 f"{result.cancelled} cancelled"
             )
+            self._finalize_audit_record(
+                job_id, terminal_status, result_text, result
+            )
             warning = self.queue_controller.mark_terminal(
                 job_id, terminal_status, result_text
             )
@@ -1576,6 +1937,8 @@ class MainWindow(QMainWindow):
     def _run_failed(self, message: str) -> None:
         if self._operation == "run" and self._active_job_id:
             job_id = self._active_job_id
+            safe_message = self._safe_history_message(job_id, message)
+            self._finalize_audit_record(job_id, "failed", safe_message)
             warning = self.queue_controller.mark_terminal(job_id, "failed", message)
             current = self._job_progress.get(job_id, (0, 1, "", ""))
             self._job_progress[job_id] = (
@@ -1794,7 +2157,10 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Apply:
             return
         try:
-            payload = BatchPayload.from_prepared(self._prepared)
+            payload = BatchPayload.from_prepared(
+                self._prepared,
+                self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
+            )
             self.queue_controller.replace_payload(job_id, payload, self._prepared)
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not save batch", str(exc))
@@ -1931,6 +2297,1215 @@ class MainWindow(QMainWindow):
         self._refresh_queue_table(select_job_id=self._selected_job_id)
         self._update_queue_controls()
 
+    @Slot(int)
+    def _results_tab_changed(self, index: int) -> None:
+        del index
+        self._acknowledge_results_attention_if_visible()
+
+    @Slot(int)
+    def _main_tab_changed(self, index: int) -> None:
+        if index == self.main_tabs.indexOf(self.history_tab):
+            self._ensure_history_ui()
+        elif index == self.main_tabs.indexOf(self.dictionary_tab):
+            self._ensure_dictionary_ui()
+            QTimer.singleShot(0, self.dictionary_search_edit.setFocus)
+        self._acknowledge_results_attention_if_visible()
+
+    def _device_results_visible(self) -> bool:
+        return (
+            self.main_tabs.currentWidget() is self.ssh_tab
+            and self.results_tabs.currentIndex() == 1
+        )
+
+    def _request_results_attention(self) -> None:
+        if self._device_results_visible():
+            self._clear_results_attention()
+            return
+        self._results_attention_pending = True
+        self._results_attention_tick = 0
+        self._set_results_attention_labels(True)
+        self._set_results_attention_highlighted(True)
+        self.results_attention_timer.start()
+
+    def _advance_results_attention_pulse(self) -> None:
+        if not self._results_attention_pending:
+            self.results_attention_timer.stop()
+            return
+        self._results_attention_tick += 1
+        if self._results_attention_tick >= RESULTS_ATTENTION_TICKS:
+            self.results_attention_timer.stop()
+            self._set_results_attention_highlighted(False)
+            return
+        self._set_results_attention_highlighted(
+            self._results_attention_tick % 2 == 0
+        )
+
+    def _acknowledge_results_attention_if_visible(self) -> None:
+        if self._results_attention_pending and self._device_results_visible():
+            self._clear_results_attention()
+
+    def _clear_results_attention(self) -> None:
+        self.results_attention_timer.stop()
+        self._results_attention_pending = False
+        self._results_attention_tick = 0
+        self._set_results_attention_labels(False)
+        self._set_results_attention_highlighted(False)
+
+    def _set_results_attention_labels(self, pending: bool) -> None:
+        self.main_tabs.setTabText(
+            self.main_tabs.indexOf(self.ssh_tab), "SSH •" if pending else "SSH"
+        )
+        self.results_tabs.setTabText(
+            1, "Device Results •" if pending else "Device Results"
+        )
+
+    def _set_results_attention_highlighted(self, highlighted: bool) -> None:
+        self._results_attention_highlighted = highlighted
+        color = QColor()
+        if highlighted:
+            app = QApplication.instance()
+            palette = app.palette() if app is not None else self.palette()
+            color = palette.color(QPalette.ColorRole.Highlight)
+        self.main_tabs.tabBar().setTabTextColor(
+            self.main_tabs.indexOf(self.ssh_tab), color
+        )
+        self.results_tabs.tabBar().setTabTextColor(1, color)
+
+    def _refresh_results_attention_color(self) -> None:
+        if self._results_attention_pending:
+            self._set_results_attention_highlighted(
+                self._results_attention_highlighted
+            )
+
+    def _ensure_dictionary_ui(self) -> None:
+        if self._dictionary_ui_built:
+            return
+        self._dictionary_ui_built = True
+        self.dictionary_layout.removeWidget(self.dictionary_placeholder)
+        self.dictionary_placeholder.deleteLater()
+
+        filters = QHBoxLayout()
+        self.dictionary_search_edit = QLineEdit()
+        self.dictionary_search_edit.setPlaceholderText(
+            "Search commands, purposes, aliases, and keywords…"
+        )
+        self.dictionary_search_edit.setClearButtonEnabled(True)
+        self.dictionary_platform_combo = QComboBox()
+        self.dictionary_platform_combo.addItem("All", None)
+        self.dictionary_platform_combo.addItem("Catalyst 9300L", "Catalyst 9300L")
+        self.dictionary_platform_combo.addItem(
+            "CloudEngine S5755-S", "CloudEngine S5755-S"
+        )
+        self.dictionary_category_combo = QComboBox()
+        self.dictionary_category_combo.addItem("All", None)
+        for category in sorted(
+            {entry.category for entry in COMMAND_ENTRIES}, key=str.casefold
+        ):
+            self.dictionary_category_combo.addItem(category, category)
+        self.dictionary_count_label = QLabel()
+        filters.addWidget(QLabel("Search"))
+        filters.addWidget(self.dictionary_search_edit, 1)
+        filters.addWidget(QLabel("Platform"))
+        filters.addWidget(self.dictionary_platform_combo)
+        filters.addWidget(QLabel("Category"))
+        filters.addWidget(self.dictionary_category_combo)
+        filters.addWidget(self.dictionary_count_label)
+        self.dictionary_layout.addLayout(filters)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        self.dictionary_table = QTableWidget(0, 3)
+        self.dictionary_table.setHorizontalHeaderLabels(
+            ["Platform", "Category", "Command"]
+        )
+        self.dictionary_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.dictionary_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.dictionary_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.dictionary_table.setAlternatingRowColors(True)
+        self.dictionary_table.verticalHeader().setVisible(False)
+        dictionary_header = self.dictionary_table.horizontalHeader()
+        dictionary_header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.ResizeToContents
+        )
+        dictionary_header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        dictionary_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        splitter.addWidget(self.dictionary_table)
+
+        self.dictionary_details_panel = QWidget()
+        self.dictionary_details_panel.setAccessibleName("Command details")
+        details_panel_layout = QVBoxLayout(self.dictionary_details_panel)
+        self.dictionary_details_scroll = QScrollArea()
+        self.dictionary_details_scroll.setWidgetResizable(True)
+        self.dictionary_details_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.dictionary_details_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        details_content = QWidget()
+        details_layout = QVBoxLayout(details_content)
+        self.dictionary_title_label = QLabel("Select a command")
+        self.dictionary_title_label.setWordWrap(True)
+        self.dictionary_title_label.setStyleSheet("font-size: 18px; font-weight: 600;")
+        details_layout.addWidget(self.dictionary_title_label)
+
+        self.dictionary_purpose_heading_label = QLabel("Purpose")
+        details_layout.addWidget(self.dictionary_purpose_heading_label)
+        self.dictionary_description_label = QLabel()
+        self.dictionary_description_label.setWordWrap(True)
+        self.dictionary_description_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        details_layout.addWidget(self.dictionary_description_label)
+
+        self.dictionary_syntax_heading_label = QLabel("Syntax")
+        details_layout.addWidget(self.dictionary_syntax_heading_label)
+        self.dictionary_syntax_edit = QPlainTextEdit()
+        self.dictionary_syntax_edit.setReadOnly(True)
+        self.dictionary_syntax_edit.setMaximumHeight(100)
+        details_layout.addWidget(self.dictionary_syntax_edit)
+
+        primary_copy_row = QHBoxLayout()
+        self.dictionary_copy_button = QPushButton("Copy")
+        self.dictionary_copy_button.setAccessibleName("Copy primary syntax")
+        self.dictionary_copy_button.setAccessibleDescription(
+            "Copies the selected primary command or template syntax."
+        )
+        self.dictionary_copy_button.setEnabled(False)
+        self.dictionary_copy_confirmation = QLabel()
+        primary_copy_row.addWidget(self.dictionary_copy_button)
+        primary_copy_row.addWidget(self.dictionary_copy_confirmation)
+        primary_copy_row.addStretch()
+        details_layout.addLayout(primary_copy_row)
+        self.dictionary_primary_copy_row = primary_copy_row
+
+        self.dictionary_placeholder_warning = QLabel(
+            "This is a template. Replace every <PLACEHOLDER> before use."
+        )
+        self.dictionary_placeholder_warning.setWordWrap(True)
+        self.dictionary_placeholder_warning.setStyleSheet("font-weight: 600;")
+        self.dictionary_placeholder_warning.hide()
+        details_layout.addWidget(self.dictionary_placeholder_warning)
+
+        self.dictionary_rollback_heading_label = QLabel("Rollback syntax")
+        self.dictionary_rollback_heading_label.hide()
+        details_layout.addWidget(self.dictionary_rollback_heading_label)
+        self.dictionary_rollback_edit = QPlainTextEdit()
+        self.dictionary_rollback_edit.setReadOnly(True)
+        self.dictionary_rollback_edit.setMaximumHeight(100)
+        self.dictionary_rollback_edit.hide()
+        details_layout.addWidget(self.dictionary_rollback_edit)
+
+        rollback_copy_row = QHBoxLayout()
+        self.dictionary_copy_rollback_button = QPushButton("Copy")
+        self.dictionary_copy_rollback_button.setAccessibleName(
+            "Copy rollback syntax"
+        )
+        self.dictionary_copy_rollback_button.setAccessibleDescription(
+            "Copies the selected rollback command syntax."
+        )
+        self.dictionary_copy_rollback_button.setEnabled(False)
+        self.dictionary_copy_rollback_button.hide()
+        self.dictionary_copy_rollback_confirmation = QLabel()
+        self.dictionary_copy_rollback_confirmation.hide()
+        rollback_copy_row.addWidget(self.dictionary_copy_rollback_button)
+        rollback_copy_row.addWidget(self.dictionary_copy_rollback_confirmation)
+        rollback_copy_row.addStretch()
+        details_layout.addLayout(rollback_copy_row)
+        self.dictionary_rollback_copy_row = rollback_copy_row
+
+        self.dictionary_notes_heading_label = QLabel("Notes")
+        details_layout.addWidget(self.dictionary_notes_heading_label)
+        self.dictionary_notes_label = QLabel()
+        self.dictionary_notes_label.setWordWrap(True)
+        self.dictionary_notes_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        details_layout.addWidget(self.dictionary_notes_label)
+
+        self.dictionary_additional_info_button = QPushButton("Additional info")
+        self.dictionary_additional_info_button.setFocusPolicy(
+            Qt.FocusPolicy.StrongFocus
+        )
+        self.dictionary_additional_info_button.setAccessibleName("Additional info")
+        self.dictionary_additional_info_button.setAccessibleDescription(
+            "Shows applicability, deployed target, mode, and risk."
+        )
+        details_layout.addWidget(
+            self.dictionary_additional_info_button,
+            0,
+            Qt.AlignmentFlag.AlignLeft,
+        )
+
+        self.dictionary_additional_info_widget = QWidget()
+        self.dictionary_additional_info_widget.setAccessibleName(
+            "Additional command information"
+        )
+        metadata = QFormLayout(self.dictionary_additional_info_widget)
+        self.dictionary_applicability_label = QLabel()
+        self.dictionary_target_label = QLabel()
+        self.dictionary_mode_label = QLabel()
+        self.dictionary_risk_label = QLabel()
+        for label in (
+            self.dictionary_applicability_label,
+            self.dictionary_target_label,
+            self.dictionary_mode_label,
+            self.dictionary_risk_label,
+        ):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        metadata.addRow("Applicability", self.dictionary_applicability_label)
+        metadata.addRow("Deployed target", self.dictionary_target_label)
+        metadata.addRow("Mode", self.dictionary_mode_label)
+        metadata.addRow("Risk", self.dictionary_risk_label)
+        self._dictionary_additional_info_expanded = False
+        self.dictionary_additional_info_widget.hide()
+        details_layout.addWidget(self.dictionary_additional_info_widget)
+        details_layout.addStretch()
+        self.dictionary_details_scroll.setWidget(details_content)
+        details_panel_layout.addWidget(self.dictionary_details_scroll)
+        splitter.addWidget(self.dictionary_details_panel)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([820, 520])
+        self.dictionary_splitter = splitter
+        self.dictionary_layout.addWidget(splitter, 1)
+
+        self.dictionary_empty_label = QLabel(
+            "No commands match the current search and filters."
+        )
+        self.dictionary_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dictionary_empty_label.hide()
+        self.dictionary_layout.addWidget(self.dictionary_empty_label)
+
+        self.dictionary_search_edit.textChanged.connect(
+            self._refresh_dictionary_table
+        )
+        self.dictionary_platform_combo.currentIndexChanged.connect(
+            self._refresh_dictionary_table
+        )
+        self.dictionary_category_combo.currentIndexChanged.connect(
+            self._refresh_dictionary_table
+        )
+        self.dictionary_table.itemSelectionChanged.connect(
+            self._dictionary_selection_changed
+        )
+        self.dictionary_copy_button.clicked.connect(self._copy_dictionary_command)
+        self.dictionary_copy_rollback_button.clicked.connect(
+            self._copy_dictionary_rollback
+        )
+        self.dictionary_additional_info_button.clicked.connect(
+            self._toggle_dictionary_additional_info
+        )
+        self._refresh_dictionary_table()
+
+    @Slot()
+    def _refresh_dictionary_table(self) -> None:
+        if not self._dictionary_ui_built:
+            return
+        query = self.dictionary_search_edit.text()
+        platform = self.dictionary_platform_combo.currentData()
+        category = self.dictionary_category_combo.currentData()
+        entries = tuple(search_commands(query, platform, category))
+        self.dictionary_table.blockSignals(True)
+        self.dictionary_table.setRowCount(0)
+        for row, entry in enumerate(entries):
+            self.dictionary_table.insertRow(row)
+            values = (entry.platform, entry.category, entry.syntax)
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, entry)
+                self.dictionary_table.setItem(row, column, item)
+        self.dictionary_table.blockSignals(False)
+        count = len(entries)
+        self.dictionary_count_label.setText(
+            f"{count} command" if count == 1 else f"{count} commands"
+        )
+        self.dictionary_empty_label.setVisible(count == 0)
+        self.dictionary_copy_confirmation.clear()
+        self.dictionary_copy_rollback_confirmation.clear()
+        if entries:
+            self.dictionary_table.selectRow(0)
+        else:
+            self._show_dictionary_entry(None)
+
+    @Slot()
+    def _dictionary_selection_changed(self) -> None:
+        row = self.dictionary_table.currentRow()
+        item = self.dictionary_table.item(row, 0) if row >= 0 else None
+        entry = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        self._show_dictionary_entry(entry if isinstance(entry, CommandEntry) else None)
+
+    @Slot()
+    def _toggle_dictionary_additional_info(self) -> None:
+        self._set_dictionary_additional_info_expanded(
+            not self._dictionary_additional_info_expanded
+        )
+
+    def _set_dictionary_additional_info_expanded(self, expanded: bool) -> None:
+        self._dictionary_additional_info_expanded = expanded
+        self.dictionary_additional_info_button.setText(
+            "Hide additional info" if expanded else "Additional info"
+        )
+        self.dictionary_additional_info_widget.setVisible(
+            expanded and self._selected_dictionary_entry is not None
+        )
+
+    def _show_dictionary_entry(self, entry: Optional[CommandEntry]) -> None:
+        self._selected_dictionary_entry = entry
+        if entry is None:
+            self.dictionary_additional_info_button.hide()
+            self.dictionary_additional_info_widget.hide()
+            self.dictionary_title_label.setText("No command selected")
+            self.dictionary_description_label.clear()
+            self.dictionary_applicability_label.clear()
+            self.dictionary_target_label.clear()
+            self.dictionary_mode_label.clear()
+            self.dictionary_risk_label.clear()
+            self.dictionary_notes_label.clear()
+            self.dictionary_notes_label.setMinimumHeight(0)
+            self.dictionary_syntax_edit.clear()
+            self.dictionary_rollback_edit.clear()
+            self.dictionary_rollback_heading_label.hide()
+            self.dictionary_rollback_edit.hide()
+            self.dictionary_placeholder_warning.hide()
+            self.dictionary_copy_button.setEnabled(False)
+            self.dictionary_copy_confirmation.clear()
+            self.dictionary_copy_rollback_button.setEnabled(False)
+            self.dictionary_copy_rollback_button.hide()
+            self.dictionary_copy_rollback_confirmation.clear()
+            self.dictionary_copy_rollback_confirmation.hide()
+            return
+        self.dictionary_additional_info_button.show()
+        self._set_dictionary_additional_info_expanded(
+            self._dictionary_additional_info_expanded
+        )
+        applicability = f"{entry.vendor} {entry.platform}"
+        if entry.documented_release:
+            applicability += f" — documented for {entry.documented_release}"
+        self.dictionary_title_label.setText(entry.title)
+        self.dictionary_description_label.setText(entry.description)
+        self.dictionary_applicability_label.setText(applicability)
+        self.dictionary_target_label.setText(entry.deployed_target)
+        self.dictionary_mode_label.setText(entry.mode)
+        self.dictionary_risk_label.setText(entry.risk)
+        self.dictionary_notes_label.setText(entry.applicability_notes)
+        wrapped_notes_height = self.dictionary_notes_label.heightForWidth(280)
+        self.dictionary_notes_label.setMinimumHeight(max(0, wrapped_notes_height))
+        self.dictionary_syntax_edit.setPlainText(entry.syntax)
+        has_rollback = bool(entry.rollback_syntax)
+        self.dictionary_rollback_heading_label.setVisible(has_rollback)
+        self.dictionary_rollback_edit.setVisible(has_rollback)
+        self.dictionary_rollback_edit.setPlainText(entry.rollback_syntax)
+        self.dictionary_copy_rollback_button.setVisible(has_rollback)
+        self.dictionary_copy_rollback_button.setEnabled(has_rollback)
+        self.dictionary_copy_rollback_confirmation.setVisible(has_rollback)
+        is_template = re.search(r"<[^<>\n]+>", entry.syntax) is not None
+        self.dictionary_placeholder_warning.setVisible(is_template)
+        self.dictionary_copy_button.setEnabled(True)
+        self.dictionary_copy_confirmation.clear()
+        self.dictionary_copy_rollback_confirmation.clear()
+
+    @Slot()
+    def _copy_dictionary_command(self) -> None:
+        entry = getattr(self, "_selected_dictionary_entry", None)
+        if entry is None:
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        clipboard.setText(entry.syntax)
+        is_template = re.search(r"<[^<>\n]+>", entry.syntax) is not None
+        self.dictionary_copy_confirmation.setText(
+            "Template copied." if is_template else "Command copied."
+        )
+        self.dictionary_copy_rollback_confirmation.clear()
+
+    @Slot()
+    def _copy_dictionary_rollback(self) -> None:
+        entry = getattr(self, "_selected_dictionary_entry", None)
+        if entry is None or not entry.rollback_syntax:
+            return
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        clipboard.setText(entry.rollback_syntax)
+        self.dictionary_copy_confirmation.clear()
+        self.dictionary_copy_rollback_confirmation.setText("Rollback copied.")
+
+    def _ensure_history_ui(self) -> None:
+        if self._history_ui_built:
+            return
+        self._history_ui_built = True
+        self.history_layout.removeWidget(self.history_placeholder)
+        self.history_placeholder.deleteLater()
+        if self.history_store is None:
+            unavailable = QLabel(
+                "Audit history is unavailable.\n\n" + self._history_startup_warning
+            )
+            unavailable.setWordWrap(True)
+            unavailable.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.history_layout.addWidget(unavailable, 1)
+            return
+
+        from PySide6.QtCharts import QChartView
+
+        filters = QGridLayout()
+        self.history_search_edit = QLineEdit()
+        self.history_search_edit.setPlaceholderText("Search batch names…")
+        self.history_range_combo = QComboBox()
+        for text, days in (
+            ("Last 7 days", 7),
+            ("Last 30 days", 30),
+            ("Last 90 days", 90),
+            ("Last year", 365),
+            ("All time", None),
+        ):
+            self.history_range_combo.addItem(text, days)
+        self.history_range_combo.setCurrentIndex(1)
+        self.history_status_combo = QComboBox()
+        self.history_status_combo.addItem("All statuses", "")
+        for status in (
+            "succeeded",
+            "completed_with_failures",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "running",
+        ):
+            self.history_status_combo.addItem(status.replace("_", " ").title(), status)
+        self.history_source_combo = QComboBox()
+        self.history_source_combo.addItem("Manual and scheduled", "")
+        self.history_source_combo.addItem("Manual", "manual")
+        self.history_source_combo.addItem("Scheduled", "scheduled")
+        self.history_device_combo = QComboBox()
+        self.history_profile_combo = QComboBox()
+        filters.addWidget(QLabel("Range"), 0, 0)
+        filters.addWidget(self.history_range_combo, 0, 1)
+        filters.addWidget(QLabel("Status"), 0, 2)
+        filters.addWidget(self.history_status_combo, 0, 3)
+        filters.addWidget(QLabel("Source"), 0, 4)
+        filters.addWidget(self.history_source_combo, 0, 5)
+        filters.addWidget(QLabel("Device Type"), 1, 0)
+        filters.addWidget(self.history_device_combo, 1, 1)
+        filters.addWidget(QLabel("Profile"), 1, 2)
+        filters.addWidget(self.history_profile_combo, 1, 3)
+        filters.addWidget(self.history_search_edit, 1, 4, 1, 2)
+        self.history_layout.addLayout(filters)
+
+        cards = QHBoxLayout()
+        self.history_runs_value = QLabel("0")
+        self.history_success_value = QLabel("0")
+        self.history_failure_value = QLabel("0")
+        self.history_rate_value = QLabel("0.0%")
+        for title, value in (
+            ("Total Runs", self.history_runs_value),
+            ("Successful Devices", self.history_success_value),
+            ("Failed Devices", self.history_failure_value),
+            ("Device Success Rate", self.history_rate_value),
+        ):
+            group = QGroupBox(title)
+            card_layout = QVBoxLayout(group)
+            value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            value.setStyleSheet("font-size: 20px; font-weight: 600;")
+            card_layout.addWidget(value)
+            cards.addWidget(group)
+        self.history_layout.addLayout(cards)
+
+        charts = QHBoxLayout()
+        self.history_line_view = QChartView()
+        self.history_pie_view = QChartView()
+        self.history_line_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.history_pie_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.history_line_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.history_pie_view.setFrameShape(QFrame.Shape.NoFrame)
+        self.history_line_view.setMinimumHeight(220)
+        self.history_pie_view.setMinimumHeight(220)
+        charts.addWidget(self.history_line_view, 3)
+        charts.addWidget(self.history_pie_view, 2)
+        self.history_layout.addLayout(charts)
+
+        self.history_empty_label = QLabel("No audit history matches these filters.")
+        self.history_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.history_layout.addWidget(self.history_empty_label)
+        self.history_table = QTableWidget(0, 9)
+        self.history_table.setHorizontalHeaderLabels(
+            [
+                "Started",
+                "Batch",
+                "Source",
+                "Profile",
+                "Device Type",
+                "Devices",
+                "Duration",
+                "Status",
+                "Result",
+            ]
+        )
+        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.history_table.verticalHeader().setVisible(False)
+        history_header = self.history_table.horizontalHeader()
+        for column in (0, 2, 3, 4, 5, 6, 7):
+            history_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        history_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        history_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        self.history_table.itemSelectionChanged.connect(self._history_selection_changed)
+        self.history_table.cellDoubleClicked.connect(
+            lambda _row, _column: self.view_history_results()
+        )
+        self.history_layout.addWidget(self.history_table, 1)
+
+        paging = QHBoxLayout()
+        self.history_previous_button = QPushButton("Previous")
+        self.history_next_button = QPushButton("Next")
+        self.history_page_label = QLabel()
+        self.history_previous_button.clicked.connect(lambda: self._change_history_page(-1))
+        self.history_next_button.clicked.connect(lambda: self._change_history_page(1))
+        paging.addWidget(self.history_previous_button)
+        paging.addWidget(self.history_next_button)
+        paging.addWidget(self.history_page_label)
+        paging.addStretch()
+        self.history_layout.addLayout(paging)
+
+        actions = QGridLayout()
+        self.history_results_button = QPushButton("View Device Results")
+        self.history_commands_button = QPushButton("View Commands")
+        self.history_output_button = QPushButton("Open Output Folder")
+        self.history_summary_button = QPushButton("Open Summary")
+        self.history_remove_button = QPushButton("Remove from History")
+        self.history_delete_outputs_button = QPushButton("Delete History && Outputs")
+        self.history_clear_button = QPushButton("Clear History")
+        self.history_results_button.clicked.connect(self.view_history_results)
+        self.history_commands_button.clicked.connect(self.view_history_commands)
+        self.history_output_button.clicked.connect(self.open_history_output)
+        self.history_summary_button.clicked.connect(self.open_history_summary)
+        self.history_remove_button.clicked.connect(self.remove_history_record)
+        self.history_delete_outputs_button.clicked.connect(
+            self.delete_history_outputs
+        )
+        self.history_clear_button.clicked.connect(self.clear_history)
+        for index, button in enumerate(
+            (
+                self.history_results_button,
+                self.history_commands_button,
+                self.history_output_button,
+                self.history_summary_button,
+                self.history_remove_button,
+                self.history_delete_outputs_button,
+                self.history_clear_button,
+            )
+        ):
+            actions.addWidget(button, index // 4, index % 4)
+        self.history_layout.addLayout(actions)
+        self._update_destructive_button_styles()
+
+        self.history_search_edit.textChanged.connect(self._history_filters_changed)
+        for combo in (
+            self.history_range_combo,
+            self.history_status_combo,
+            self.history_source_combo,
+            self.history_device_combo,
+            self.history_profile_combo,
+        ):
+            combo.currentIndexChanged.connect(self._history_filters_changed)
+        self._refresh_history_filter_values()
+        self._refresh_history()
+
+    def _refresh_history_filter_values(self) -> None:
+        if not self._history_ui_built or self.history_store is None or not hasattr(self, "history_device_combo"):
+            return
+        for combo, field, all_text in (
+            (self.history_device_combo, "device_type", "All device types"),
+            (self.history_profile_combo, "profile_label", "All profiles"),
+        ):
+            selected = combo.currentData() if combo.count() else ""
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(all_text, "")
+            try:
+                values = self.history_store.distinct(field)
+            except HistoryError as exc:
+                self.validation_label.setText(f"Audit history warning: {exc}")
+                values = []
+            for value in values:
+                combo.addItem(value, value)
+            index = combo.findData(selected)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.blockSignals(False)
+
+    @Slot()
+    def _history_filters_changed(self) -> None:
+        self._history_page = 0
+        self._refresh_history()
+
+    def _history_filter(self) -> HistoryFilter:
+        days = self.history_range_combo.currentData()
+        since = self._clock() - timedelta(days=int(days)) if days else None
+        return HistoryFilter(
+            since_utc=since,
+            search=self.history_search_edit.text(),
+            status=str(self.history_status_combo.currentData() or ""),
+            source=str(self.history_source_combo.currentData() or ""),
+            device_type=str(self.history_device_combo.currentData() or ""),
+            profile_label=str(self.history_profile_combo.currentData() or ""),
+        )
+
+    def _history_granularity(self) -> str:
+        days = self.history_range_combo.currentData()
+        if days is None:
+            return "monthly"
+        return "weekly" if int(days) >= 365 else "daily"
+
+    def _refresh_history_if_loaded(self) -> None:
+        if self._history_ui_built and hasattr(self, "history_table"):
+            self._refresh_history_filter_values()
+            self._refresh_history()
+
+    def _refresh_history(self) -> None:
+        if self.history_store is None or not hasattr(self, "history_table"):
+            return
+        try:
+            filters = self._history_filter()
+            records, total = self.history_store.list(
+                filters, limit=100, offset=self._history_page * 100
+            )
+            stats = self.history_store.stats(filters)
+            granularity = self._history_granularity()
+            timeline = self.history_store.timeline(filters, granularity)
+            statuses = self.history_store.status_counts(filters)
+        except HistoryError as exc:
+            self.validation_label.setText(f"Audit history warning: {exc}")
+            return
+        self._history_records = {record.job_id: record for record in records}
+        self.history_runs_value.setText(str(stats.runs))
+        self.history_success_value.setText(str(stats.successes))
+        self.history_failure_value.setText(str(stats.failures))
+        self.history_rate_value.setText(f"{stats.success_rate:.1f}%")
+        self._update_history_charts(timeline, statuses, granularity)
+
+        self.history_table.blockSignals(True)
+        self.history_table.setRowCount(0)
+        for row, record in enumerate(records):
+            self.history_table.insertRow(row)
+            started_item = QTableWidgetItem(
+                record.started_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+            )
+            started_item.setData(Qt.ItemDataRole.UserRole, record.job_id)
+            duration = self._format_duration(record.duration_seconds)
+            result_devices = (
+                record.success_count + record.failure_count + record.cancelled_count
+            )
+            devices = result_devices or record.valid_devices + record.invalid_devices
+            result_text = record.result_text
+            if record.summary_path and not Path(record.summary_path).is_file():
+                result_text = (result_text + " — Output unavailable").strip(" —")
+            values = (
+                started_item,
+                QTableWidgetItem(record.batch_name),
+                QTableWidgetItem(record.source.title()),
+                QTableWidgetItem(record.profile_label),
+                QTableWidgetItem(record.device_type),
+                QTableWidgetItem(str(devices)),
+                QTableWidgetItem(duration),
+                QTableWidgetItem(record.status.replace("_", " ").title()),
+                QTableWidgetItem(result_text),
+            )
+            for column, item in enumerate(values):
+                self.history_table.setItem(row, column, item)
+        self.history_table.blockSignals(False)
+        self.history_empty_label.setVisible(total == 0)
+        self.history_line_view.setVisible(total > 0)
+        self.history_pie_view.setVisible(total > 0)
+        pages = max(1, (total + 99) // 100)
+        if self._history_page >= pages:
+            self._history_page = pages - 1
+            self._refresh_history()
+            return
+        self.history_page_label.setText(
+            f"Page {self._history_page + 1} of {pages} — {total} run(s)"
+        )
+        self.history_previous_button.setEnabled(self._history_page > 0)
+        self.history_next_button.setEnabled(self._history_page + 1 < pages)
+        try:
+            all_history_count = self.history_store.stats(HistoryFilter()).runs
+        except HistoryError:
+            all_history_count = total
+        self.history_clear_button.setEnabled(all_history_count > 0)
+        self._history_selection_changed()
+
+    @staticmethod
+    def _format_duration(seconds: Optional[int]) -> str:
+        if seconds is None:
+            return "In progress"
+        minutes, remaining = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {remaining}s"
+        return f"{remaining}s"
+
+    @staticmethod
+    def _history_bucket_heading(label: str, granularity: str) -> str:
+        if granularity == "weekly":
+            return f"Week of {label}"
+        if granularity == "monthly":
+            return f"Month {label}"
+        return label
+
+    @classmethod
+    def _history_line_detail(
+        cls,
+        label: str,
+        granularity: str,
+        series_name: str,
+        count: int,
+    ) -> str:
+        noun = "device" if count == 1 else "devices"
+        return (
+            f"{cls._history_bucket_heading(label, granularity)}\n"
+            f"{series_name}: {count} {noun}"
+        )
+
+    @staticmethod
+    def _history_status_detail(label: str, count: int, total: int) -> str:
+        noun = "run" if count == 1 else "runs"
+        detail = f"{label}\n{count} {noun}"
+        if total > 0:
+            detail += f" ({count / total:.1%})"
+        return detail
+
+    @staticmethod
+    def _show_history_chart_tooltip(view: QWidget, detail: str) -> None:
+        if detail:
+            QToolTip.showText(QCursor.pos(), detail, view)
+        else:
+            QToolTip.hideText()
+
+    def _update_history_charts(
+        self,
+        timeline,
+        statuses: dict[str, int],
+        granularity: str = "daily",
+    ) -> None:
+        from PySide6.QtCharts import (
+            QBarCategoryAxis,
+            QChart,
+            QLineSeries,
+            QPieSeries,
+            QValueAxis,
+        )
+
+        QToolTip.hideText()
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        dark_mode = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        success_color = QColor("#66bb6a" if dark_mode else "#2e7d32")
+        failure_color = QColor("#ef5350" if dark_mode else "#c62828")
+
+        chart = QChart()
+        chart.setTitle("Successful and failed devices over time")
+        success_series = QLineSeries()
+        success_series.setName("Succeeded")
+        success_series.setColor(success_color)
+        success_series.setPointsVisible(True)
+        success_series.setMarkerSize(8.0)
+        failure_series = QLineSeries()
+        failure_series.setName("Failed")
+        failure_series.setColor(failure_color)
+        failure_series.setPointsVisible(True)
+        failure_series.setMarkerSize(8.0)
+        labels: list[str] = []
+        maximum = 1
+        for index, bucket in enumerate(timeline):
+            labels.append(bucket.label)
+            success_series.append(index, bucket.successes)
+            failure_series.append(index, bucket.failures)
+            maximum = max(maximum, bucket.successes, bucket.failures)
+
+        timeline_values = tuple(
+            (bucket.label, int(bucket.successes), int(bucket.failures))
+            for bucket in timeline
+        )
+
+        def line_detail(point, series_name: str, value_index: int) -> str:
+            try:
+                index = int(round(point.x()))
+            except (OverflowError, TypeError, ValueError):
+                return ""
+            if index < 0 or index >= len(timeline_values):
+                return ""
+            label, successes, failures = timeline_values[index]
+            count = (successes, failures)[value_index]
+            return self._history_line_detail(
+                label, granularity, series_name, count
+            )
+
+        for series, series_name, value_index in (
+            (success_series, "Succeeded", 0),
+            (failure_series, "Failed", 1),
+        ):
+            series.hovered.connect(
+                lambda point, state, name=series_name, index=value_index: (
+                    self._show_history_chart_tooltip(
+                        self.history_line_view,
+                        line_detail(point, name, index) if state else "",
+                    )
+                )
+            )
+            series.clicked.connect(
+                lambda point, name=series_name, index=value_index: (
+                    self._show_history_chart_tooltip(
+                        self.history_line_view,
+                        line_detail(point, name, index),
+                    )
+                )
+            )
+        chart.addSeries(success_series)
+        chart.addSeries(failure_series)
+        x_axis = QBarCategoryAxis()
+        x_axis.append(labels or ["No data"])
+        y_axis = QValueAxis()
+        y_axis.setLabelFormat("%d")
+        y_axis.setRange(0, maximum)
+        y_axis.setTickCount(min(6, maximum + 1))
+        chart.addAxis(x_axis, Qt.AlignmentFlag.AlignBottom)
+        chart.addAxis(y_axis, Qt.AlignmentFlag.AlignLeft)
+        success_series.attachAxis(x_axis)
+        success_series.attachAxis(y_axis)
+        failure_series.attachAxis(x_axis)
+        failure_series.attachAxis(y_axis)
+        self._style_history_chart(chart, (x_axis, y_axis))
+        self.history_line_view.setBackgroundBrush(
+            QBrush(palette.color(QPalette.ColorRole.Window))
+        )
+        self.history_line_view.setAccessibleName(
+            "Successful and failed devices over time"
+        )
+        line_accessible = []
+        for label, successes, failures in timeline_values:
+            heading = self._history_bucket_heading(label, granularity)
+            success_noun = "device" if successes == 1 else "devices"
+            failure_noun = "device" if failures == 1 else "devices"
+            line_accessible.append(
+                f"{heading}: {successes} succeeded {success_noun}, "
+                f"{failures} failed {failure_noun}"
+            )
+        self.history_line_view.setAccessibleDescription(
+            "; ".join(line_accessible) or "No timeline data"
+        )
+        self.history_line_view.setChart(chart)
+
+        pie_chart = QChart()
+        pie_chart.setTitle("Run status")
+        pie = QPieSeries()
+        pie.setHoleSize(0.45)
+        colors = (
+            {
+                "succeeded": "#66bb6a",
+                "completed_with_failures": "#ffca28",
+                "failed": "#ef5350",
+                "cancelled": "#b0bec5",
+                "interrupted": "#ba68c8",
+                "running": "#64b5f6",
+            }
+            if dark_mode
+            else {
+                "succeeded": "#2e7d32",
+                "completed_with_failures": "#f9a825",
+                "failed": "#c62828",
+                "cancelled": "#616161",
+                "interrupted": "#6a1b9a",
+                "running": "#1565c0",
+            }
+        )
+        status_total = sum(count for count in statuses.values() if count > 0)
+        status_accessible = []
+        for status, count in statuses.items():
+            if count:
+                label = status.replace("_", " ").title()
+                piece = pie.append(label, count)
+                piece.setColor(QColor(colors.get(status, "#546e7a")))
+                piece.setBorderColor(palette.color(QPalette.ColorRole.Base))
+                piece.setLabelColor(palette.color(QPalette.ColorRole.WindowText))
+                detail = self._history_status_detail(label, count, status_total)
+                status_accessible.append(detail.replace("\n", ": "))
+                piece.hovered.connect(
+                    lambda state, text=detail: self._show_history_chart_tooltip(
+                        self.history_pie_view, text if state else ""
+                    )
+                )
+                piece.clicked.connect(
+                    lambda text=detail: self._show_history_chart_tooltip(
+                        self.history_pie_view, text
+                    )
+                )
+        pie_chart.addSeries(pie)
+        self._style_history_chart(pie_chart)
+        self.history_pie_view.setBackgroundBrush(
+            QBrush(palette.color(QPalette.ColorRole.Window))
+        )
+        self.history_pie_view.setAccessibleName("Run status")
+        self.history_pie_view.setAccessibleDescription(
+            "; ".join(status_accessible) or "No run status data"
+        )
+        self.history_pie_view.setChart(pie_chart)
+
+    def _style_history_chart(self, chart, axes=()) -> None:
+        """Match Qt Charts, which does not inherit QWidget dark-mode colors."""
+        app = QApplication.instance()
+        palette = app.palette() if app is not None else self.palette()
+        window = palette.color(QPalette.ColorRole.Window)
+        base = palette.color(QPalette.ColorRole.Base)
+        text = palette.color(QPalette.ColorRole.WindowText)
+        mid = palette.color(QPalette.ColorRole.Mid)
+        chart.setBackgroundVisible(True)
+        chart.setBackgroundBrush(QBrush(window))
+        chart.setBackgroundRoundness(4)
+        chart.setDropShadowEnabled(False)
+        chart.setPlotAreaBackgroundVisible(True)
+        chart.setPlotAreaBackgroundBrush(QBrush(base))
+        chart.setTitleBrush(QBrush(text))
+        chart.legend().setLabelColor(text)
+        chart.legend().setBackgroundVisible(False)
+        for axis in axes:
+            axis.setLabelsColor(text)
+            axis.setTitleBrush(QBrush(text))
+            axis.setLinePenColor(mid)
+            axis.setGridLineColor(mid)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QEvent.Type.PaletteChange,
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.ThemeChange,
+        }:
+            if hasattr(self, "cancel_button"):
+                self._update_destructive_button_styles()
+            if hasattr(self, "results_attention_timer"):
+                self._refresh_results_attention_color()
+            if self._history_ui_built and hasattr(self, "history_table"):
+                QTimer.singleShot(0, self._refresh_history)
+
+    def _change_history_page(self, direction: int) -> None:
+        self._history_page = max(0, self._history_page + direction)
+        self._refresh_history()
+
+    def _selected_history_record(self) -> Optional[HistoryRecord]:
+        if not hasattr(self, "history_table"):
+            return None
+        row = self.history_table.currentRow()
+        item = self.history_table.item(row, 0) if row >= 0 else None
+        job_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return self._history_records.get(str(job_id)) if job_id else None
+
+    @Slot()
+    def _history_selection_changed(self) -> None:
+        if not hasattr(self, "history_results_button"):
+            return
+        record = self._selected_history_record()
+        has_record = record is not None
+        summary_exists = bool(record and Path(record.summary_path).is_file())
+        output_exists = bool(record and Path(record.run_directory).is_dir())
+        self.history_results_button.setEnabled(summary_exists)
+        self.history_commands_button.setEnabled(has_record)
+        self.history_output_button.setEnabled(output_exists)
+        self.history_summary_button.setEnabled(summary_exists)
+        self.history_remove_button.setEnabled(has_record)
+        can_delete = False
+        if record:
+            try:
+                validate_output_deletion(record)
+                can_delete = True
+            except HistoryError:
+                pass
+        self.history_delete_outputs_button.setEnabled(can_delete)
+
+    @Slot()
+    def view_history_results(self) -> None:
+        record = self._selected_history_record()
+        if record is None:
+            return
+        try:
+            results = read_summary(Path(record.summary_path))
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Output unavailable", str(exc))
+            return
+        self._selected_job_id = None
+        self.device_table.setRowCount(0)
+        self._rows.clear()
+        for row, result in enumerate(results):
+            self.device_table.insertRow(row)
+            self._rows[result.address] = row
+            self._set_cell(row, 0, result.address)
+            self._set_cell(row, 1, result.status.title())
+            stage = result.failed_section
+            if result.failed_line:
+                stage = f"{stage} / {result.failed_line}" if stage else result.failed_line
+            self._set_cell(row, 2, stage)
+            self._set_cell(row, 3, result.error or result.status.title())
+            self._set_cell(row, 4, result.transcript_file)
+        self._batch_result = BatchResult(
+            results, Path(record.run_directory), Path(record.summary_path)
+        )
+        self.progress_bar.setRange(0, max(1, len(results)))
+        self.progress_bar.setValue(len(results))
+        self.status_label.setText(record.status.replace("_", " ").title())
+        self.totals_label.setText(record.result_text)
+        self.open_output_button.setEnabled(Path(record.run_directory).is_dir())
+        self.open_summary_button.setEnabled(Path(record.summary_path).is_file())
+        self.main_tabs.setCurrentWidget(self.ssh_tab)
+        self.results_tabs.setCurrentIndex(1)
+
+    @Slot()
+    def view_history_commands(self) -> None:
+        record = self._selected_history_record()
+        if record is None:
+            return
+        answer = QMessageBox.warning(
+            self,
+            "View sensitive command snapshot?",
+            "Commands may contain literal passwords or other sensitive values.",
+            QMessageBox.StandardButton.Open | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Open:
+            return
+        try:
+            snapshot = self.history_command_store.get(record.job_id)
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Commands unavailable", str(exc))
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Commands — {record.batch_name}")
+        dialog.resize(720, 520)
+        layout = QVBoxLayout(dialog)
+        for section, title in (("exec", "Exec Commands"), ("config", "Config Commands")):
+            layout.addWidget(QLabel(title))
+            editor = QPlainTextEdit()
+            editor.setReadOnly(True)
+            editor.setPlainText(
+                "\n".join(
+                    command.text
+                    for command in snapshot.commands
+                    if command.section == section
+                )
+            )
+            layout.addWidget(editor, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    @Slot()
+    def open_history_output(self) -> None:
+        record = self._selected_history_record()
+        if record and Path(record.run_directory).is_dir():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(record.run_directory))
+
+    @Slot()
+    def open_history_summary(self) -> None:
+        record = self._selected_history_record()
+        if record and Path(record.summary_path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(record.summary_path))
+
+    @Slot()
+    def remove_history_record(self) -> None:
+        record = self._selected_history_record()
+        if record is None or self.history_store is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove audit history record?",
+            "Remove this record and its encrypted command snapshot?\n\n"
+            "Output files will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.history_command_store.delete(record.job_id)
+            self.history_store.remove(record.job_id)
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Could not remove history", str(exc))
+            return
+        self._refresh_history_filter_values()
+        self._refresh_history()
+
+    @Slot()
+    def delete_history_outputs(self) -> None:
+        record = self._selected_history_record()
+        if record is None or self.history_store is None:
+            return
+        try:
+            run_directory = validate_output_deletion(record)
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Cannot delete output", str(exc))
+            return
+        answer = QMessageBox.warning(
+            self,
+            "Delete history and output files?",
+            f"Permanently delete this audit record and all files in:\n\n{run_directory}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            delete_output_directory(record)
+            self.history_command_store.delete(record.job_id)
+            self.history_store.remove(record.job_id)
+        except HistoryError as exc:
+            self._refresh_history()
+            QMessageBox.critical(self, "Could not delete history output", str(exc))
+            return
+        self._refresh_history_filter_values()
+        self._refresh_history()
+
+    @Slot()
+    def clear_history(self) -> None:
+        if self.history_store is None:
+            return
+        try:
+            records, total = self.history_store.list(
+                HistoryFilter(), limit=1_000_000
+            )
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Could not read history", str(exc))
+            return
+        if not total:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Clear audit history?",
+            f"Remove all {total} history records and encrypted command snapshots?\n\n"
+            "Output files will not be deleted.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            for record in records:
+                self.history_command_store.delete(record.job_id)
+            self.history_store.clear()
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Could not clear history", str(exc))
+            return
+        self._refresh_history_filter_values()
+        self._refresh_history()
+
     @Slot(str)
     def _show_sleep_warning(self, message: str) -> None:
         self.validation_label.setText(message)
@@ -1950,6 +3525,8 @@ class MainWindow(QMainWindow):
             self._save_settings()
             if hasattr(self, "scheduler_timer"):
                 self.scheduler_timer.stop()
+            if hasattr(self, "results_attention_timer"):
+                self.results_attention_timer.stop()
             if hasattr(self, "sleep_inhibitor"):
                 self.sleep_inhibitor.set_required(False)
             event.accept()
@@ -1984,6 +3561,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         if hasattr(self, "scheduler_timer"):
             self.scheduler_timer.stop()
+        if hasattr(self, "results_attention_timer"):
+            self.results_attention_timer.stop()
         if hasattr(self, "sleep_inhibitor"):
             self.sleep_inhibitor.set_required(False)
         event.accept()
@@ -2121,19 +3700,38 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.smoke_test:
         import netmiko  # noqa: F401 - verifies the packaged SSH dependency is present.
         import keyring.backends.macOS  # noqa: F401 - verifies packaged Keychain support.
+        import PySide6.QtCharts  # noqa: F401 - verifies packaged chart support.
 
         with tempfile.TemporaryDirectory() as temporary:
             smoke_settings = QSettings(
                 str(Path(temporary) / "smoke-settings.ini"),
                 QSettings.Format.IniFormat,
             )
-            window = MainWindow(smoke_settings, secret_store=MemorySecretStore())
+            apply_application_theme(
+                app,
+                smoke_settings.value("appearance/theme", THEME_SYSTEM, str),
+            )
+            window = MainWindow(
+                smoke_settings,
+                secret_store=MemorySecretStore(),
+                history_store=HistoryStore(Path(temporary) / "history.sqlite3"),
+                history_command_store=MemoryHistoryCommandStore(),
+            )
             window.show()
+            app.processEvents()
+            window._ensure_history_ui()
+            window._ensure_dictionary_ui()
+            window.dictionary_search_edit.setText("interface")
             app.processEvents()
             window.close()
             app.processEvents()
         return 0
-    window = MainWindow()
+    settings = QSettings(ORGANIZATION_NAME, APP_NAME)
+    apply_application_theme(
+        app,
+        settings.value("appearance/theme", THEME_SYSTEM, str),
+    )
+    window = MainWindow(settings)
     window.show()
     return app.exec()
 
