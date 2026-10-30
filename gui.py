@@ -126,6 +126,8 @@ THEME_DARK = "dark"
 THEME_MODES = (THEME_SYSTEM, THEME_LIGHT, THEME_DARK)
 RESULTS_ATTENTION_INTERVAL_MS = 500
 RESULTS_ATTENTION_TICKS = 6
+HISTORY_TREND_DEVICES = "devices"
+HISTORY_TREND_DURATION = "duration"
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -806,12 +808,6 @@ class MainWindow(QMainWindow):
         inventory_buttons_layout.addWidget(self.clear_devices_button)
         inventory_buttons_layout.addWidget(self.test_connections_button)
         inventory_buttons_layout.addStretch()
-        inventory_container = QWidget()
-        inventory_layout = QHBoxLayout(inventory_container)
-        inventory_layout.setContentsMargins(0, 0, 0, 0)
-        inventory_layout.addWidget(self.inventory_text_edit, 1)
-        inventory_layout.addWidget(inventory_buttons, 0)
-        form.addRow("Devices", inventory_container)
 
         self.exec_commands_edit = QPlainTextEdit()
         self.exec_commands_edit.setPlaceholderText("One exec command per line")
@@ -833,27 +829,6 @@ class MainWindow(QMainWindow):
         self.command_dictionary_button.clicked.connect(
             self._open_command_dictionary
         )
-        self.command_inputs_container = QWidget()
-        command_inputs_layout = QGridLayout(self.command_inputs_container)
-        command_inputs_layout.setContentsMargins(0, 0, 0, 0)
-        exec_commands_label = QLabel("Exec Commands")
-        exec_commands_label.setBuddy(self.exec_commands_edit)
-        config_commands_label = QLabel("Config Commands")
-        config_commands_label.setBuddy(self.config_commands_edit)
-        command_inputs_layout.addWidget(exec_commands_label, 0, 0)
-        command_inputs_layout.addWidget(self.exec_commands_edit, 0, 1)
-        command_inputs_layout.addWidget(config_commands_label, 1, 0)
-        command_inputs_layout.addWidget(self.config_commands_edit, 1, 1)
-        command_inputs_layout.addWidget(
-            self.command_dictionary_button,
-            0,
-            2,
-            2,
-            1,
-            Qt.AlignmentFlag.AlignVCenter,
-        )
-        command_inputs_layout.setColumnStretch(1, 1)
-
         command_file_buttons = QWidget()
         command_file_buttons_layout = QGridLayout(command_file_buttons)
         command_file_buttons_layout.setContentsMargins(0, 0, 0, 0)
@@ -863,8 +838,32 @@ class MainWindow(QMainWindow):
         command_file_buttons_layout.setColumnStretch(0, 1)
         command_file_buttons_layout.setColumnStretch(1, 1)
 
-        form.addRow(self.command_inputs_container)
-        form.addRow("", command_file_buttons)
+        self.command_inputs_container = QWidget()
+        command_inputs_layout = QGridLayout(self.command_inputs_container)
+        command_inputs_layout.setContentsMargins(0, 0, 0, 0)
+        devices_label = QLabel("Devices")
+        devices_label.setBuddy(self.inventory_text_edit)
+        exec_commands_label = QLabel("Exec Commands")
+        exec_commands_label.setBuddy(self.exec_commands_edit)
+        config_commands_label = QLabel("Config Commands")
+        config_commands_label.setBuddy(self.config_commands_edit)
+        command_inputs_layout.addWidget(devices_label, 4, 0)
+        command_inputs_layout.addWidget(self.inventory_text_edit, 4, 1)
+        command_inputs_layout.addWidget(inventory_buttons, 4, 2)
+        command_inputs_layout.addWidget(exec_commands_label, 5, 0)
+        command_inputs_layout.addWidget(self.exec_commands_edit, 5, 1)
+        command_inputs_layout.addWidget(config_commands_label, 6, 0)
+        command_inputs_layout.addWidget(self.config_commands_edit, 6, 1)
+        command_inputs_layout.addWidget(
+            self.command_dictionary_button,
+            5,
+            2,
+            2,
+            1,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        command_inputs_layout.addWidget(command_file_buttons, 7, 1)
+        command_inputs_layout.setColumnStretch(1, 1)
 
         self.username_edit = QLineEdit()
         self.username_edit.setPlaceholderText("SSH Username")
@@ -874,21 +873,35 @@ class MainWindow(QMainWindow):
         self.profile_combo = QComboBox()
         self.manage_profiles_button = QPushButton("Manage Profiles…")
         self.manage_profiles_button.clicked.connect(self.manage_profiles)
-        profile_container = QWidget()
-        profile_layout = QHBoxLayout(profile_container)
-        profile_layout.setContentsMargins(0, 0, 0, 0)
-        profile_layout.addWidget(self.profile_combo, 1)
-        profile_layout.addWidget(self.manage_profiles_button)
         self.output_edit, output_row = self._path_row("Choose output folder…", self._choose_output)
-        form.insertRow(0, "Profile", profile_container)
-        form.insertRow(1, "Username", self.username_edit)
-        form.insertRow(2, "Password", self.password_edit)
-        form.addRow("Output Folder", output_row)
 
         self.device_type_combo = QComboBox()
         self.device_type_combo.setEditable(True)
         self.device_type_combo.addItems(["huawei", "cisco_ios"])
-        form.insertRow(3, "Device Type", self.device_type_combo)
+
+        profile_label = QLabel("Profile")
+        profile_label.setBuddy(self.profile_combo)
+        username_label = QLabel("Username")
+        username_label.setBuddy(self.username_edit)
+        password_label = QLabel("Password")
+        password_label.setBuddy(self.password_edit)
+        device_type_label = QLabel("Device Type")
+        device_type_label.setBuddy(self.device_type_combo)
+        output_label = QLabel("Output Folder")
+        output_label.setBuddy(self.output_edit)
+        command_inputs_layout.addWidget(profile_label, 0, 0)
+        command_inputs_layout.addWidget(self.profile_combo, 0, 1)
+        command_inputs_layout.addWidget(self.manage_profiles_button, 0, 2)
+        command_inputs_layout.addWidget(username_label, 1, 0)
+        command_inputs_layout.addWidget(self.username_edit, 1, 1)
+        command_inputs_layout.addWidget(password_label, 2, 0)
+        command_inputs_layout.addWidget(self.password_edit, 2, 1)
+        command_inputs_layout.addWidget(device_type_label, 3, 0)
+        command_inputs_layout.addWidget(self.device_type_combo, 3, 1)
+        command_inputs_layout.addWidget(output_label, 8, 0)
+        command_inputs_layout.addWidget(output_row, 8, 1)
+
+        form.addRow(self.command_inputs_container)
 
         settings_layout.addWidget(self.configuration_group)
 
@@ -2857,6 +2870,17 @@ class MainWindow(QMainWindow):
             cards.addWidget(group)
         self.history_layout.addLayout(cards)
 
+        trend_controls = QHBoxLayout()
+        trend_label = QLabel("Trend")
+        self.history_trend_combo = QComboBox()
+        self.history_trend_combo.addItem("Device Results", HISTORY_TREND_DEVICES)
+        self.history_trend_combo.addItem("Run Duration", HISTORY_TREND_DURATION)
+        trend_label.setBuddy(self.history_trend_combo)
+        trend_controls.addWidget(trend_label)
+        trend_controls.addWidget(self.history_trend_combo)
+        trend_controls.addStretch()
+        self.history_layout.addLayout(trend_controls)
+
         charts = QHBoxLayout()
         self.history_line_view = QChartView()
         self.history_pie_view = QChartView()
@@ -2955,6 +2979,9 @@ class MainWindow(QMainWindow):
             self.history_profile_combo,
         ):
             combo.currentIndexChanged.connect(self._history_filters_changed)
+        self.history_trend_combo.currentIndexChanged.connect(
+            self._history_trend_changed
+        )
         self._refresh_history_filter_values()
         self._refresh_history()
 
@@ -2983,6 +3010,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _history_filters_changed(self) -> None:
         self._history_page = 0
+        self._refresh_history()
+
+    @Slot()
+    def _history_trend_changed(self) -> None:
         self._refresh_history()
 
     def _history_filter(self) -> HistoryFilter:
@@ -3019,6 +3050,11 @@ class MainWindow(QMainWindow):
             stats = self.history_store.stats(filters)
             granularity = self._history_granularity()
             timeline = self.history_store.timeline(filters, granularity)
+            duration_timeline = (
+                self.history_store.duration_timeline(filters, granularity)
+                if self.history_trend_combo.currentData() == HISTORY_TREND_DURATION
+                else []
+            )
             statuses = self.history_store.status_counts(filters)
         except HistoryError as exc:
             self.validation_label.setText(f"Audit history warning: {exc}")
@@ -3028,7 +3064,12 @@ class MainWindow(QMainWindow):
         self.history_success_value.setText(str(stats.successes))
         self.history_failure_value.setText(str(stats.failures))
         self.history_rate_value.setText(f"{stats.success_rate:.1f}%")
-        self._update_history_charts(timeline, statuses, granularity)
+        self._update_history_charts(
+            timeline,
+            duration_timeline,
+            statuses,
+            granularity,
+        )
 
         self.history_table.blockSignals(True)
         self.history_table.setRowCount(0)
@@ -3122,6 +3163,22 @@ class MainWindow(QMainWindow):
             detail += f" ({count / total:.1%})"
         return detail
 
+    @classmethod
+    def _history_duration_detail(
+        cls,
+        label: str,
+        granularity: str,
+        median_seconds: float,
+        average_seconds: float,
+        run_count: int,
+    ) -> str:
+        return (
+            f"{cls._history_bucket_heading(label, granularity)}\n"
+            f"Median: {cls._format_duration(round(median_seconds))}\n"
+            f"Average: {cls._format_duration(round(average_seconds))}\n"
+            f"Runs: {run_count}"
+        )
+
     @staticmethod
     def _show_history_chart_tooltip(view: QWidget, detail: str) -> None:
         if detail:
@@ -3132,6 +3189,7 @@ class MainWindow(QMainWindow):
     def _update_history_charts(
         self,
         timeline,
+        duration_timeline,
         statuses: dict[str, int],
         granularity: str = "daily",
     ) -> None:
@@ -3151,95 +3209,182 @@ class MainWindow(QMainWindow):
         failure_color = QColor("#ef5350" if dark_mode else "#c62828")
 
         chart = QChart()
-        chart.setTitle("Successful and failed devices over time")
-        success_series = QLineSeries()
-        success_series.setName("Succeeded")
-        success_series.setColor(success_color)
-        success_series.setPointsVisible(True)
-        success_series.setMarkerSize(8.0)
-        failure_series = QLineSeries()
-        failure_series.setName("Failed")
-        failure_series.setColor(failure_color)
-        failure_series.setPointsVisible(True)
-        failure_series.setMarkerSize(8.0)
         labels: list[str] = []
-        maximum = 1
-        for index, bucket in enumerate(timeline):
-            labels.append(bucket.label)
-            success_series.append(index, bucket.successes)
-            failure_series.append(index, bucket.failures)
-            maximum = max(maximum, bucket.successes, bucket.failures)
-
-        timeline_values = tuple(
-            (bucket.label, int(bucket.successes), int(bucket.failures))
-            for bucket in timeline
-        )
-
-        def line_detail(point, series_name: str, value_index: int) -> str:
-            try:
-                index = int(round(point.x()))
-            except (OverflowError, TypeError, ValueError):
-                return ""
-            if index < 0 or index >= len(timeline_values):
-                return ""
-            label, successes, failures = timeline_values[index]
-            count = (successes, failures)[value_index]
-            return self._history_line_detail(
-                label, granularity, series_name, count
-            )
-
-        for series, series_name, value_index in (
-            (success_series, "Succeeded", 0),
-            (failure_series, "Failed", 1),
-        ):
-            series.hovered.connect(
-                lambda point, state, name=series_name, index=value_index: (
-                    self._show_history_chart_tooltip(
-                        self.history_line_view,
-                        line_detail(point, name, index) if state else "",
-                    )
-                )
-            )
-            series.clicked.connect(
-                lambda point, name=series_name, index=value_index: (
-                    self._show_history_chart_tooltip(
-                        self.history_line_view,
-                        line_detail(point, name, index),
-                    )
-                )
-            )
-        chart.addSeries(success_series)
-        chart.addSeries(failure_series)
         x_axis = QBarCategoryAxis()
-        x_axis.append(labels or ["No data"])
         y_axis = QValueAxis()
-        y_axis.setLabelFormat("%d")
-        y_axis.setRange(0, maximum)
-        y_axis.setTickCount(min(6, maximum + 1))
+        if self.history_trend_combo.currentData() == HISTORY_TREND_DURATION:
+            duration_color = QColor("#64b5f6" if dark_mode else "#1565c0")
+            duration_series = QLineSeries()
+            duration_series.setName("Median Duration")
+            duration_series.setColor(duration_color)
+            duration_series.setPointsVisible(True)
+            duration_series.setMarkerSize(8.0)
+            duration_values = tuple(
+                (
+                    bucket.label,
+                    float(bucket.median_seconds),
+                    float(bucket.average_seconds),
+                    int(bucket.run_count),
+                )
+                for bucket in duration_timeline
+            )
+            chart.setTitle(
+                "Median run duration over time"
+                if duration_values
+                else "No completed run duration data"
+            )
+            maximum_minutes = 1.0
+            for index, (label, median_seconds, _average, _count) in enumerate(
+                duration_values
+            ):
+                labels.append(label)
+                median_minutes = median_seconds / 60.0
+                duration_series.append(index, median_minutes)
+                maximum_minutes = max(maximum_minutes, median_minutes)
+
+            def duration_detail(point) -> str:
+                try:
+                    index = int(round(point.x()))
+                except (OverflowError, TypeError, ValueError):
+                    return ""
+                if index < 0 or index >= len(duration_values):
+                    return ""
+                label, median_seconds, average_seconds, run_count = (
+                    duration_values[index]
+                )
+                return self._history_duration_detail(
+                    label,
+                    granularity,
+                    median_seconds,
+                    average_seconds,
+                    run_count,
+                )
+
+            duration_series.hovered.connect(
+                lambda point, state: self._show_history_chart_tooltip(
+                    self.history_line_view,
+                    duration_detail(point) if state else "",
+                )
+            )
+            duration_series.clicked.connect(
+                lambda point: self._show_history_chart_tooltip(
+                    self.history_line_view,
+                    duration_detail(point),
+                )
+            )
+            chart.addSeries(duration_series)
+            y_axis.setTitleText("Duration (minutes)")
+            y_axis.setLabelFormat("%.1f")
+            y_axis.setRange(0.0, maximum_minutes)
+            y_axis.setTickCount(6)
+            self.history_line_view.setAccessibleName(
+                "Median run duration over time"
+            )
+            duration_accessible = [
+                self._history_duration_detail(
+                    label,
+                    granularity,
+                    median_seconds,
+                    average_seconds,
+                    run_count,
+                ).replace("\n", ": ", 1).replace("\n", ", ")
+                for label, median_seconds, average_seconds, run_count in (
+                    duration_values
+                )
+            ]
+            self.history_line_view.setAccessibleDescription(
+                "; ".join(duration_accessible)
+                or "No completed run duration data"
+            )
+            line_series = (duration_series,)
+        else:
+            chart.setTitle("Successful and failed devices over time")
+            success_series = QLineSeries()
+            success_series.setName("Succeeded")
+            success_series.setColor(success_color)
+            success_series.setPointsVisible(True)
+            success_series.setMarkerSize(8.0)
+            failure_series = QLineSeries()
+            failure_series.setName("Failed")
+            failure_series.setColor(failure_color)
+            failure_series.setPointsVisible(True)
+            failure_series.setMarkerSize(8.0)
+            maximum = 1
+            for index, bucket in enumerate(timeline):
+                labels.append(bucket.label)
+                success_series.append(index, bucket.successes)
+                failure_series.append(index, bucket.failures)
+                maximum = max(maximum, bucket.successes, bucket.failures)
+
+            timeline_values = tuple(
+                (bucket.label, int(bucket.successes), int(bucket.failures))
+                for bucket in timeline
+            )
+
+            def line_detail(point, series_name: str, value_index: int) -> str:
+                try:
+                    index = int(round(point.x()))
+                except (OverflowError, TypeError, ValueError):
+                    return ""
+                if index < 0 or index >= len(timeline_values):
+                    return ""
+                label, successes, failures = timeline_values[index]
+                count = (successes, failures)[value_index]
+                return self._history_line_detail(
+                    label, granularity, series_name, count
+                )
+
+            for series, series_name, value_index in (
+                (success_series, "Succeeded", 0),
+                (failure_series, "Failed", 1),
+            ):
+                series.hovered.connect(
+                    lambda point, state, name=series_name, index=value_index: (
+                        self._show_history_chart_tooltip(
+                            self.history_line_view,
+                            line_detail(point, name, index) if state else "",
+                        )
+                    )
+                )
+                series.clicked.connect(
+                    lambda point, name=series_name, index=value_index: (
+                        self._show_history_chart_tooltip(
+                            self.history_line_view,
+                            line_detail(point, name, index),
+                        )
+                    )
+                )
+            chart.addSeries(success_series)
+            chart.addSeries(failure_series)
+            y_axis.setLabelFormat("%d")
+            y_axis.setRange(0, maximum)
+            y_axis.setTickCount(min(6, maximum + 1))
+            self.history_line_view.setAccessibleName(
+                "Successful and failed devices over time"
+            )
+            line_accessible = []
+            for label, successes, failures in timeline_values:
+                heading = self._history_bucket_heading(label, granularity)
+                success_noun = "device" if successes == 1 else "devices"
+                failure_noun = "device" if failures == 1 else "devices"
+                line_accessible.append(
+                    f"{heading}: {successes} succeeded {success_noun}, "
+                    f"{failures} failed {failure_noun}"
+                )
+            self.history_line_view.setAccessibleDescription(
+                "; ".join(line_accessible) or "No timeline data"
+            )
+            line_series = (success_series, failure_series)
+
+        x_axis.append(labels or ["No data"])
         chart.addAxis(x_axis, Qt.AlignmentFlag.AlignBottom)
         chart.addAxis(y_axis, Qt.AlignmentFlag.AlignLeft)
-        success_series.attachAxis(x_axis)
-        success_series.attachAxis(y_axis)
-        failure_series.attachAxis(x_axis)
-        failure_series.attachAxis(y_axis)
+        for series in line_series:
+            series.attachAxis(x_axis)
+            series.attachAxis(y_axis)
         self._style_history_chart(chart, (x_axis, y_axis))
         self.history_line_view.setBackgroundBrush(
             QBrush(palette.color(QPalette.ColorRole.Window))
-        )
-        self.history_line_view.setAccessibleName(
-            "Successful and failed devices over time"
-        )
-        line_accessible = []
-        for label, successes, failures in timeline_values:
-            heading = self._history_bucket_heading(label, granularity)
-            success_noun = "device" if successes == 1 else "devices"
-            failure_noun = "device" if failures == 1 else "devices"
-            line_accessible.append(
-                f"{heading}: {successes} succeeded {success_noun}, "
-                f"{failures} failed {failure_noun}"
-            )
-        self.history_line_view.setAccessibleDescription(
-            "; ".join(line_accessible) or "No timeline data"
         )
         self.history_line_view.setChart(chart)
 

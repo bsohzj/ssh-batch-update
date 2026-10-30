@@ -135,6 +135,93 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(statuses["completed_with_failures"], 1)
         self.assertEqual(self.store.distinct("device_type"), ["cisco_ios", "huawei"])
 
+    def test_duration_timeline_groups_median_average_and_count(self):
+        def add_duration(
+            job_id,
+            started,
+            duration_seconds,
+            status="succeeded",
+            profile="Operations",
+        ):
+            record = self.record(
+                job_id,
+                batch_name=f"Duration {job_id}",
+                started_utc=started,
+                profile_label=profile,
+            )
+            self.store.start(record)
+            self.store.finalize(
+                job_id,
+                status,
+                1,
+                int(status == "completed_with_failures"),
+                0,
+                "completed",
+                completed_utc=started + timedelta(seconds=duration_seconds),
+            )
+
+        start = self.now
+        add_duration("one-minute", start, 60)
+        add_duration("three-minutes", start + timedelta(hours=1), 180)
+        add_duration("five-minutes", start + timedelta(days=1), 300)
+        add_duration("other-profile", start, 600, profile="Night Shift")
+        filters = history.HistoryFilter(profile_label="Operations")
+
+        daily = self.store.duration_timeline(filters, "daily")
+        weekly = self.store.duration_timeline(filters, "weekly")
+        monthly = self.store.duration_timeline(filters, "monthly")
+
+        self.assertEqual(len(daily), 2)
+        self.assertEqual(daily[0].median_seconds, 120.0)
+        self.assertEqual(daily[0].average_seconds, 120.0)
+        self.assertEqual(daily[0].run_count, 2)
+        self.assertEqual(daily[1].median_seconds, 300.0)
+        self.assertEqual(len(weekly), 1)
+        self.assertEqual(weekly[0].median_seconds, 180.0)
+        self.assertEqual(weekly[0].average_seconds, 180.0)
+        self.assertEqual(weekly[0].run_count, 3)
+        self.assertEqual(len(monthly), 1)
+        self.assertEqual(monthly[0].median_seconds, 180.0)
+        self.assertEqual(monthly[0].average_seconds, 180.0)
+        self.assertEqual(monthly[0].run_count, 3)
+
+    def test_duration_timeline_excludes_incomplete_outcomes_and_clamps_zero(self):
+        def add_duration(job_id, status, duration_seconds):
+            started = self.now
+            record = self.record(job_id, started_utc=started)
+            self.store.start(record)
+            if status != "running":
+                self.store.finalize(
+                    job_id,
+                    status,
+                    int(status in {"succeeded", "completed_with_failures"}),
+                    int(status == "failed"),
+                    int(status == "cancelled"),
+                    status,
+                    completed_utc=started + timedelta(seconds=duration_seconds),
+                )
+
+        add_duration("negative", "succeeded", -30)
+        add_duration("partial", "completed_with_failures", 30)
+        add_duration("failed", "failed", 600)
+        add_duration("cancelled", "cancelled", 600)
+        add_duration("interrupted", "interrupted", 600)
+        add_duration("running", "running", 600)
+
+        buckets = self.store.duration_timeline(history.HistoryFilter(), "daily")
+
+        self.assertEqual(len(buckets), 1)
+        self.assertEqual(buckets[0].median_seconds, 15.0)
+        self.assertEqual(buckets[0].average_seconds, 15.0)
+        self.assertEqual(buckets[0].run_count, 2)
+        self.assertEqual(
+            self.store.duration_timeline(
+                history.HistoryFilter(status="failed"),
+                "daily",
+            ),
+            [],
+        )
+
     def test_records_are_indefinite_until_removed_or_cleared(self):
         old = self.record("old", started_utc=self.now - timedelta(days=800))
         current = self.record("current")

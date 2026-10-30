@@ -77,14 +77,16 @@ class MainWindowTests(unittest.TestCase):
         profile="Manual",
         run_directory="",
         summary_path="",
+        duration_seconds=60,
     ):
         now = datetime.now(timezone.utc)
+        started = now - timedelta(minutes=1)
         record = history.HistoryRecord(
             job_id=job_id,
             batch_name=f"cisco_ios — 1 devices — {job_id}",
             created_utc=now - timedelta(minutes=2),
             scheduled_utc=now - timedelta(minutes=1) if source == "scheduled" else None,
-            started_utc=now - timedelta(minutes=1),
+            started_utc=started,
             completed_utc=None,
             source=source,
             profile_label=profile,
@@ -107,7 +109,7 @@ class MainWindowTests(unittest.TestCase):
                 result_text,
                 run_directory,
                 summary_path,
-                completed_utc=now,
+                completed_utc=started + timedelta(seconds=duration_seconds),
             )
         return self.history_store.get(job_id)
 
@@ -265,13 +267,43 @@ class MainWindowTests(unittest.TestCase):
         config_position = command_inputs_layout.getItemPosition(
             command_inputs_layout.indexOf(self.window.config_commands_edit)
         )
-        self.assertEqual(button_position, (0, 2, 2, 1))
+        inventory_position = command_inputs_layout.getItemPosition(
+            command_inputs_layout.indexOf(self.window.inventory_text_edit)
+        )
+        self.assertEqual(button_position, (5, 2, 2, 1))
         self.assertEqual(
             command_inputs_layout.itemAt(button_index).alignment(),
             Qt.AlignmentFlag.AlignVCenter,
         )
+        self.assertEqual(inventory_position[1], 1)
         self.assertEqual(exec_position[1], 1)
         self.assertEqual(config_position[1], 1)
+        for editor in (
+            self.window.profile_combo,
+            self.window.username_edit,
+            self.window.password_edit,
+            self.window.device_type_combo,
+        ):
+            position = command_inputs_layout.getItemPosition(
+                command_inputs_layout.indexOf(editor)
+            )
+            self.assertEqual(position[1], 1)
+
+        self.window.show()
+        for width, height in ((1050, 680), (1500, 900)):
+            self.window.resize(width, height)
+            self.app.processEvents()
+            editors = (
+                self.window.inventory_text_edit,
+                self.window.exec_commands_edit,
+                self.window.config_commands_edit,
+                self.window.profile_combo,
+                self.window.username_edit,
+                self.window.password_edit,
+                self.window.device_type_combo,
+            )
+            self.assertEqual(len({editor.geometry().left() for editor in editors}), 1)
+            self.assertEqual(len({editor.geometry().right() for editor in editors}), 1)
 
     def test_theme_menu_defaults_to_system_and_actions_are_exclusive(self):
         self.assertEqual(self.window.view_menu.title().replace("&", ""), "View")
@@ -970,6 +1002,87 @@ class MainWindowTests(unittest.TestCase):
             "Completed With Failures",
         )
 
+    def test_history_duration_trend_switches_charts_and_handles_empty_filter(self):
+        self.add_history_record("short", duration_seconds=60)
+        self.add_history_record("typical", duration_seconds=120)
+        self.add_history_record("long", duration_seconds=600)
+        self.add_history_record("failed", status="failed", duration_seconds=900)
+        self.window._ensure_history_ui()
+
+        self.assertEqual(
+            self.window.history_trend_combo.currentData(),
+            gui.HISTORY_TREND_DEVICES,
+        )
+        duration_index = self.window.history_trend_combo.findData(
+            gui.HISTORY_TREND_DURATION
+        )
+        self.window.history_trend_combo.setCurrentIndex(duration_index)
+        self.app.processEvents()
+
+        chart = self.window.history_line_view.chart()
+        self.assertEqual(chart.title(), "Median run duration over time")
+        self.assertEqual(len(chart.series()), 1)
+        duration_series = chart.series()[0]
+        self.assertEqual(duration_series.name(), "Median Duration")
+        self.assertTrue(duration_series.pointsVisible())
+        self.assertEqual(duration_series.markerSize(), 8.0)
+        self.assertEqual(
+            [(point.x(), point.y()) for point in duration_series.points()],
+            [(0.0, 2.0)],
+        )
+        self.assertIn("Duration (minutes)", [axis.titleText() for axis in chart.axes()])
+
+        bucket = self.history_store.duration_timeline(
+            history.HistoryFilter(), "daily"
+        )[0]
+        expected_detail = (
+            f"{bucket.label}\nMedian: 2m 0s\nAverage: 4m 20s\nRuns: 3"
+        )
+        with patch.object(gui.QToolTip, "showText") as show:
+            duration_series.hovered.emit(QPointF(0, 2), True)
+            self.assertEqual(show.call_args.args[1], expected_detail)
+            self.assertIs(show.call_args.args[2], self.window.history_line_view)
+
+            duration_series.clicked.emit(QPointF(0, 2))
+            self.assertEqual(show.call_args.args[1], expected_detail)
+
+        self.assertEqual(
+            self.window.history_line_view.accessibleName(),
+            "Median run duration over time",
+        )
+        self.assertIn(
+            "Median: 2m 0s, Average: 4m 20s, Runs: 3",
+            self.window.history_line_view.accessibleDescription(),
+        )
+        self.assertIsNone(self.settings.value("history/trend"))
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.history_trend_combo.currentData(),
+            gui.HISTORY_TREND_DURATION,
+        )
+        self.assertEqual(
+            self.window.history_line_view.chart().series()[0].color().name(),
+            "#64b5f6",
+        )
+
+        failed_index = self.window.history_status_combo.findData("failed")
+        self.window.history_status_combo.setCurrentIndex(failed_index)
+        self.app.processEvents()
+
+        empty_chart = self.window.history_line_view.chart()
+        self.assertEqual(empty_chart.series()[0].count(), 0)
+        self.assertEqual(
+            self.window.history_line_view.accessibleDescription(),
+            "No completed run duration data",
+        )
+        self.assertEqual(empty_chart.title(), "No completed run duration data")
+        self.assertEqual(
+            self.window.history_trend_combo.currentData(),
+            gui.HISTORY_TREND_DURATION,
+        )
+
     def test_history_chart_hover_click_and_accessible_details(self):
         self.add_history_record("good", "succeeded", successes=3)
         self.add_history_record(
@@ -1054,6 +1167,16 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window._history_status_detail("Failed", 1, 0),
             "Failed\n1 run",
+        )
+        self.assertEqual(
+            self.window._history_duration_detail(
+                "2026-10-26",
+                "weekly",
+                125,
+                185,
+                3,
+            ),
+            "Week of 2026-10-26\nMedian: 2m 5s\nAverage: 3m 5s\nRuns: 3",
         )
 
         self.add_history_record("guard", "succeeded", successes=1)

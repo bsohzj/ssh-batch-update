@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import median
 from typing import Callable, Iterator, Optional, Protocol
 
 from PySide6.QtCore import QStandardPaths
@@ -119,6 +120,14 @@ class HistoryBucket:
     label: str
     successes: int
     failures: int
+
+
+@dataclass(frozen=True)
+class HistoryDurationBucket:
+    label: str
+    median_seconds: float
+    average_seconds: float
+    run_count: int
 
 
 @dataclass(frozen=True)
@@ -426,18 +435,60 @@ class HistoryStore:
             started = _parse(row["started_utc"])
             if started is None:
                 continue
-            local = started.astimezone()
-            if granularity == "monthly":
-                label = local.strftime("%Y-%m")
-            elif granularity == "weekly":
-                monday = local.date() - timedelta(days=local.weekday())
-                label = monday.isoformat()
-            else:
-                label = local.date().isoformat()
+            label = self._timeline_label(started, granularity)
             totals = buckets.setdefault(label, [0, 0])
             totals[0] += int(row["success_count"])
             totals[1] += int(row["failure_count"])
         return [HistoryBucket(label, *values) for label, values in buckets.items()]
+
+    def duration_timeline(
+        self,
+        filters: HistoryFilter,
+        granularity: str,
+    ) -> list[HistoryDurationBucket]:
+        where, parameters = self._where(filters)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"SELECT started_utc, completed_utc, status FROM history {where} "
+                    "ORDER BY started_utc",
+                    parameters,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise HistoryError(
+                f"Could not calculate history duration timeline: {exc}"
+            ) from exc
+        buckets: dict[str, list[int]] = {}
+        completed_statuses = {"succeeded", "completed_with_failures"}
+        for row in rows:
+            if str(row["status"]) not in completed_statuses:
+                continue
+            started = _parse(row["started_utc"])
+            completed = _parse(row["completed_utc"])
+            if started is None or completed is None:
+                continue
+            label = self._timeline_label(started, granularity)
+            duration = max(0, int((completed - started).total_seconds()))
+            buckets.setdefault(label, []).append(duration)
+        return [
+            HistoryDurationBucket(
+                label=label,
+                median_seconds=float(median(durations)),
+                average_seconds=sum(durations) / len(durations),
+                run_count=len(durations),
+            )
+            for label, durations in buckets.items()
+        ]
+
+    @staticmethod
+    def _timeline_label(started: datetime, granularity: str) -> str:
+        local = started.astimezone()
+        if granularity == "monthly":
+            return local.strftime("%Y-%m")
+        if granularity == "weekly":
+            monday = local.date() - timedelta(days=local.weekday())
+            return monday.isoformat()
+        return local.date().isoformat()
 
     def status_counts(self, filters: HistoryFilter) -> dict[str, int]:
         where, parameters = self._where(filters)
