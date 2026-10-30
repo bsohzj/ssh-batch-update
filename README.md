@@ -188,6 +188,38 @@ automatic restoration of prior state, and validate the result on an approved
 lab switch before production use. Save commands may prompt interactively and
 must not be treated as unattended operations.
 
+### Config converter
+
+The reusable, non-modal **Config Converter** window opens below the Command
+Dictionary control. It converts a conservative command and configuration
+baseline between generic Cisco IOS XE and Huawei VRP syntax entirely in memory;
+it does not connect to a device, queue work, or create audit History. Source text
+can be pasted or imported from `.cfg` and `.txt` files. Select a source vendor or
+use auto-detection, then click **Convert** to produce an editable target candidate.
+
+The reviewed baseline includes the Dictionary's operational command pairs plus
+hostnames, VLANs, common interface access/trunk settings, descriptions, MTU and
+administrative state, SVIs and IPv4 addresses, static routes, link aggregation,
+LLDP, DNS, NTP, syslog, and directly compatible basic STP settings. Interface
+numbering and command availability still depend on the actual hardware and
+software release. High-speed interface names and site-, security-, or
+hardware-specific features such as AAA/NAC, QoS, SNMP credentials, PKI, stack/HA,
+and non-equivalent STP behavior are left as blocking review items rather than
+guessed.
+
+Unsupported input remains visible as a target-native `REVIEW` comment and is
+explained in the review table. Passwords, hashes, communities, shared keys, and
+cipher values are redacted instead of copied. Editing the result requires
+**Recheck** before executable handoff. Plain target text can be exported as a
+review candidate even when issues remain, but SSH `[exec]`/`[config]` export and
+**Import to SSH Commands** are blocked until every review marker, unknown command,
+and placeholder is resolved. Importing a clean result classifies operational and
+configuration commands, updates Device Type, and offers Replace or Append when
+the SSH command boxes already contain text.
+
+Converted output is a human-review candidate, not a production-ready migration.
+Validate it against vendor documentation and an approved lab switch before use.
+
 ## Use
 
 Put one IPv4 or IPv6 address per line in an inventory file. Hostnames are not
