@@ -727,6 +727,7 @@ class MainWindow(QMainWindow):
         self._credential_file: Optional[Path] = None
         self._history_ui_built = False
         self._dictionary_ui_built = False
+        self.dictionary_dialog: Optional[QDialog] = None
         self._history_page = 0
         self._history_records: dict[str, HistoryRecord] = {}
         self._results_attention_pending = False
@@ -825,6 +826,34 @@ class MainWindow(QMainWindow):
         self.clear_commands_button = QPushButton("Clear Commands")
         self.clear_commands_button.setEnabled(False)
         self.clear_commands_button.clicked.connect(self._clear_commands)
+        self.command_dictionary_button = QPushButton("Command Dictionary")
+        self.command_dictionary_button.setToolTip(
+            "Open the offline command dictionary in a separate window."
+        )
+        self.command_dictionary_button.clicked.connect(
+            self._open_command_dictionary
+        )
+        self.command_inputs_container = QWidget()
+        command_inputs_layout = QGridLayout(self.command_inputs_container)
+        command_inputs_layout.setContentsMargins(0, 0, 0, 0)
+        exec_commands_label = QLabel("Exec Commands")
+        exec_commands_label.setBuddy(self.exec_commands_edit)
+        config_commands_label = QLabel("Config Commands")
+        config_commands_label.setBuddy(self.config_commands_edit)
+        command_inputs_layout.addWidget(exec_commands_label, 0, 0)
+        command_inputs_layout.addWidget(self.exec_commands_edit, 0, 1)
+        command_inputs_layout.addWidget(config_commands_label, 1, 0)
+        command_inputs_layout.addWidget(self.config_commands_edit, 1, 1)
+        command_inputs_layout.addWidget(
+            self.command_dictionary_button,
+            0,
+            2,
+            2,
+            1,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        command_inputs_layout.setColumnStretch(1, 1)
+
         command_file_buttons = QWidget()
         command_file_buttons_layout = QGridLayout(command_file_buttons)
         command_file_buttons_layout.setContentsMargins(0, 0, 0, 0)
@@ -834,8 +863,7 @@ class MainWindow(QMainWindow):
         command_file_buttons_layout.setColumnStretch(0, 1)
         command_file_buttons_layout.setColumnStretch(1, 1)
 
-        form.addRow("Exec Commands", self.exec_commands_edit)
-        form.addRow("Config Commands", self.config_commands_edit)
+        form.addRow(self.command_inputs_container)
         form.addRow("", command_file_buttons)
 
         self.username_edit = QLineEdit()
@@ -999,14 +1027,6 @@ class MainWindow(QMainWindow):
         self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_layout.addWidget(self.history_placeholder, 1)
 
-        self.dictionary_tab = QWidget()
-        self.dictionary_layout = QVBoxLayout(self.dictionary_tab)
-        self.dictionary_placeholder = QLabel(
-            "Open Command Dictionary to browse supported network commands."
-        )
-        self.dictionary_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.dictionary_layout.addWidget(self.dictionary_placeholder, 1)
-
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
@@ -1016,7 +1036,6 @@ class MainWindow(QMainWindow):
 
         self.main_tabs.addTab(ssh_tab, "SSH")
         self.main_tabs.addTab(self.history_tab, "History")
-        self.main_tabs.addTab(self.dictionary_tab, "Dictionary")
         self.main_tabs.currentChanged.connect(self._main_tab_changed)
         self.main_tabs.setCurrentWidget(ssh_tab)
         self.ssh_tab = ssh_tab
@@ -2306,9 +2325,6 @@ class MainWindow(QMainWindow):
     def _main_tab_changed(self, index: int) -> None:
         if index == self.main_tabs.indexOf(self.history_tab):
             self._ensure_history_ui()
-        elif index == self.main_tabs.indexOf(self.dictionary_tab):
-            self._ensure_dictionary_ui()
-            QTimer.singleShot(0, self.dictionary_search_edit.setFocus)
         self._acknowledge_results_attention_if_visible()
 
     def _device_results_visible(self) -> bool:
@@ -2377,12 +2393,34 @@ class MainWindow(QMainWindow):
                 self._results_attention_highlighted
             )
 
+    @Slot()
+    def _open_command_dictionary(self) -> None:
+        self._ensure_dictionary_ui()
+        if self.dictionary_dialog is None:
+            return
+        if self.dictionary_dialog.isMinimized():
+            self.dictionary_dialog.showNormal()
+        else:
+            self.dictionary_dialog.show()
+        self.dictionary_dialog.raise_()
+        self.dictionary_dialog.activateWindow()
+        QTimer.singleShot(0, self.dictionary_search_edit.setFocus)
+
     def _ensure_dictionary_ui(self) -> None:
         if self._dictionary_ui_built:
             return
         self._dictionary_ui_built = True
-        self.dictionary_layout.removeWidget(self.dictionary_placeholder)
-        self.dictionary_placeholder.deleteLater()
+        self.dictionary_dialog = QDialog(self)
+        self.dictionary_dialog.setWindowTitle("Command Dictionary")
+        self.dictionary_dialog.setAccessibleName("Command Dictionary")
+        self.dictionary_dialog.setModal(False)
+        self.dictionary_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self.dictionary_dialog.setAttribute(
+            Qt.WidgetAttribute.WA_DeleteOnClose, False
+        )
+        self.dictionary_dialog.setMinimumSize(900, 600)
+        self.dictionary_dialog.resize(1000, 680)
+        self.dictionary_layout = QVBoxLayout(self.dictionary_dialog)
 
         filters = QHBoxLayout()
         self.dictionary_search_edit = QLineEdit()
@@ -3523,6 +3561,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._closing:
             self._save_settings()
+            if self.dictionary_dialog is not None:
+                self.dictionary_dialog.hide()
             if hasattr(self, "scheduler_timer"):
                 self.scheduler_timer.stop()
             if hasattr(self, "results_attention_timer"):
@@ -3559,6 +3599,8 @@ class MainWindow(QMainWindow):
                 return
         self._save_settings()
         self._closing = True
+        if self.dictionary_dialog is not None:
+            self.dictionary_dialog.hide()
         if hasattr(self, "scheduler_timer"):
             self.scheduler_timer.stop()
         if hasattr(self, "results_attention_timer"):
@@ -3720,7 +3762,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             window.show()
             app.processEvents()
             window._ensure_history_ui()
-            window._ensure_dictionary_ui()
+            window._open_command_dictionary()
             window.dictionary_search_edit.setText("interface")
             app.processEvents()
             window.close()

@@ -111,8 +111,8 @@ lab switches before using the feature on production access switches.
 
 The full-window **History** screen keeps a persistent audit index for live
 batches that run after the feature is installed. It does not import older
-output folders and does not record connection tests. The three top-level tabs
-are **SSH**, **History**, and **Dictionary**; the app always starts on **SSH**.
+output folders and does not record connection tests. The two top-level tabs
+are **SSH** and **History**; the app always starts on **SSH**.
 History is loaded only when its screen is first opened, so it does not delay
 normal queue use or SSH execution.
 
@@ -157,7 +157,8 @@ does not stop an already confirmed live batch.
 
 ### Command dictionary
 
-The full-window **Command Dictionary** is an offline reference containing 96
+The reusable, non-modal **Command Dictionary** window is opened from the SSH
+command controls and contains 96
 entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
 CloudEngine S5755-S. Seventy entries are read-only operational commands. The
 remaining entries are explicitly marked as configuration changes, service-

@@ -230,10 +230,9 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
-        self.assertEqual(self.window.main_tabs.count(), 3)
+        self.assertEqual(self.window.main_tabs.count(), 2)
         self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
         self.assertEqual(self.window.main_tabs.tabText(1), "History")
-        self.assertEqual(self.window.main_tabs.tabText(2), "Dictionary")
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
         self.assertTrue(self.window.main_tabs.tabBar().expanding())
         self.assertGreaterEqual(self.window.main_tabs.tabBar().minimumHeight(), 44)
@@ -247,6 +246,32 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
+        self.assertEqual(
+            self.window.command_dictionary_button.text(), "Command Dictionary"
+        )
+        self.assertTrue(
+            self.window.command_inputs_container.isAncestorOf(
+                self.window.command_dictionary_button
+            )
+        )
+        command_inputs_layout = self.window.command_inputs_container.layout()
+        button_index = command_inputs_layout.indexOf(
+            self.window.command_dictionary_button
+        )
+        button_position = command_inputs_layout.getItemPosition(button_index)
+        exec_position = command_inputs_layout.getItemPosition(
+            command_inputs_layout.indexOf(self.window.exec_commands_edit)
+        )
+        config_position = command_inputs_layout.getItemPosition(
+            command_inputs_layout.indexOf(self.window.config_commands_edit)
+        )
+        self.assertEqual(button_position, (0, 2, 2, 1))
+        self.assertEqual(
+            command_inputs_layout.itemAt(button_index).alignment(),
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        self.assertEqual(exec_position[1], 1)
+        self.assertEqual(config_position[1], 1)
 
     def test_theme_menu_defaults_to_system_and_actions_are_exclusive(self):
         self.assertEqual(self.window.view_menu.title().replace("&", ""), "View")
@@ -386,21 +411,29 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window.history_line_view.isHidden())
         self.assertTrue(self.window.history_pie_view.isHidden())
 
-    def test_command_dictionary_is_third_lazy_top_level_tab_and_focuses_search(self):
+    def test_command_dictionary_opens_lazy_reusable_non_modal_window(self):
         self.assertFalse(self.window._dictionary_ui_built)
         self.assertFalse(hasattr(self.window, "dictionary_table"))
+        self.assertIsNone(self.window.dictionary_dialog)
 
         self.window.show()
-        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.window.command_dictionary_button.click()
         self.app.processEvents()
 
         self.assertTrue(self.window._dictionary_ui_built)
-        self.assertIs(
-            self.window.main_tabs.currentWidget(), self.window.dictionary_tab
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertIsInstance(self.window.dictionary_dialog, QDialog)
+        self.assertFalse(self.window.dictionary_dialog.isModal())
+        self.assertEqual(
+            self.window.dictionary_dialog.windowModality(),
+            Qt.WindowModality.NonModal,
         )
-        dictionary_index = self.window.main_tabs.indexOf(self.window.dictionary_tab)
-        self.assertEqual(dictionary_index, 2)
-        self.assertEqual(self.window.main_tabs.tabText(dictionary_index), "Dictionary")
+        self.assertEqual(
+            self.window.dictionary_dialog.windowTitle(), "Command Dictionary"
+        )
+        self.assertFalse(self.window.dictionary_dialog.isHidden())
+        self.assertGreaterEqual(self.window.dictionary_dialog.minimumWidth(), 900)
+        self.assertGreaterEqual(self.window.dictionary_dialog.minimumHeight(), 600)
         self.assertTrue(self.window.dictionary_search_edit.hasFocus())
         self.assertEqual(self.window.dictionary_table.columnCount(), 3)
         self.assertEqual(
@@ -422,6 +455,17 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window.dictionary_table.rowCount(), len(gui.COMMAND_ENTRIES)
         )
+
+        dialog = self.window.dictionary_dialog
+        self.window.dictionary_search_edit.setText("interface")
+        dialog.close()
+        self.app.processEvents()
+        self.assertTrue(dialog.isHidden())
+        self.window.command_dictionary_button.click()
+        self.app.processEvents()
+        self.assertIs(self.window.dictionary_dialog, dialog)
+        self.assertEqual(self.window.dictionary_search_edit.text(), "interface")
+        self.assertFalse(dialog.isHidden())
 
     def test_command_dictionary_search_filters_count_and_details(self):
         self.window._ensure_dictionary_ui()
@@ -574,7 +618,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(additional_info.isHidden())
 
         self.window.show()
-        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.window._open_command_dictionary()
         self.app.processEvents()
         button.setFocus()
         self.app.processEvents()
@@ -640,10 +684,10 @@ class MainWindowTests(unittest.TestCase):
         self.window.dictionary_search_edit.setText(entry.syntax)
         self.window.dictionary_additional_info_button.click()
 
-        self.window.show()
-        for width, height in ((1400, 850), (1050, 680)):
+        self.window._open_command_dictionary()
+        for width, height in ((1000, 680), (900, 600)):
             with self.subTest(size=(width, height)):
-                self.window.resize(width, height)
+                self.window.dictionary_dialog.resize(width, height)
                 self.app.processEvents()
                 notes = self.window.dictionary_notes_label
                 self.assertEqual(notes.text(), entry.applicability_notes)
@@ -849,10 +893,12 @@ class MainWindowTests(unittest.TestCase):
         selected_job_id = self.window._selected_job_id
         self.window._request_results_attention()
 
-        self.window.main_tabs.setCurrentWidget(self.window.dictionary_tab)
+        self.window.command_dictionary_button.click()
         self.window.dictionary_search_edit.setText("interface")
         self.app.processEvents()
 
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.assertFalse(self.window.dictionary_dialog.isHidden())
         self.assertEqual(self.window.queue_table.rowCount(), queue_rows)
         self.assertEqual(self.window._selected_job_id, selected_job_id)
         self.assertTrue(self.window._results_attention_pending)
@@ -1417,12 +1463,15 @@ class MainWindowTests(unittest.TestCase):
 
     def test_close_stops_results_attention_timer(self):
         self.window._request_results_attention()
+        self.window._open_command_dictionary()
         self.assertTrue(self.window.results_attention_timer.isActive())
+        self.assertFalse(self.window.dictionary_dialog.isHidden())
 
         self.window.close()
         self.app.processEvents()
 
         self.assertFalse(self.window.results_attention_timer.isActive())
+        self.assertTrue(self.window.dictionary_dialog.isHidden())
 
     def test_future_schedule_arms_idle_sleep_prevention(self):
         prepared = runner.prepare_run(
