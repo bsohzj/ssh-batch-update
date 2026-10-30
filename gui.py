@@ -192,6 +192,15 @@ def apply_application_theme(app: QApplication, mode: object) -> str:
     return normalized
 
 
+def _repolish_application_widgets(app: QApplication) -> None:
+    """Refresh native widget styling after an application palette change."""
+    for widget in app.allWidgets():
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+        widget.update()
+
+
 PROFILE_GROUP = "credential_profiles/items"
 LAST_PROFILE_KEY = "credential_profiles/last_selected"
 
@@ -1098,6 +1107,8 @@ class MainWindow(QMainWindow):
         if app is None:
             return
         self._theme_mode = apply_application_theme(app, mode)
+        _repolish_application_widgets(app)
+        QTimer.singleShot(0, lambda: _repolish_application_widgets(app))
         self.settings.setValue("appearance/theme", self._theme_mode)
         self.settings.sync()
         self._update_destructive_button_styles()

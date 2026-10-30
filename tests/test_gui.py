@@ -357,6 +357,35 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.settings.value("appearance/theme"), "system")
         self.assertEqual(self.app.palette().resolveMask(), 0)
 
+    def test_runtime_theme_repolishes_existing_widget_text_colors(self):
+        widgets_and_roles = (
+            (self.window.validation_label, QPalette.ColorRole.WindowText),
+            (self.window.username_edit, QPalette.ColorRole.Text),
+            (self.window.inventory_text_edit, QPalette.ColorRole.Text),
+            (self.window.device_type_combo, QPalette.ColorRole.ButtonText),
+            (self.window.command_dictionary_button, QPalette.ColorRole.ButtonText),
+            (self.window.queue_table, QPalette.ColorRole.Text),
+        )
+
+        with patch.object(
+            gui,
+            "_repolish_application_widgets",
+            wraps=gui._repolish_application_widgets,
+        ) as repolish:
+            self.window.theme_dark_action.trigger()
+            self.app.processEvents()
+
+            self.assertGreaterEqual(repolish.call_count, 2)
+            for widget, role in widgets_and_roles:
+                self.assertEqual(widget.palette().color(role), QColor("#f1f3f4"))
+
+            self.window.theme_light_action.trigger()
+            self.app.processEvents()
+
+            self.assertGreaterEqual(repolish.call_count, 4)
+            for widget, role in widgets_and_roles:
+                self.assertEqual(widget.palette().color(role), QColor("#202124"))
+
     def test_stored_theme_is_applied_when_a_window_is_reopened(self):
         self.window.theme_dark_action.trigger()
         self.settings.sync()
