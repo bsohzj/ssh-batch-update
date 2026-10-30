@@ -37,6 +37,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QPainter,
     QPalette,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -82,6 +83,22 @@ from batch_queue import (
 )
 
 from command_dictionary import COMMAND_ENTRIES, CommandEntry, search_commands
+
+from config_converter import (
+    DISPOSITION_IGNORED,
+    DISPOSITION_REVIEW,
+    DISPOSITION_UNMAPPED,
+    VENDOR_CISCO,
+    VENDOR_HUAWEI,
+    ConversionIssue,
+    ConversionResult,
+    analyze_target_text,
+    convert_text,
+    detect_vendor,
+    opposite_vendor,
+    render_sectioned_commands,
+    vendor_label,
+)
 
 from history import (
     HistoryCommandSnapshot,
@@ -739,6 +756,16 @@ class MainWindow(QMainWindow):
         self._history_ui_built = False
         self._dictionary_ui_built = False
         self.dictionary_dialog: Optional[QDialog] = None
+        self._converter_ui_built = False
+        self.converter_dialog: Optional[QDialog] = None
+        self._converter_result: Optional[ConversionResult] = None
+        self._converter_target_vendor: Optional[str] = None
+        self._converter_source_stale = False
+        self._converter_output_dirty = False
+        self._converter_setting_output = False
+        self._converter_result_is_analysis = False
+        self._last_converter_import = ""
+        self._last_converter_export = ""
         self._history_page = 0
         self._history_records: dict[str, HistoryRecord] = {}
         self._results_attention_pending = False
@@ -838,7 +865,13 @@ class MainWindow(QMainWindow):
         self.command_dictionary_button.clicked.connect(
             self._open_command_dictionary
         )
+        self.config_converter_button = QPushButton("Config Converter")
+        self.config_converter_button.setToolTip(
+            "Convert reviewed Cisco IOS XE and Huawei VRP commands locally."
+        )
+        self.config_converter_button.clicked.connect(self._open_config_converter)
         command_file_buttons = QWidget()
+        self.command_file_buttons = command_file_buttons
         command_file_buttons_layout = QGridLayout(command_file_buttons)
         command_file_buttons_layout.setContentsMargins(0, 0, 0, 0)
         command_file_buttons_layout.addWidget(import_sectioned_button, 0, 0, 1, 2)
@@ -863,15 +896,16 @@ class MainWindow(QMainWindow):
         command_inputs_layout.addWidget(self.exec_commands_edit, 5, 1)
         command_inputs_layout.addWidget(config_commands_label, 6, 0)
         command_inputs_layout.addWidget(self.config_commands_edit, 6, 1)
+        command_tools = QWidget()
+        command_tools_layout = QVBoxLayout(command_tools)
+        command_tools_layout.setContentsMargins(0, 0, 0, 0)
+        command_tools_layout.addWidget(self.command_dictionary_button)
+        command_tools_layout.addWidget(self.config_converter_button)
         command_inputs_layout.addWidget(
-            self.command_dictionary_button,
-            5,
-            2,
-            2,
-            1,
-            Qt.AlignmentFlag.AlignVCenter,
+            command_tools, 5, 2, 2, 1, Qt.AlignmentFlag.AlignVCenter
         )
-        command_inputs_layout.addWidget(command_file_buttons, 7, 1)
+        self.command_tools_container = command_tools
+        command_inputs_layout.addWidget(command_file_buttons, 7, 1, 1, 2)
         command_inputs_layout.setColumnStretch(1, 1)
 
         self.username_edit = QLineEdit()
@@ -1132,6 +1166,611 @@ class MainWindow(QMainWindow):
             button = getattr(self, name, None)
             if button is not None:
                 button.setStyleSheet(style)
+
+    @Slot()
+    def _open_config_converter(self) -> None:
+        self._ensure_converter_ui()
+        if self.converter_dialog is None:
+            return
+        if self.converter_dialog.isMinimized():
+            self.converter_dialog.showNormal()
+        else:
+            self.converter_dialog.show()
+        self.converter_dialog.raise_()
+        self.converter_dialog.activateWindow()
+        QTimer.singleShot(0, self.converter_source_edit.setFocus)
+
+    def _ensure_converter_ui(self) -> None:
+        if self._converter_ui_built:
+            return
+        self._converter_ui_built = True
+        self.converter_dialog = QDialog(self)
+        self.converter_dialog.setWindowTitle("Config Converter")
+        self.converter_dialog.setAccessibleName("Config Converter")
+        self.converter_dialog.setModal(False)
+        self.converter_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self.converter_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.converter_dialog.setMinimumSize(900, 650)
+        self.converter_dialog.resize(1180, 780)
+        layout = QVBoxLayout(self.converter_dialog)
+
+        scope_label = QLabel(
+            "Generic Cisco IOS XE / Huawei VRP candidate conversion. Verify every "
+            "result against the target model, software release, and site policy."
+        )
+        scope_label.setWordWrap(True)
+        scope_label.setAccessibleName("Converter scope warning")
+        layout.addWidget(scope_label)
+        self.converter_scope_label = scope_label
+
+        direction_row = QHBoxLayout()
+        self.converter_source_vendor_combo = QComboBox()
+        self.converter_source_vendor_combo.addItem("Auto-detect", None)
+        self.converter_source_vendor_combo.addItem("Cisco IOS XE", VENDOR_CISCO)
+        self.converter_source_vendor_combo.addItem("Huawei VRP", VENDOR_HUAWEI)
+        self.converter_swap_button = QPushButton("Swap Direction")
+        self.converter_target_label = QLabel("Target: detected on Convert")
+        self.converter_target_label.setWordWrap(True)
+        direction_row.addWidget(QLabel("Source"))
+        direction_row.addWidget(self.converter_source_vendor_combo)
+        direction_row.addWidget(self.converter_swap_button)
+        direction_row.addWidget(self.converter_target_label, 1)
+        layout.addLayout(direction_row)
+
+        editor_splitter = QSplitter(Qt.Orientation.Horizontal)
+        editor_splitter.setChildrenCollapsible(False)
+
+        source_panel = QWidget()
+        source_layout = QVBoxLayout(source_panel)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_heading = QLabel("Source configuration or commands")
+        source_layout.addWidget(source_heading)
+        self.converter_source_edit = QPlainTextEdit()
+        self.converter_source_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.converter_source_edit.setPlaceholderText(
+            "Paste a configuration, command list, or [exec]/[config] command file."
+        )
+        source_layout.addWidget(self.converter_source_edit, 1)
+        source_actions = QHBoxLayout()
+        self.converter_import_button = QPushButton("Import Configuration")
+        self.converter_clear_button = QPushButton("Clear")
+        self.converter_clear_button.setEnabled(False)
+        self.converter_convert_button = QPushButton("Convert")
+        self.converter_convert_button.setEnabled(False)
+        source_actions.addWidget(self.converter_import_button)
+        source_actions.addWidget(self.converter_clear_button)
+        source_actions.addStretch()
+        source_actions.addWidget(self.converter_convert_button)
+        source_layout.addLayout(source_actions)
+        editor_splitter.addWidget(source_panel)
+
+        output_panel = QWidget()
+        output_layout = QVBoxLayout(output_panel)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_heading = QLabel("Converted target text")
+        output_layout.addWidget(output_heading)
+        self.converter_output_edit = QPlainTextEdit()
+        self.converter_output_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.converter_output_edit.setPlaceholderText(
+            "Converted candidate output appears here and remains editable for review."
+        )
+        output_layout.addWidget(self.converter_output_edit, 1)
+        output_actions = QHBoxLayout()
+        self.converter_recheck_button = QPushButton("Recheck")
+        self.converter_export_button = QPushButton("Export…")
+        self.converter_import_to_ssh_button = QPushButton("Import to SSH Commands")
+        for button in (
+            self.converter_recheck_button,
+            self.converter_export_button,
+            self.converter_import_to_ssh_button,
+        ):
+            button.setEnabled(False)
+        output_actions.addWidget(self.converter_recheck_button)
+        output_actions.addStretch()
+        output_actions.addWidget(self.converter_export_button)
+        output_actions.addWidget(self.converter_import_to_ssh_button)
+        output_layout.addLayout(output_actions)
+        editor_splitter.addWidget(output_panel)
+        editor_splitter.setStretchFactor(0, 1)
+        editor_splitter.setStretchFactor(1, 1)
+        editor_splitter.setSizes([580, 580])
+        self.converter_editor_splitter = editor_splitter
+        layout.addWidget(editor_splitter, 2)
+
+        self.converter_status_label = QLabel(
+            "Enter or import source text, select its vendor or use auto-detect, then Convert."
+        )
+        self.converter_status_label.setWordWrap(True)
+        layout.addWidget(self.converter_status_label)
+
+        self.converter_issue_table = QTableWidget(0, 4)
+        self.converter_issue_table.setHorizontalHeaderLabels(
+            ["Source line", "Disposition", "Section", "Explanation"]
+        )
+        self.converter_issue_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.converter_issue_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.converter_issue_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.converter_issue_table.setAlternatingRowColors(True)
+        self.converter_issue_table.verticalHeader().setVisible(False)
+        issue_header = self.converter_issue_table.horizontalHeader()
+        for column in (0, 1, 2):
+            issue_header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        issue_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.converter_issue_table.setMinimumHeight(150)
+        layout.addWidget(self.converter_issue_table, 1)
+
+        self.converter_source_edit.textChanged.connect(
+            self._converter_source_changed
+        )
+        self.converter_output_edit.textChanged.connect(
+            self._converter_output_changed
+        )
+        self.converter_source_vendor_combo.currentIndexChanged.connect(
+            self._converter_direction_changed
+        )
+        self.converter_swap_button.clicked.connect(self._swap_converter_direction)
+        self.converter_import_button.clicked.connect(self._import_converter_source)
+        self.converter_clear_button.clicked.connect(self._clear_converter)
+        self.converter_convert_button.clicked.connect(self._convert_converter_source)
+        self.converter_recheck_button.clicked.connect(self._recheck_converter_output)
+        self.converter_export_button.clicked.connect(self._export_converter_output)
+        self.converter_import_to_ssh_button.clicked.connect(
+            self._import_converter_to_ssh
+        )
+        self.converter_issue_table.itemSelectionChanged.connect(
+            self._converter_issue_selected
+        )
+
+    @Slot()
+    def _converter_source_changed(self) -> None:
+        if not self._converter_ui_built:
+            return
+        has_source = bool(self.converter_source_edit.toPlainText().strip())
+        self.converter_convert_button.setEnabled(has_source)
+        if self._converter_result is not None:
+            self._converter_source_stale = True
+            self.converter_status_label.setText(
+                "Source changed. Click Convert to replace the stale result."
+            )
+        self._update_converter_actions()
+
+    @Slot()
+    def _converter_output_changed(self) -> None:
+        if not self._converter_ui_built or self._converter_setting_output:
+            return
+        self._converter_output_dirty = True
+        self.converter_status_label.setText(
+            "Output edited. Recheck before SSH import or sectioned export."
+        )
+        self._update_converter_actions()
+
+    @Slot()
+    def _converter_direction_changed(self) -> None:
+        if not self._converter_ui_built:
+            return
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected:
+            self.converter_target_label.setText(
+                f"Target: {vendor_label(opposite_vendor(str(selected)))}"
+            )
+        else:
+            self.converter_target_label.setText("Target: detected on Convert")
+        if self._converter_result is not None:
+            self._converter_source_stale = True
+            self.converter_status_label.setText(
+                "Direction changed. Click Convert to replace the stale result."
+            )
+        self._update_converter_actions()
+
+    @Slot()
+    def _swap_converter_direction(self) -> None:
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected is None:
+            detection = detect_vendor(self.converter_source_edit.toPlainText())
+            if detection.vendor is None:
+                QMessageBox.critical(
+                    self.converter_dialog,
+                    "Cannot swap direction",
+                    "Select a source vendor or enter text with recognizable vendor syntax.",
+                )
+                return
+            selected = detection.vendor
+        target = opposite_vendor(str(selected))
+        index = self.converter_source_vendor_combo.findData(target)
+        self.converter_source_vendor_combo.setCurrentIndex(index)
+
+    def _resolved_converter_source(self, show_error: bool = True) -> Optional[str]:
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected:
+            return str(selected)
+        detection = detect_vendor(self.converter_source_edit.toPlainText())
+        if detection.vendor:
+            return detection.vendor
+        if show_error:
+            QMessageBox.critical(
+                self.converter_dialog,
+                "Source vendor required",
+                "The source is unknown or contains mixed Cisco and Huawei syntax. "
+                "Choose Cisco IOS XE or Huawei VRP explicitly.",
+            )
+        return None
+
+    @Slot()
+    def _convert_converter_source(self) -> None:
+        source_vendor = self._resolved_converter_source()
+        if source_vendor is None:
+            return
+        try:
+            result = convert_text(
+                self.converter_source_edit.toPlainText(), source_vendor
+            )
+        except ValueError as exc:
+            QMessageBox.critical(
+                self.converter_dialog, "Conversion failed", str(exc)
+            )
+            return
+        self._converter_target_vendor = result.target_vendor
+        self.converter_target_label.setText(
+            f"Target: {vendor_label(result.target_vendor)}"
+        )
+        self._converter_setting_output = True
+        try:
+            self.converter_output_edit.setPlainText(result.output_text)
+        finally:
+            self._converter_setting_output = False
+        self._converter_source_stale = False
+        self._converter_output_dirty = False
+        self._set_converter_result(result, is_analysis=False)
+
+    @Slot()
+    def _recheck_converter_output(self) -> None:
+        if self._converter_target_vendor is None:
+            source_vendor = self._resolved_converter_source()
+            if source_vendor is None:
+                return
+            self._converter_target_vendor = opposite_vendor(source_vendor)
+            self.converter_target_label.setText(
+                f"Target: {vendor_label(self._converter_target_vendor)}"
+            )
+        result = analyze_target_text(
+            self.converter_output_edit.toPlainText(),
+            self._converter_target_vendor,
+        )
+        self._converter_output_dirty = False
+        self._set_converter_result(result, is_analysis=True)
+
+    def _set_converter_result(
+        self, result: ConversionResult, *, is_analysis: bool
+    ) -> None:
+        self._converter_result = result
+        self._converter_result_is_analysis = is_analysis
+        table = self.converter_issue_table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for row, issue in enumerate(result.issues):
+            table.insertRow(row)
+            values = (
+                str(issue.line_number),
+                issue.disposition.title(),
+                issue.section.title(),
+                issue.message,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, issue)
+                table.setItem(row, column, item)
+        table.blockSignals(False)
+        dispositions = [issue.disposition for issue in result.issues]
+        review_count = dispositions.count(DISPOSITION_REVIEW)
+        unmapped_count = dispositions.count(DISPOSITION_UNMAPPED)
+        ignored_count = dispositions.count(DISPOSITION_IGNORED)
+        blocking_count = len(result.blocking_issues)
+        self.converter_status_label.setText(
+            f"{len(result.commands)} converted | {review_count} review | "
+            f"{unmapped_count} unmapped | {ignored_count} ignored | "
+            f"{blocking_count} blocking"
+        )
+        self._update_converter_actions()
+
+    def _update_converter_actions(self) -> None:
+        if not self._converter_ui_built:
+            return
+        has_source = bool(self.converter_source_edit.toPlainText())
+        has_output = bool(self.converter_output_edit.toPlainText().strip())
+        self.converter_clear_button.setEnabled(has_source or has_output)
+        self.converter_recheck_button.setEnabled(has_output)
+        self.converter_export_button.setEnabled(has_output)
+        self.converter_import_to_ssh_button.setEnabled(has_output)
+
+    @Slot()
+    def _clear_converter(self) -> None:
+        self._converter_result = None
+        self._converter_target_vendor = None
+        self._converter_source_stale = False
+        self._converter_output_dirty = False
+        self._converter_result_is_analysis = False
+        self._converter_setting_output = True
+        try:
+            self.converter_output_edit.clear()
+        finally:
+            self._converter_setting_output = False
+        self.converter_source_edit.clear()
+        self.converter_issue_table.clearContents()
+        self.converter_issue_table.setRowCount(0)
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected:
+            self.converter_target_label.setText(
+                f"Target: {vendor_label(opposite_vendor(str(selected)))}"
+            )
+        else:
+            self.converter_target_label.setText("Target: detected on Convert")
+        self.converter_status_label.setText(
+            "Enter or import source text, select its vendor or use auto-detect, then Convert."
+        )
+        self._update_converter_actions()
+
+    @Slot()
+    def _converter_issue_selected(self) -> None:
+        selected = self.converter_issue_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        item = self.converter_issue_table.item(row, 0)
+        issue = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not isinstance(issue, ConversionIssue):
+            return
+        editor = (
+            self.converter_output_edit
+            if self._converter_result_is_analysis
+            else self.converter_source_edit
+        )
+        block = editor.document().findBlockByLineNumber(max(0, issue.line_number - 1))
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+        cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+
+    @Slot()
+    def _import_converter_source(self) -> None:
+        start = (
+            str(Path(self._last_converter_import).parent)
+            if self._last_converter_import
+            else str(Path.home())
+        )
+        converter_was_visible = bool(
+            self.converter_dialog is not None and self.converter_dialog.isVisible()
+        )
+        selected, _ = QFileDialog.getOpenFileName(
+            self.converter_dialog,
+            "Import configuration or commands",
+            start,
+            "Configuration files (*.cfg *.txt);;All files (*)",
+        )
+        self._restore_converter_after_file_dialog(converter_was_visible)
+        if not selected:
+            return
+        path = Path(selected)
+        text = self._read_import_file(path)
+        if text is None:
+            return
+        self.converter_source_edit.setPlainText(text)
+        self._last_converter_import = str(path)
+
+    def _choose_converter_export_format(self) -> Optional[str]:
+        message = QMessageBox(self.converter_dialog)
+        message.setWindowTitle("Export converted output")
+        message.setText("Choose the export format.")
+        plain_button = message.addButton(
+            "Plain Target Configuration", QMessageBox.ButtonRole.AcceptRole
+        )
+        ssh_button = message.addButton(
+            "SSH [exec]/[config] File", QMessageBox.ButtonRole.ActionRole
+        )
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked is plain_button:
+            return "plain"
+        if clicked is ssh_button:
+            return "ssh"
+        return None
+
+    def _select_converter_export_file(
+        self, title: str, default_name: str, file_filter: str
+    ) -> Optional[Path]:
+        start = (
+            Path(self._last_converter_export).parent
+            if self._last_converter_export
+            else Path.home()
+        )
+        converter_was_visible = bool(
+            self.converter_dialog is not None and self.converter_dialog.isVisible()
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self.converter_dialog,
+            title,
+            str(start / default_name),
+            file_filter,
+        )
+        self._restore_converter_after_file_dialog(converter_was_visible)
+        return Path(selected) if selected else None
+
+    def _restore_converter_after_file_dialog(self, was_visible: bool) -> None:
+        if not was_visible or self.converter_dialog is None or self._closing:
+            return
+
+        def restore() -> None:
+            if self.converter_dialog is None or self._closing:
+                return
+            if self.converter_dialog.isMinimized():
+                self.converter_dialog.showNormal()
+            else:
+                self.converter_dialog.show()
+            self.converter_dialog.raise_()
+            self.converter_dialog.activateWindow()
+
+        # Native macOS file panels can deliver their Cancel close event to the
+        # non-modal parent. Restore after that event has drained from the queue.
+        restore()
+        QTimer.singleShot(0, restore)
+
+    @Slot()
+    def _export_converter_output(self) -> None:
+        export_format = self._choose_converter_export_format()
+        if export_format is None:
+            return
+        if export_format == "plain":
+            has_review_risk = bool(
+                self._converter_source_stale
+                or self._converter_output_dirty
+                or (
+                    self._converter_result is not None
+                    and self._converter_result.blocking_issues
+                )
+            )
+            if has_review_risk:
+                answer = QMessageBox.warning(
+                    self.converter_dialog,
+                    "Export review-only output?",
+                    "This output is stale, modified, or contains blocking review items. "
+                    "Export it only as a review candidate.",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            path = self._select_converter_export_file(
+                "Export target configuration",
+                "converted-config.cfg",
+                "Configuration files (*.cfg *.txt);;All files (*)",
+            )
+            text = self.converter_output_edit.toPlainText()
+        else:
+            result = self._converter_handoff_result()
+            if result is None:
+                return
+            try:
+                text = render_sectioned_commands(result)
+            except ValueError as exc:
+                QMessageBox.critical(
+                    self.converter_dialog, "SSH export blocked", str(exc)
+                )
+                return
+            path = self._select_converter_export_file(
+                "Export SSH command file",
+                "converted-commands.txt",
+                "Text files (*.txt);;All files (*)",
+            )
+        if path is not None and self._write_export_file(path, text):
+            self._last_converter_export = str(path)
+
+    def _converter_handoff_result(self) -> Optional[ConversionResult]:
+        if self._converter_source_stale:
+            QMessageBox.critical(
+                self.converter_dialog,
+                "Stale conversion",
+                "The source or conversion direction changed. Click Convert again first.",
+            )
+            return None
+        if self._converter_output_dirty or self._converter_result is None:
+            self._recheck_converter_output()
+        result = self._converter_result
+        if result is None:
+            return None
+        if result.blocking_issues:
+            QMessageBox.critical(
+                self.converter_dialog,
+                "Import blocked",
+                f"Resolve all {len(result.blocking_issues)} blocking review item(s) "
+                "before executable export or SSH import.",
+            )
+            return None
+        return result
+
+    def _choose_converter_import_mode(
+        self, exec_count: int, config_count: int
+    ) -> Optional[str]:
+        message = QMessageBox(self.converter_dialog)
+        message.setWindowTitle("Import converted commands")
+        message.setText(
+            f"The result contains {exec_count} Exec and {config_count} Config commands. "
+            "The SSH command boxes already contain text."
+        )
+        replace_button = message.addButton(
+            "Replace", QMessageBox.ButtonRole.AcceptRole
+        )
+        append_button = message.addButton(
+            "Append", QMessageBox.ButtonRole.ActionRole
+        )
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked is replace_button:
+            return "replace"
+        if clicked is append_button:
+            return "append"
+        return None
+
+    @staticmethod
+    def _append_command_text(existing: str, additional: str) -> str:
+        if not additional:
+            return existing
+        if not existing.strip():
+            return additional
+        return f"{existing.rstrip()}\n{additional}"
+
+    @Slot()
+    def _import_converter_to_ssh(self) -> None:
+        result = self._converter_handoff_result()
+        if result is None:
+            return
+        exec_text = "\n".join(result.exec_commands)
+        config_text = "\n".join(result.config_commands)
+        existing_exec = self.exec_commands_edit.toPlainText()
+        existing_config = self.config_commands_edit.toPlainText()
+        mode = "replace"
+        if existing_exec.strip() or existing_config.strip():
+            selected = self._choose_converter_import_mode(
+                len(result.exec_commands), len(result.config_commands)
+            )
+            if selected is None:
+                return
+            mode = selected
+        if mode == "replace":
+            self.exec_commands_edit.setPlainText(exec_text)
+            self.config_commands_edit.setPlainText(config_text)
+        else:
+            self.exec_commands_edit.setPlainText(
+                self._append_command_text(existing_exec, exec_text)
+            )
+            self.config_commands_edit.setPlainText(
+                self._append_command_text(existing_config, config_text)
+            )
+        device_type = (
+            "cisco_ios"
+            if result.target_vendor == VENDOR_CISCO
+            else "huawei"
+        )
+        self.device_type_combo.setCurrentText(device_type)
+        self._prepared = None
+        self._set_validated(False)
+        self.validation_label.setText(
+            f"Imported {len(result.exec_commands)} Exec and "
+            f"{len(result.config_commands)} Config commands from Config Converter. "
+            "Validate before running."
+        )
 
     def _path_row(self, placeholder: str, callback) -> tuple[QLineEdit, QWidget]:
         edit = QLineEdit()
@@ -3719,6 +4358,8 @@ class MainWindow(QMainWindow):
             self._save_settings()
             if self.dictionary_dialog is not None:
                 self.dictionary_dialog.hide()
+            if self.converter_dialog is not None:
+                self.converter_dialog.hide()
             if hasattr(self, "scheduler_timer"):
                 self.scheduler_timer.stop()
             if hasattr(self, "results_attention_timer"):
@@ -3757,6 +4398,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self.dictionary_dialog is not None:
             self.dictionary_dialog.hide()
+        if self.converter_dialog is not None:
+            self.converter_dialog.hide()
         if hasattr(self, "scheduler_timer"):
             self.scheduler_timer.stop()
         if hasattr(self, "results_attention_timer"):
@@ -3920,6 +4563,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             window._ensure_history_ui()
             window._open_command_dictionary()
             window.dictionary_search_edit.setText("interface")
+            window._open_config_converter()
+            window.converter_source_edit.setPlainText("show version")
+            window._convert_converter_source()
             app.processEvents()
             window.close()
             app.processEvents()

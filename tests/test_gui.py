@@ -251,6 +251,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(
             self.window.command_dictionary_button.text(), "Command Dictionary"
         )
+        self.assertEqual(self.window.config_converter_button.text(), "Config Converter")
         self.assertTrue(
             self.window.command_inputs_container.isAncestorOf(
                 self.window.command_dictionary_button
@@ -258,7 +259,7 @@ class MainWindowTests(unittest.TestCase):
         )
         command_inputs_layout = self.window.command_inputs_container.layout()
         button_index = command_inputs_layout.indexOf(
-            self.window.command_dictionary_button
+            self.window.command_tools_container
         )
         button_position = command_inputs_layout.getItemPosition(button_index)
         exec_position = command_inputs_layout.getItemPosition(
@@ -266,6 +267,11 @@ class MainWindowTests(unittest.TestCase):
         )
         config_position = command_inputs_layout.getItemPosition(
             command_inputs_layout.indexOf(self.window.config_commands_edit)
+        )
+        command_file_position = command_inputs_layout.getItemPosition(
+            command_inputs_layout.indexOf(
+                self.window.command_file_buttons
+            )
         )
         inventory_position = command_inputs_layout.getItemPosition(
             command_inputs_layout.indexOf(self.window.inventory_text_edit)
@@ -275,9 +281,15 @@ class MainWindowTests(unittest.TestCase):
             command_inputs_layout.itemAt(button_index).alignment(),
             Qt.AlignmentFlag.AlignVCenter,
         )
+        tools_layout = self.window.command_tools_container.layout()
+        self.assertLess(
+            tools_layout.indexOf(self.window.command_dictionary_button),
+            tools_layout.indexOf(self.window.config_converter_button),
+        )
         self.assertEqual(inventory_position[1], 1)
         self.assertEqual(exec_position[1], 1)
         self.assertEqual(config_position[1], 1)
+        self.assertEqual(command_file_position, (7, 1, 1, 2))
         for editor in (
             self.window.profile_combo,
             self.window.username_edit,
@@ -527,6 +539,291 @@ class MainWindowTests(unittest.TestCase):
         self.assertIs(self.window.dictionary_dialog, dialog)
         self.assertEqual(self.window.dictionary_search_edit.text(), "interface")
         self.assertFalse(dialog.isHidden())
+
+    def test_config_converter_opens_lazy_reusable_non_modal_window(self):
+        self.assertFalse(self.window._converter_ui_built)
+        self.assertIsNone(self.window.converter_dialog)
+
+        self.window.show()
+        self.window.config_converter_button.click()
+        self.app.processEvents()
+
+        self.assertTrue(self.window._converter_ui_built)
+        self.assertIsInstance(self.window.converter_dialog, QDialog)
+        self.assertFalse(self.window.converter_dialog.isModal())
+        self.assertEqual(
+            self.window.converter_dialog.windowModality(),
+            Qt.WindowModality.NonModal,
+        )
+        self.assertEqual(self.window.converter_dialog.windowTitle(), "Config Converter")
+        self.assertGreaterEqual(self.window.converter_dialog.minimumWidth(), 900)
+        self.assertGreaterEqual(self.window.converter_dialog.minimumHeight(), 650)
+        self.assertTrue(self.window.converter_source_edit.hasFocus())
+        self.assertEqual(self.window.converter_issue_table.columnCount(), 4)
+        self.assertEqual(
+            self.window.converter_source_edit.lineWrapMode(),
+            gui.QPlainTextEdit.LineWrapMode.NoWrap,
+        )
+
+        dialog = self.window.converter_dialog
+        self.window.converter_source_edit.setPlainText("show version")
+        dialog.close()
+        self.app.processEvents()
+        self.assertTrue(dialog.isHidden())
+        self.window.config_converter_button.click()
+        self.app.processEvents()
+        self.assertIs(self.window.converter_dialog, dialog)
+        self.assertEqual(self.window.converter_source_edit.toPlainText(), "show version")
+
+    def test_config_converter_auto_detects_converts_and_rechecks(self):
+        self.window._ensure_converter_ui()
+        self.window.converter_source_edit.setPlainText(
+            "show version\nhostname EDGE-01\n"
+        )
+
+        self.window._convert_converter_source()
+
+        self.assertEqual(
+            self.window.converter_target_label.text(), "Target: Huawei VRP"
+        )
+        self.assertEqual(
+            self.window.converter_output_edit.toPlainText(),
+            "display version\nsysname EDGE-01",
+        )
+        self.assertIn("2 converted", self.window.converter_status_label.text())
+        self.assertFalse(self.window._converter_output_dirty)
+
+        self.window.converter_output_edit.appendPlainText("unknown target line")
+        self.assertTrue(self.window._converter_output_dirty)
+        self.window._recheck_converter_output()
+        self.assertFalse(self.window._converter_output_dirty)
+        self.assertEqual(len(self.window._converter_result.blocking_issues), 1)
+        self.assertEqual(self.window.converter_issue_table.rowCount(), 1)
+
+    def test_config_converter_clear_resets_input_output_and_review_state(self):
+        self.window._ensure_converter_ui()
+        self.assertEqual(self.window.converter_clear_button.text(), "Clear")
+        self.assertFalse(self.window.converter_clear_button.isEnabled())
+        self.window.converter_source_vendor_combo.setCurrentIndex(
+            self.window.converter_source_vendor_combo.findData("cisco")
+        )
+        self.window.converter_source_edit.setPlainText(
+            "hostname EDGE-01\naaa new-model\n"
+        )
+        self.window._convert_converter_source()
+        self.assertTrue(self.window.converter_clear_button.isEnabled())
+        self.assertNotEqual(self.window.converter_output_edit.toPlainText(), "")
+        self.assertGreater(self.window.converter_issue_table.rowCount(), 0)
+
+        self.window.converter_clear_button.click()
+
+        self.assertEqual(self.window.converter_source_edit.toPlainText(), "")
+        self.assertEqual(self.window.converter_output_edit.toPlainText(), "")
+        self.assertEqual(self.window.converter_issue_table.rowCount(), 0)
+        self.assertIsNone(self.window._converter_result)
+        self.assertIsNone(self.window._converter_target_vendor)
+        self.assertFalse(self.window._converter_source_stale)
+        self.assertFalse(self.window._converter_output_dirty)
+        self.assertFalse(self.window.converter_clear_button.isEnabled())
+        self.assertFalse(self.window.converter_export_button.isEnabled())
+        self.assertEqual(
+            self.window.converter_target_label.text(), "Target: Huawei VRP"
+        )
+
+    def test_config_converter_imports_clean_result_into_empty_ssh_form(self):
+        self.window._ensure_converter_ui()
+        self.window.converter_source_edit.setPlainText(
+            "[exec]\nshow version\n[config]\nhostname EDGE-01\n"
+        )
+        self.window._convert_converter_source()
+
+        self.window._import_converter_to_ssh()
+
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "display version")
+        self.assertEqual(self.window.config_commands_edit.toPlainText(), "sysname EDGE-01")
+        self.assertEqual(self.window.device_type_combo.currentText(), "huawei")
+        self.assertIn("Validate before running", self.window.validation_label.text())
+
+    def test_config_converter_append_preserves_existing_ssh_commands(self):
+        self.window.exec_commands_edit.setPlainText("display clock")
+        self.window.config_commands_edit.setPlainText("sysname OLD")
+        self.window._ensure_converter_ui()
+        self.window.converter_source_edit.setPlainText(
+            "show version\nhostname EDGE-01\n"
+        )
+        self.window._convert_converter_source()
+
+        with patch.object(
+            self.window, "_choose_converter_import_mode", return_value="append"
+        ):
+            self.window._import_converter_to_ssh()
+
+        self.assertEqual(
+            self.window.exec_commands_edit.toPlainText(),
+            "display clock\ndisplay version",
+        )
+        self.assertEqual(
+            self.window.config_commands_edit.toPlainText(),
+            "sysname OLD\nsysname EDGE-01",
+        )
+
+    def test_config_converter_blocks_unresolved_ssh_import(self):
+        self.window._ensure_converter_ui()
+        self.window.converter_source_vendor_combo.setCurrentIndex(
+            self.window.converter_source_vendor_combo.findData("cisco")
+        )
+        self.window.converter_source_edit.setPlainText("aaa new-model\n")
+        self.window._convert_converter_source()
+
+        with patch.object(gui.QMessageBox, "critical") as error_dialog:
+            self.window._import_converter_to_ssh()
+
+        error_dialog.assert_called_once()
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "")
+        self.assertEqual(self.window.config_commands_edit.toPlainText(), "")
+
+    def test_config_converter_exports_plain_and_sectioned_files(self):
+        self.window._ensure_converter_ui()
+        self.window.converter_source_edit.setPlainText(
+            "show version\nhostname EDGE-01\n"
+        )
+        self.window._convert_converter_source()
+        plain_path = self.base / "converted.cfg"
+        ssh_path = self.base / "converted.txt"
+
+        with (
+            patch.object(
+                self.window, "_choose_converter_export_format", return_value="plain"
+            ),
+            patch.object(
+                self.window,
+                "_select_converter_export_file",
+                return_value=plain_path,
+            ),
+        ):
+            self.window._export_converter_output()
+
+        with (
+            patch.object(
+                self.window, "_choose_converter_export_format", return_value="ssh"
+            ),
+            patch.object(
+                self.window,
+                "_select_converter_export_file",
+                return_value=ssh_path,
+            ),
+        ):
+            self.window._export_converter_output()
+
+        self.assertEqual(
+            plain_path.read_text(encoding="utf-8"),
+            "display version\nsysname EDGE-01",
+        )
+        self.assertEqual(
+            ssh_path.read_text(encoding="utf-8"),
+            "[exec]\ndisplay version\n\n[config]\nsysname EDGE-01\n",
+        )
+
+    def test_config_converter_imports_source_file_without_converting(self):
+        self.window._ensure_converter_ui()
+        source_path = self.base / "source.cfg"
+        source_path.write_text("show version\n", encoding="utf-8")
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            return_value=(str(source_path), "Configuration files (*.cfg *.txt)"),
+        ):
+            self.window._import_converter_source()
+
+        self.assertEqual(
+            self.window.converter_source_edit.toPlainText(), "show version\n"
+        )
+        self.assertEqual(self.window.converter_output_edit.toPlainText(), "")
+        self.assertEqual(self.window._last_converter_import, str(source_path))
+
+    def test_config_converter_stays_open_when_native_import_is_cancelled(self):
+        self.window.show()
+        self.window._open_config_converter()
+        self.app.processEvents()
+        self.assertTrue(self.window.converter_dialog.isVisible())
+
+        def cancel_and_hide_parent(*_args):
+            self.window.converter_dialog.hide()
+            return "", ""
+
+        with patch.object(
+            gui.QFileDialog,
+            "getOpenFileName",
+            side_effect=cancel_and_hide_parent,
+        ):
+            self.window._import_converter_source()
+        self.app.processEvents()
+
+        self.assertTrue(self.window.converter_dialog.isVisible())
+        self.assertEqual(self.window.converter_source_edit.toPlainText(), "")
+
+    def test_config_converter_replace_and_cancel_are_explicit(self):
+        self.window.exec_commands_edit.setPlainText("show clock")
+        self.window.config_commands_edit.setPlainText("hostname OLD")
+        self.window._ensure_converter_ui()
+        self.window.converter_source_edit.setPlainText("show version\n")
+        self.window._convert_converter_source()
+
+        with patch.object(
+            self.window, "_choose_converter_import_mode", return_value=None
+        ):
+            self.window._import_converter_to_ssh()
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "show clock")
+        self.assertEqual(
+            self.window.config_commands_edit.toPlainText(), "hostname OLD"
+        )
+
+        with patch.object(
+            self.window, "_choose_converter_import_mode", return_value="replace"
+        ):
+            self.window._import_converter_to_ssh()
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "display version")
+        self.assertEqual(self.window.config_commands_edit.toPlainText(), "")
+
+    def test_config_converter_stale_source_blocks_handoff(self):
+        self.window._ensure_converter_ui()
+        self.window.converter_source_edit.setPlainText("show version\n")
+        self.window._convert_converter_source()
+        self.window.converter_source_edit.appendPlainText("show clock detail")
+
+        with patch.object(gui.QMessageBox, "critical") as error_dialog:
+            self.window._import_converter_to_ssh()
+
+        error_dialog.assert_called_once()
+        self.assertIn("Stale conversion", error_dialog.call_args.args)
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "")
+
+    def test_config_converter_switches_with_application_theme(self):
+        self.window._ensure_converter_ui()
+
+        self.window.theme_light_action.trigger()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.converter_source_edit.palette().color(QPalette.ColorRole.Base),
+            QColor("#ffffff"),
+        )
+        self.assertEqual(
+            self.window.converter_issue_table.palette().color(QPalette.ColorRole.Text),
+            QColor("#202124"),
+        )
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.converter_source_edit.palette().color(QPalette.ColorRole.Base),
+            QColor("#151515"),
+        )
+        self.assertEqual(
+            self.window.converter_output_edit.palette().color(QPalette.ColorRole.Text),
+            QColor("#f1f3f4"),
+        )
+        self.assertEqual(self.window.converter_issue_table.styleSheet(), "")
 
     def test_command_dictionary_search_filters_count_and_details(self):
         self.window._ensure_dictionary_ui()
@@ -1616,14 +1913,17 @@ class MainWindowTests(unittest.TestCase):
     def test_close_stops_results_attention_timer(self):
         self.window._request_results_attention()
         self.window._open_command_dictionary()
+        self.window._open_config_converter()
         self.assertTrue(self.window.results_attention_timer.isActive())
         self.assertFalse(self.window.dictionary_dialog.isHidden())
+        self.assertFalse(self.window.converter_dialog.isHidden())
 
         self.window.close()
         self.app.processEvents()
 
         self.assertFalse(self.window.results_attention_timer.isActive())
         self.assertTrue(self.window.dictionary_dialog.isHidden())
+        self.assertTrue(self.window.converter_dialog.isHidden())
 
     def test_future_schedule_arms_idle_sleep_prevention(self):
         prepared = runner.prepare_run(
