@@ -45,7 +45,10 @@ progress never displays literal commands. Reports default to
 Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
 Failed-device output files include the sanitized exception message, with known
-connection secrets redacted.
+connection secrets redacted. Failed results also show an operational category,
+such as Connectivity, Authentication, Privilege, Command Rejected, or Command
+Timeout. The category summarizes the failure; the sanitized result and
+transcript remain the detailed diagnostic record.
 
 ### Credential profiles
 
@@ -72,16 +75,19 @@ The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
 earlier ready work. Use **Schedule Run** to select a future local date from the
-calendar and a separate time field; the dialog shows a readable schedule
-preview before submission. Future jobs do not block ready jobs, and batches scheduled for the same
-time run in the visible queue order.
+calendar, a time, and a required latest-start deadline. New schedules default
+to a one-hour start window. A batch may begin at the deadline, but it becomes
+**Expired** if it has not started after that time. Expiry never stops work that
+is already running. Future jobs do not block ready jobs, and batches scheduled
+for the same time run in visible queue order.
 
-The **Queue** tab shows order, device and command counts, schedule, status, and
-result. Pending jobs can be moved, edited, rescheduled, retried, or removed.
-Cancelled and completed history entries can also be removed; removing an entry
-never deletes its transcripts, summary, or output directory. **Clear Completed**
-removes all successful, partially failed, failed, and cancelled history entries
-at once while leaving running, queued, and scheduled batches untouched.
+The **Queue** tab shows order, batch name, device and command counts, schedule,
+latest start, status, and result. Pending jobs can be moved, edited,
+rescheduled, retried, or removed. Cancelled, completed, and expired Queue
+entries can also be removed; removing an entry never deletes its transcripts,
+summary, or output directory. **Clear Completed** removes all successful,
+partially failed, failed, cancelled, and expired Queue entries at once while
+leaving running, queued, and scheduled batches untouched.
 Editing loads the encrypted snapshot into the normal form and requires fresh
 validation and confirmation before replacing it. Double-click a queue row to
 open its per-device results. **Pause Queue** stops new batches from starting;
@@ -89,15 +95,25 @@ open its per-device results. **Pause Queue** stops new batches from starting;
 pauses the queue. A batch with device failures does not prevent the next ready
 batch from starting.
 
+For a completed batch with device failures, **Retry Failed Devices…** creates an
+editable SSH-form draft containing only failed devices and the original
+commands. Successful and cancelled devices are excluded. The app reloads the
+original named profile when it still exists; otherwise it clears credentials
+and selects Manual. Review and validate the draft before submitting it as a new
+batch. No retry is queued or executed automatically.
+
 Queued device addresses, commands, output settings, and credentials are stored
 as a complete macOS Keychain payload. Ordinary application settings contain
-only an opaque job ID, ordering, schedule, device type, and counts. The Keychain
-payload is deleted when the batch completes, is cancelled, or is removed. A
+only an opaque job ID, batch name, ordering, schedule window, friendly profile
+label, device type, and counts. The Keychain payload is deleted when the batch
+completes, is cancelled, expires, or is removed. A
 profile is snapshotted when submitted, so later changes to its `.env` do not
 change the queued batch.
 
-Queued work is restored after reopening, but the queue starts paused. An
-overdue schedule becomes **Ready** and requires **Resume Queue**. A batch that
+Queued work is restored after reopening, but the queue starts paused. A new
+schedule restored after its latest-start deadline becomes **Expired** and its
+Keychain payload is deleted. Older saved schedules that predate deadlines keep
+their legacy no-expiry behavior. A batch that
 was running when the app stopped becomes **Interrupted** and must be retried
 manually because some commands may already have run. The app prevents idle
 system sleep while an unpaused schedule is armed or a run is active, but it
@@ -127,7 +143,9 @@ and filterable records, and 100-row pagination. Filters include date range,
 status, manual or scheduled source, device type, and credential-profile label.
 Selecting a record can load its `summary.csv` into **Device Results**, open its
 output or summary, or show its encrypted command snapshot after a sensitive
-content warning.
+content warning. **Retry Failed Devices…** can also create a failed-only draft
+from a historical summary and encrypted command snapshot; credentials are
+reloaded from an existing named profile rather than History.
 
 Audit metadata is stored in an owner-private SQLite database at the app's
 macOS Application Support location. The database contains batch metadata,

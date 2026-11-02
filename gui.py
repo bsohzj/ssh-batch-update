@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from uuid import uuid4
 
 from PySide6.QtCore import (
@@ -119,11 +119,15 @@ from history import (
 from run_commands import (
     BatchResult,
     CancellationToken,
+    Command,
     ConfigurationError,
+    DeviceResult,
     PreparedRun,
     ProgressEvent,
     RunRequest,
     Settings,
+    failure_category_label,
+    format_batch_summary,
     load_settings,
     parse_commands,
     parse_inline_commands,
@@ -574,19 +578,19 @@ class BatchWorker(QObject):
 
 
 class ScheduleDialog(QDialog):
-    """Select one future local date and time with minute precision."""
+    """Select a scheduled start and required latest-start deadline."""
 
     def __init__(
         self,
         initial_utc: Optional[datetime] = None,
+        initial_latest_start_utc: Optional[datetime] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Schedule Run")
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        label = QLabel("Run this batch at:")
-        layout.addWidget(label)
+        layout.addWidget(QLabel("Run this batch during this start window:"))
 
         minimum = QDateTime.currentDateTime().addSecs(60)
         if initial_utc is not None:
@@ -598,6 +602,17 @@ class ScheduleDialog(QDialog):
             selected = selected.addSecs(60 - selected.time().second())
         selected.setTime(selected.time().addMSecs(-selected.time().msec()))
 
+        window_seconds = 3600
+        if initial_utc is not None and initial_latest_start_utc is not None:
+            window_seconds = max(
+                60,
+                int((initial_latest_start_utc - initial_utc).total_seconds()),
+            )
+        latest = selected.addSecs(window_seconds)
+        self._latest_manually_edited = False
+        self._updating_schedule = False
+        self._last_start_local = selected
+
         fields = QFormLayout()
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
@@ -607,14 +622,26 @@ class ScheduleDialog(QDialog):
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("h:mm AP")
         self.time_edit.setTime(selected.time())
+        self.latest_date_edit = QDateEdit()
+        self.latest_date_edit.setCalendarPopup(True)
+        self.latest_date_edit.setDisplayFormat("ddd, d MMM yyyy")
+        self.latest_date_edit.setMinimumDate(QDateTime.currentDateTime().date())
+        self.latest_date_edit.setDate(latest.date())
+        self.latest_time_edit = QTimeEdit()
+        self.latest_time_edit.setDisplayFormat("h:mm AP")
+        self.latest_time_edit.setTime(latest.time())
         fields.addRow("Date", self.date_edit)
         fields.addRow("Time", self.time_edit)
+        fields.addRow("Latest start date", self.latest_date_edit)
+        fields.addRow("Latest start time", self.latest_time_edit)
         layout.addLayout(fields)
 
         self.preview_label = QLabel()
         self.preview_label.setWordWrap(True)
-        self.date_edit.dateChanged.connect(self._update_preview)
-        self.time_edit.timeChanged.connect(self._update_preview)
+        self.date_edit.dateChanged.connect(self._start_changed)
+        self.time_edit.timeChanged.connect(self._start_changed)
+        self.latest_date_edit.dateChanged.connect(self._latest_changed)
+        self.latest_time_edit.timeChanged.connect(self._latest_changed)
         layout.addWidget(self.preview_label)
         self._update_preview()
 
@@ -629,15 +656,48 @@ class ScheduleDialog(QDialog):
     def _selected_local(self) -> QDateTime:
         return QDateTime(self.date_edit.date(), self.time_edit.time())
 
+    def _latest_local(self) -> QDateTime:
+        return QDateTime(self.latest_date_edit.date(), self.latest_time_edit.time())
+
+    @Slot()
+    def _start_changed(self) -> None:
+        selected = self._selected_local()
+        if not self._latest_manually_edited:
+            delta = self._last_start_local.secsTo(selected)
+            self._updating_schedule = True
+            try:
+                shifted = self._latest_local().addSecs(delta)
+                self.latest_date_edit.setDate(shifted.date())
+                self.latest_time_edit.setTime(shifted.time())
+            finally:
+                self._updating_schedule = False
+        self._last_start_local = selected
+        self._update_preview()
+
+    @Slot()
+    def _latest_changed(self) -> None:
+        if not self._updating_schedule:
+            self._latest_manually_edited = True
+        self._update_preview()
+
     @Slot()
     def _update_preview(self) -> None:
         display = self._selected_local().toString(
             "dddd, d MMMM yyyy 'at' h:mm AP"
         )
-        self.preview_label.setText(f"Scheduled for {display}")
+        latest = self._latest_local().toString(
+            "dddd, d MMMM yyyy 'at' h:mm AP"
+        )
+        self.preview_label.setText(f"Scheduled for {display}\nMust start by {latest}")
 
     def selected_utc(self) -> datetime:
         local = self._selected_local().toPython().replace(second=0, microsecond=0)
+        if local.tzinfo is None:
+            local = local.astimezone()
+        return local.astimezone(timezone.utc)
+
+    def latest_start_utc(self) -> datetime:
+        local = self._latest_local().toPython().replace(second=0, microsecond=0)
         if local.tzinfo is None:
             local = local.astimezone()
         return local.astimezone(timezone.utc)
@@ -646,6 +706,13 @@ class ScheduleDialog(QDialog):
     def _accept_if_future(self) -> None:
         if self.selected_utc() <= datetime.now(timezone.utc):
             QMessageBox.critical(self, "Invalid schedule", "Choose a future date and time.")
+            return
+        if self.latest_start_utc() <= self.selected_utc():
+            QMessageBox.critical(
+                self,
+                "Invalid schedule",
+                "Latest start must be later than the scheduled time.",
+            )
             return
         self.accept()
 
@@ -790,6 +857,11 @@ class MainWindow(QMainWindow):
         self._update_queue_controls()
         if self._history_startup_warning:
             self.validation_label.setText(self._history_startup_warning)
+        if self.queue_controller.cleanup_warnings:
+            self.validation_label.setText(
+                "Keychain cleanup warning: "
+                + " ".join(self.queue_controller.cleanup_warnings)
+            )
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -981,9 +1053,12 @@ class MainWindow(QMainWindow):
         self.results_tabs = QTabWidget()
         queue_tab = QWidget()
         queue_layout = QVBoxLayout(queue_tab)
-        self.queue_table = QTableWidget(0, 8)
+        self.queue_table = QTableWidget(0, 9)
         self.queue_table.setHorizontalHeaderLabels(
-            ["Order", "Batch", "Device Type", "Devices", "Commands", "Run At", "Status", "Result"]
+            [
+                "Order", "Batch", "Device Type", "Devices", "Commands",
+                "Run At", "Latest Start", "Status", "Result",
+            ]
         )
         self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -992,10 +1067,10 @@ class MainWindow(QMainWindow):
         self.queue_table.itemSelectionChanged.connect(self._queue_selection_changed)
         self.queue_table.cellDoubleClicked.connect(self._queue_double_clicked)
         queue_header = self.queue_table.horizontalHeader()
-        for column in (0, 2, 3, 4, 5, 6):
+        for column in (0, 2, 3, 4, 5, 6, 7):
             queue_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         queue_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        queue_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        queue_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         queue_layout.addWidget(self.queue_table, 1)
 
         queue_actions = QGridLayout()
@@ -1005,6 +1080,7 @@ class MainWindow(QMainWindow):
         self.edit_batch_button = QPushButton("Edit Batch")
         self.reschedule_button = QPushButton("Reschedule…")
         self.retry_button = QPushButton("Retry")
+        self.retry_failed_button = QPushButton("Retry Failed Devices…")
         self.remove_batch_button = QPushButton("Remove")
         self.clear_completed_button = QPushButton("Clear Completed")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
@@ -1013,6 +1089,7 @@ class MainWindow(QMainWindow):
         self.edit_batch_button.clicked.connect(self.edit_selected_batch)
         self.reschedule_button.clicked.connect(self.reschedule_selected_batch)
         self.retry_button.clicked.connect(self.retry_selected_batch)
+        self.retry_failed_button.clicked.connect(self.retry_failed_queue_batch)
         self.remove_batch_button.clicked.connect(self.remove_selected_batch)
         self.clear_completed_button.clicked.connect(self.clear_completed_batches)
         for index, button in enumerate(
@@ -1023,6 +1100,7 @@ class MainWindow(QMainWindow):
                 self.edit_batch_button,
                 self.reschedule_button,
                 self.retry_button,
+                self.retry_failed_button,
                 self.remove_batch_button,
                 self.clear_completed_button,
             )
@@ -1032,9 +1110,9 @@ class MainWindow(QMainWindow):
 
         device_results_tab = QWidget()
         device_results_layout = QVBoxLayout(device_results_tab)
-        self.device_table = QTableWidget(0, 5)
+        self.device_table = QTableWidget(0, 6)
         self.device_table.setHorizontalHeaderLabels(
-            ["Device", "Status", "Stage / Line", "Result", "Output"]
+            ["Device", "Status", "Category", "Stage / Line", "Result", "Output"]
         )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -1043,8 +1121,9 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         device_results_layout.addWidget(self.device_table, 1)
 
         progress_grid = QGridLayout()
@@ -2095,9 +2174,10 @@ class MainWindow(QMainWindow):
             self._rows[entry.address] = row
             self._set_cell(row, 0, entry.address)
             self._set_cell(row, 1, "Invalid" if entry.error else "Ready")
-            self._set_cell(row, 2, "")
-            self._set_cell(row, 3, entry.error)
-            self._set_cell(row, 4, "")
+            self._set_cell(row, 2, "Input Validation" if entry.error else "")
+            self._set_cell(row, 3, "Input validation" if entry.error else "")
+            self._set_cell(row, 4, entry.error)
+            self._set_cell(row, 5, "")
         self.progress_bar.setRange(0, max(1, len(prepared.entries)))
         self.progress_bar.setValue(0)
         self.status_label.setText("Validated")
@@ -2111,7 +2191,14 @@ class MainWindow(QMainWindow):
 
     def _initialize_job_rows(self, job_id: str, prepared: PreparedRun) -> None:
         self._job_rows[job_id] = [
-            [entry.address, "Invalid" if entry.error else "Ready", "", entry.error, ""]
+            [
+                entry.address,
+                "Invalid" if entry.error else "Ready",
+                "Input Validation" if entry.error else "",
+                "Input validation" if entry.error else "",
+                entry.error,
+                "",
+            ]
             for entry in prepared.entries
         ]
         self._job_progress[job_id] = (
@@ -2171,20 +2258,20 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.device_table.setItem(row, column, item)
         item.setText(value)
-        if column == 3:
+        if column == 4:
             item.setToolTip("Double-click to view the full result" if value else "")
-        elif column == 4:
+        elif column == 5:
             item.setToolTip("Double-click to open this output file" if value else "")
 
     @Slot(int, int)
     def handle_table_double_click(self, row: int, column: int) -> None:
-        if column == 3:
+        if column == 4:
             self.show_result_details(row)
-        elif column == 4:
+        elif column == 5:
             self.open_transcript_at(row, column)
 
     def show_result_details(self, row: int) -> None:
-        result_item = self.device_table.item(row, 3)
+        result_item = self.device_table.item(row, 4)
         if result_item is None or not result_item.text().strip():
             return
 
@@ -2210,7 +2297,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int)
     def open_transcript_at(self, row: int, column: int) -> None:
-        if column != 4:
+        if column != 5:
             return
         item = self.device_table.item(row, column)
         if item is None or not item.text().strip():
@@ -2248,18 +2335,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def start_run(self) -> None:
-        self._submit_batch(scheduled_utc=None, request_dispatch=True)
+        self._submit_batch(
+            scheduled_utc=None,
+            latest_start_utc=None,
+            request_dispatch=True,
+        )
 
     @Slot()
     def schedule_batch(self) -> None:
         dialog = ScheduleDialog(parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._submit_batch(scheduled_utc=dialog.selected_utc(), request_dispatch=False)
+        self._submit_batch(
+            scheduled_utc=dialog.selected_utc(),
+            latest_start_utc=dialog.latest_start_utc(),
+            request_dispatch=False,
+        )
 
     def _submit_batch(
         self,
         scheduled_utc: Optional[datetime],
+        latest_start_utc: Optional[datetime],
         request_dispatch: bool,
     ) -> None:
         if not self.validate_inputs(show_success=False) or self._prepared is None:
@@ -2271,6 +2367,8 @@ class MainWindow(QMainWindow):
             schedule_text = (
                 "\nScheduled for "
                 f"{scheduled_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
+                "Must start by "
+                f"{latest_start_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
             )
         answer = QMessageBox.warning(
             self,
@@ -2293,7 +2391,12 @@ class MainWindow(QMainWindow):
                 prepared,
                 self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
             )
-            job = self.queue_controller.add(payload, prepared, scheduled_utc)
+            job = self.queue_controller.add(
+                payload,
+                prepared,
+                scheduled_utc,
+                latest_start_utc,
+            )
         except (QueueStorageError, OSError) as exc:
             QMessageBox.critical(self, "Could not queue batch", str(exc))
             return
@@ -2312,7 +2415,11 @@ class MainWindow(QMainWindow):
     def _queue_tick(self) -> None:
         if self._closing:
             return
-        self.queue_controller.refresh_due()
+        warnings = self.queue_controller.refresh_due()
+        if warnings:
+            self.validation_label.setText(
+                "Keychain cleanup warning: " + " ".join(warnings)
+            )
         self._refresh_queue_table(select_job_id=self._selected_job_id)
         future_armed = any(
             job.status == "scheduled" for job in self.queue_controller.pending_jobs()
@@ -2362,6 +2469,7 @@ class MainWindow(QMainWindow):
             batch_name=job.name,
             created_utc=job.created_utc,
             scheduled_utc=job.scheduled_utc,
+            latest_start_utc=job.latest_start_utc,
             started_utc=self._clock(),
             completed_utc=None,
             source="scheduled" if job.scheduled_utc else "manual",
@@ -2494,21 +2602,22 @@ class MainWindow(QMainWindow):
         elif event.kind == "device_status":
             self._set_cell(row, 1, event.status.title())
             if event.section:
-                self._set_cell(row, 2, event.section)
+                self._set_cell(row, 3, event.section)
         elif event.kind == "command_started":
             self._set_cell(row, 1, "Running")
-            self._set_cell(row, 2, f"{event.section} / {event.line_number}")
+            self._set_cell(row, 3, f"{event.section} / {event.line_number}")
         elif event.kind == "device_finished":
             status = event.status.title()
             if self._operation == "connection_test" and event.status == "success":
                 status = "Passed"
             self._set_cell(row, 1, status)
+            self._set_cell(row, 2, failure_category_label(event.failure_category))
             if event.line_number:
-                self._set_cell(row, 2, f"{event.section} / {event.line_number}")
+                self._set_cell(row, 3, f"{event.section} / {event.line_number}")
             elif event.section:
-                self._set_cell(row, 2, event.section)
-            self._set_cell(row, 3, event.message or status)
-            self._set_cell(row, 4, event.transcript_file)
+                self._set_cell(row, 3, event.section)
+            self._set_cell(row, 4, event.message or status)
+            self._set_cell(row, 5, event.transcript_file)
             self.progress_bar.setValue(event.index)
 
     def _handle_job_progress(self, job_id: str, event: ProgressEvent) -> None:
@@ -2524,29 +2633,35 @@ class MainWindow(QMainWindow):
         elif event.kind == "device_status":
             self._set_job_cell(job_id, event.address, 1, event.status.title())
             if event.section:
-                self._set_job_cell(job_id, event.address, 2, event.section)
+                self._set_job_cell(job_id, event.address, 3, event.section)
         elif event.kind == "command_started":
             self._set_job_cell(job_id, event.address, 1, "Running")
             self._set_job_cell(
                 job_id,
                 event.address,
-                2,
+                3,
                 f"{event.section} / {event.line_number}",
             )
         elif event.kind == "device_finished":
             shown_status = event.status.title()
             self._set_job_cell(job_id, event.address, 1, shown_status)
+            self._set_job_cell(
+                job_id,
+                event.address,
+                2,
+                failure_category_label(event.failure_category),
+            )
             if event.line_number:
                 self._set_job_cell(
                     job_id,
                     event.address,
-                    2,
+                    3,
                     f"{event.section} / {event.line_number}",
                 )
             elif event.section:
-                self._set_job_cell(job_id, event.address, 2, event.section)
-            self._set_job_cell(job_id, event.address, 3, event.message or shown_status)
-            self._set_job_cell(job_id, event.address, 4, event.transcript_file)
+                self._set_job_cell(job_id, event.address, 3, event.section)
+            self._set_job_cell(job_id, event.address, 4, event.message or shown_status)
+            self._set_job_cell(job_id, event.address, 5, event.transcript_file)
             value = event.index
         self._job_progress[job_id] = (value, maximum, status_text, totals)
         if self._selected_job_id == job_id:
@@ -2578,10 +2693,7 @@ class MainWindow(QMainWindow):
                 if result.failures
                 else "succeeded"
             )
-            result_text = (
-                f"{result.successes} succeeded, {result.failures} failed, "
-                f"{result.cancelled} cancelled"
-            )
+            result_text = format_batch_summary(result)
             self._finalize_audit_record(
                 job_id, terminal_status, result_text, result
             )
@@ -2605,8 +2717,7 @@ class MainWindow(QMainWindow):
         self._batch_result = result
         if self._operation == "connection_test":
             self.totals_label.setText(
-                f"{result.successes} passed, {result.failures} failed, "
-                f"{result.cancelled} cancelled"
+                format_batch_summary(result, "passed")
             )
             self.status_label.setText(
                 "Connection test complete"
@@ -2615,8 +2726,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.totals_label.setText(
-                f"{result.successes} succeeded, {result.failures} failed, "
-                f"{result.cancelled} cancelled"
+                format_batch_summary(result)
             )
             self.status_label.setText(
                 "Run complete" if not result.cancelled else "Run cancelled"
@@ -2695,6 +2805,11 @@ class MainWindow(QMainWindow):
                     if job.scheduled_utc
                     else "Ready now"
                 )
+                latest_start = (
+                    job.latest_start_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+                    if job.latest_start_utc
+                    else "No expiry (legacy)" if job.scheduled_utc else "—"
+                )
                 status = job.status.replace("_", " ").title()
                 values = (
                     order_item,
@@ -2706,6 +2821,7 @@ class MainWindow(QMainWindow):
                     ),
                     QTableWidgetItem(str(job.command_count)),
                     QTableWidgetItem(scheduled),
+                    QTableWidgetItem(latest_start),
                     QTableWidgetItem(status),
                     QTableWidgetItem(job.result),
                 )
@@ -2747,6 +2863,10 @@ class MainWindow(QMainWindow):
         self.edit_batch_button.setEnabled(editable and self._editing_job_id is None)
         self.reschedule_button.setEnabled(editable)
         self.retry_button.setEnabled(bool(job and job.status in {"blocked", "interrupted"}))
+        result = self._job_results.get(job.job_id) if job else None
+        self.retry_failed_button.setEnabled(
+            bool(result and any(item.status == "failed" for item in result.results))
+        )
         self.remove_batch_button.setEnabled(bool(job and job.status != "running"))
         self.clear_completed_button.setEnabled(
             bool(self.queue_controller.completed_jobs())
@@ -2775,6 +2895,9 @@ class MainWindow(QMainWindow):
     def edit_selected_batch(self) -> None:
         job_id = self._selected_queue_job_id()
         if not job_id:
+            return
+        job = self.queue_controller.job(job_id)
+        if job is None:
             return
         if any(
             (
@@ -2852,7 +2975,11 @@ class MainWindow(QMainWindow):
                 self._prepared,
                 self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
             )
-            self.queue_controller.replace_payload(job_id, payload, self._prepared)
+            self.queue_controller.replace_payload(
+                job_id,
+                payload,
+                self._prepared,
+            )
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not save batch", str(exc))
             return
@@ -2881,11 +3008,19 @@ class MainWindow(QMainWindow):
         job = self.queue_controller.job(job_id)
         if job is None:
             return
-        dialog = ScheduleDialog(job.scheduled_utc, self)
+        dialog = ScheduleDialog(
+            job.scheduled_utc,
+            job.latest_start_utc,
+            self,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.queue_controller.reschedule(job.job_id, dialog.selected_utc())
+            self.queue_controller.reschedule(
+                job.job_id,
+                dialog.selected_utc(),
+                dialog.latest_start_utc(),
+            )
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not reschedule batch", str(exc))
             return
@@ -2919,6 +3054,132 @@ class MainWindow(QMainWindow):
             return
         self._refresh_queue_table(select_job_id=job.job_id)
         QTimer.singleShot(0, self._queue_tick)
+
+    @Slot()
+    def retry_failed_queue_batch(self) -> None:
+        job_id = self._selected_queue_job_id()
+        job = self.queue_controller.job(job_id)
+        result = self._job_results.get(job_id or "")
+        prepared = self._job_prepared.get(job_id or "")
+        if job is None or result is None or prepared is None:
+            QMessageBox.critical(
+                self,
+                "Retry unavailable",
+                "The completed batch details are no longer available in this session.",
+            )
+            return
+        self._create_retry_draft(
+            profile_label=job.profile_label,
+            device_type=job.device_type,
+            output_dir=prepared.request.output_dir,
+            commands=prepared.commands,
+            results=result.results,
+        )
+
+    @Slot()
+    def retry_failed_history_batch(self) -> None:
+        record = self._selected_history_record()
+        if record is None:
+            return
+        try:
+            results = read_summary(Path(record.summary_path))
+            snapshot = self.history_command_store.get(record.job_id)
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Retry unavailable", str(exc))
+            return
+        output_dir = (
+            Path(record.run_directory).parent
+            if record.run_directory
+            else Path(self.output_edit.text().strip()).expanduser()
+        )
+        self._create_retry_draft(
+            profile_label=record.profile_label,
+            device_type=record.device_type,
+            output_dir=output_dir,
+            commands=snapshot.commands,
+            results=results,
+        )
+
+    def _create_retry_draft(
+        self,
+        *,
+        profile_label: str,
+        device_type: str,
+        output_dir: Path,
+        commands: Sequence[Command],
+        results: Sequence[DeviceResult],
+    ) -> None:
+        failed = tuple(result for result in results if result.status == "failed")
+        if not failed:
+            QMessageBox.critical(
+                self,
+                "Retry unavailable",
+                "This batch has no failed devices to retry.",
+            )
+            return
+        has_form_content = any(
+            (
+                self.inventory_text_edit.toPlainText().strip(),
+                self.exec_commands_edit.toPlainText().strip(),
+                self.config_commands_edit.toPlainText().strip(),
+                self.username_edit.text(),
+                self.password_edit.text(),
+            )
+        )
+        if has_form_content or self._editing_job_id is not None:
+            answer = QMessageBox.question(
+                self,
+                "Replace current form?",
+                "Creating this retry draft will replace the current form contents.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        exec_text = "\n".join(
+            command.text for command in commands if command.section == "exec"
+        )
+        config_text = "\n".join(
+            command.text for command in commands if command.section == "config"
+        )
+        matching_profile = next(
+            (profile for profile in self.profile_store.profiles() if profile.name == profile_label),
+            None,
+        )
+
+        self._loading_settings = True
+        try:
+            self.inventory_text_edit.setPlainText(
+                "\n".join(result.address for result in failed)
+            )
+            self.exec_commands_edit.setPlainText(exec_text)
+            self.config_commands_edit.setPlainText(config_text)
+            self.device_type_combo.setCurrentText(device_type)
+            self.output_edit.setText(str(output_dir))
+        finally:
+            self._loading_settings = False
+
+        self._editing_job_id = None
+        self._editing_connection_settings = None
+        self.save_edit_button.hide()
+        self.cancel_edit_button.hide()
+        if matching_profile is not None:
+            self._refresh_profile_combo(matching_profile.profile_id)
+            if not self._load_profile_by_id(matching_profile.profile_id, startup=False):
+                self._switch_to_manual(clear_credentials=True)
+        else:
+            self._switch_to_manual(clear_credentials=True)
+        self._selected_job_id = None
+        self._prepared = None
+        self._set_validated(False)
+        self.validation_label.setText(
+            f"Retry draft created for {len(failed)} failed device(s). "
+            "Review and validate before running."
+        )
+        self.main_tabs.setCurrentWidget(self.ssh_tab)
+        self.results_tabs.setCurrentIndex(0)
+        self._update_queue_controls()
 
     @Slot()
     def remove_selected_batch(self) -> None:
@@ -2957,7 +3218,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Clear completed runs?",
-            f"Remove {len(completed)} completed run(s) from the queue history?\n\n"
+            f"Remove {len(completed)} completed or expired queue entry/entries?\n\n"
             "Running, queued, and scheduled batches will remain. Output files, "
             "transcripts, and summaries will not be deleted.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -3600,6 +3861,7 @@ class MainWindow(QMainWindow):
         actions = QGridLayout()
         self.history_results_button = QPushButton("View Device Results")
         self.history_commands_button = QPushButton("View Commands")
+        self.history_retry_failed_button = QPushButton("Retry Failed Devices…")
         self.history_output_button = QPushButton("Open Output Folder")
         self.history_summary_button = QPushButton("Open Summary")
         self.history_remove_button = QPushButton("Remove from History")
@@ -3607,6 +3869,7 @@ class MainWindow(QMainWindow):
         self.history_clear_button = QPushButton("Clear History")
         self.history_results_button.clicked.connect(self.view_history_results)
         self.history_commands_button.clicked.connect(self.view_history_commands)
+        self.history_retry_failed_button.clicked.connect(self.retry_failed_history_batch)
         self.history_output_button.clicked.connect(self.open_history_output)
         self.history_summary_button.clicked.connect(self.open_history_summary)
         self.history_remove_button.clicked.connect(self.remove_history_record)
@@ -3618,6 +3881,7 @@ class MainWindow(QMainWindow):
             (
                 self.history_results_button,
                 self.history_commands_button,
+                self.history_retry_failed_button,
                 self.history_output_button,
                 self.history_summary_button,
                 self.history_remove_button,
@@ -4161,6 +4425,9 @@ class MainWindow(QMainWindow):
         output_exists = bool(record and Path(record.run_directory).is_dir())
         self.history_results_button.setEnabled(summary_exists)
         self.history_commands_button.setEnabled(has_record)
+        self.history_retry_failed_button.setEnabled(
+            bool(summary_exists and record and record.failure_count > 0)
+        )
         self.history_output_button.setEnabled(output_exists)
         self.history_summary_button.setEnabled(summary_exists)
         self.history_remove_button.setEnabled(has_record)
@@ -4191,12 +4458,13 @@ class MainWindow(QMainWindow):
             self._rows[result.address] = row
             self._set_cell(row, 0, result.address)
             self._set_cell(row, 1, result.status.title())
+            self._set_cell(row, 2, failure_category_label(result.failure_category))
             stage = result.failed_section
             if result.failed_line:
                 stage = f"{stage} / {result.failed_line}" if stage else result.failed_line
-            self._set_cell(row, 2, stage)
-            self._set_cell(row, 3, result.error or result.status.title())
-            self._set_cell(row, 4, result.transcript_file)
+            self._set_cell(row, 3, stage)
+            self._set_cell(row, 4, result.error or result.status.title())
+            self._set_cell(row, 5, result.transcript_file)
         self._batch_result = BatchResult(
             results, Path(record.run_directory), Path(record.summary_path)
         )

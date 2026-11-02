@@ -16,7 +16,7 @@ from typing import Callable, Iterator, Optional, Protocol
 
 from PySide6.QtCore import QStandardPaths
 
-from run_commands import Command, DeviceResult
+from run_commands import Command, DeviceResult, FailureCategory
 
 
 HISTORY_COMMAND_SERVICE = "com.sg4291.sshbatchupdate.history.commands"
@@ -77,6 +77,7 @@ class HistoryRecord:
     valid_devices: int
     invalid_devices: int
     command_count: int
+    latest_start_utc: Optional[datetime] = None
     status: str = "running"
     success_count: int = 0
     failure_count: int = 0
@@ -277,6 +278,7 @@ class HistoryStore:
                     batch_name TEXT NOT NULL,
                     created_utc TEXT NOT NULL,
                     scheduled_utc TEXT NOT NULL DEFAULT '',
+                    latest_start_utc TEXT NOT NULL DEFAULT '',
                     started_utc TEXT NOT NULL,
                     completed_utc TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL,
@@ -295,13 +297,25 @@ class HistoryStore:
                 )
                 """
             )
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > 2:
+                raise HistoryError(
+                    f"Audit history schema version {version} is newer than this application supports."
+                )
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(history)")
+            }
+            if "latest_start_utc" not in columns:
+                connection.execute(
+                    "ALTER TABLE history ADD COLUMN latest_start_utc TEXT NOT NULL DEFAULT ''"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_started ON history(started_utc DESC)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_status ON history(status)"
             )
-            connection.execute("PRAGMA user_version = 1")
+            connection.execute("PRAGMA user_version = 2")
 
     def start(self, record: HistoryRecord) -> None:
         values = self._record_values(record)
@@ -557,6 +571,7 @@ class HistoryStore:
             "batch_name": record.batch_name,
             "created_utc": _iso(record.created_utc),
             "scheduled_utc": _iso(record.scheduled_utc),
+            "latest_start_utc": _iso(record.latest_start_utc),
             "started_utc": _iso(record.started_utc),
             "completed_utc": _iso(record.completed_utc),
             "source": record.source,
@@ -581,6 +596,7 @@ class HistoryStore:
             batch_name=str(row["batch_name"]),
             created_utc=_parse(row["created_utc"]),  # type: ignore[arg-type]
             scheduled_utc=_parse(row["scheduled_utc"]),
+            latest_start_utc=_parse(row["latest_start_utc"]),
             started_utc=_parse(row["started_utc"]),  # type: ignore[arg-type]
             completed_utc=_parse(row["completed_utc"]),
             source=str(row["source"]),
@@ -620,9 +636,17 @@ def read_summary(path: Path) -> tuple[DeviceResult, ...]:
             failed_command=row.get("failed_command", ""),
             transcript_file=row.get("transcript_file", ""),
             error=row.get("error", ""),
+            failure_category=_read_failure_category(row.get("failure_category", "")),
         )
         for row in rows
     )
+
+
+def _read_failure_category(value: str) -> Optional[FailureCategory]:
+    try:
+        return FailureCategory(value) if value else None
+    except ValueError:
+        return None
 
 
 def write_output_marker(record: HistoryRecord) -> None:

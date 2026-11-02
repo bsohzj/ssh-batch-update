@@ -241,7 +241,8 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.results_tabs.count(), 2)
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
-        self.assertEqual(self.window.queue_table.columnCount(), 8)
+        self.assertEqual(self.window.queue_table.columnCount(), 9)
+        self.assertEqual(self.window.device_table.columnCount(), 6)
         self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
         self.assertFalse(hasattr(self.window, "queue_button"))
@@ -1622,13 +1623,17 @@ class MainWindowTests(unittest.TestCase):
         )
         payload = batch_queue.BatchPayload.from_prepared(prepared, "Night Ops")
         scheduled = datetime.now(timezone.utc) + timedelta(hours=1)
-        job = self.window.queue_controller.add(payload, prepared, scheduled)
+        latest_start = scheduled + timedelta(hours=1)
+        job = self.window.queue_controller.add(
+            payload, prepared, scheduled, latest_start
+        )
 
         self.window._start_audit_record(job, payload, prepared)
 
         record = self.history_store.get(job.job_id)
         self.assertEqual(record.source, "scheduled")
         self.assertEqual(record.profile_label, "Night Ops")
+        self.assertEqual(record.latest_start_utc, latest_start)
         snapshot = self.history_commands.get(job.job_id)
         self.assertEqual(
             [(command.section, command.text) for command in snapshot.commands],
@@ -1727,10 +1732,17 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertTrue(dialog.date_edit.isVisible())
         self.assertTrue(dialog.time_edit.isVisible())
+        self.assertTrue(dialog.latest_date_edit.isVisible())
+        self.assertTrue(dialog.latest_time_edit.isVisible())
         self.assertTrue(dialog.date_edit.calendarPopup())
         self.assertEqual(dialog.date_edit.displayFormat(), "ddd, d MMM yyyy")
         self.assertEqual(dialog.time_edit.displayFormat(), "h:mm AP")
         self.assertTrue(dialog.preview_label.text().startswith("Scheduled for "))
+        self.assertIn("Must start by", dialog.preview_label.text())
+        self.assertEqual(
+            int((dialog.latest_start_utc() - dialog.selected_utc()).total_seconds()),
+            3600,
+        )
 
         dialog.date_edit.setDate(dialog.date_edit.date().addDays(1))
         dialog.time_edit.setTime(QTime(18, 30))
@@ -1738,6 +1750,10 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertIn("6:30 PM", dialog.preview_label.text())
         self.assertGreater(dialog.selected_utc(), datetime.now(timezone.utc))
+        self.assertEqual(
+            int((dialog.latest_start_utc() - dialog.selected_utc()).total_seconds()),
+            3600,
+        )
 
         dialog.close()
 
@@ -1946,7 +1962,10 @@ class MainWindowTests(unittest.TestCase):
         )
         scheduled = datetime.now(timezone.utc) + timedelta(hours=1)
         self.window.queue_controller.add(
-            batch_queue.BatchPayload.from_prepared(prepared), prepared, scheduled
+            batch_queue.BatchPayload.from_prepared(prepared),
+            prepared,
+            scheduled,
+            scheduled + timedelta(hours=1),
         )
         self.window.queue_controller.paused = False
 
@@ -1954,6 +1973,33 @@ class MainWindowTests(unittest.TestCase):
             self.window._queue_tick()
 
         set_required.assert_called_with(True)
+
+    def test_expired_schedule_stays_in_queue_without_creating_history(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        now = datetime.now(timezone.utc)
+        scheduled = now + timedelta(minutes=5)
+        job = self.window.queue_controller.add(
+            batch_queue.BatchPayload.from_prepared(prepared),
+            prepared,
+            scheduled,
+            scheduled + timedelta(minutes=30),
+        )
+        self.window.queue_controller.clock = lambda: scheduled + timedelta(minutes=31)
+        self.window.queue_controller.paused = False
+
+        with patch.object(self.window, "_start_worker") as start_worker:
+            self.window._queue_tick()
+
+        expired = self.window.queue_controller.job(job.job_id)
+        self.assertEqual(expired.status, "expired")
+        self.assertIn("Not started", expired.result)
+        self.assertNotIn(job.job_id, self.secret_store.values)
+        self.assertIsNone(self.history_store.get(job.job_id))
+        start_worker.assert_not_called()
 
     def test_queued_completion_updates_status_and_deletes_secret(self):
         prepared = runner.prepare_run(
@@ -1979,6 +2025,88 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertNotIn(job.job_id, self.secret_store.values)
         self.assertEqual(self.window._job_results[job.job_id].summary_path, summary)
+
+    def test_retry_failed_queue_batch_creates_unvalidated_failed_only_draft(self):
+        prepared = runner.prepare_run(
+            self._valid_request("huawei", "192.0.2.1\nbad-address\n192.0.2.2"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Missing Profile")
+        job = self.window.queue_controller.add(
+            payload,
+            prepared,
+        )
+        result = runner.BatchResult(
+            (
+                runner.DeviceResult("192.0.2.1", "success", ""),
+                runner.DeviceResult(
+                    "bad-address",
+                    "failed",
+                    "",
+                    failure_category=runner.FailureCategory.INPUT_VALIDATION,
+                ),
+                runner.DeviceResult(
+                    "192.0.2.2",
+                    "failed",
+                    "",
+                    failure_category=runner.FailureCategory.CONNECTIVITY,
+                ),
+                runner.DeviceResult("192.0.2.3", "cancelled", ""),
+            ),
+            self.base / "outputs" / "run_retry",
+            self.base / "outputs" / "run_retry" / "summary.csv",
+        )
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window.queue_controller.mark_terminal(
+            job.job_id,
+            "completed_with_failures",
+            runner.format_batch_summary(result),
+        )
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._job_results[job.job_id] = result
+        self.window._refresh_queue_table(select_job_id=job.job_id)
+
+        self.window.retry_failed_queue_batch()
+
+        self.assertEqual(
+            self.window.inventory_text_edit.toPlainText(),
+            "bad-address\n192.0.2.2",
+        )
+        self.assertEqual(self.window.profile_combo.currentText(), "Manual")
+        self.assertEqual(self.window.username_edit.text(), "")
+        self.assertFalse(self.window.run_button.isEnabled())
+        self.assertEqual(len(self.window.queue_controller.jobs), 1)
+        self.assertIn("Review and validate", self.window.validation_label.text())
+
+    def test_retry_draft_cancel_preserves_current_form(self):
+        self.populate_valid_inputs()
+        original_devices = self.window.inventory_text_edit.toPlainText()
+
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Cancel,
+        ):
+            self.window._create_retry_draft(
+                profile_label="Manual",
+                device_type="huawei",
+                output_dir=self.base / "retry-output",
+                commands=(runner.Command("exec", "display version", 1),),
+                results=(
+                    runner.DeviceResult(
+                        "192.0.2.9",
+                        "failed",
+                        "",
+                        failure_category=runner.FailureCategory.CONNECTIVITY,
+                    ),
+                ),
+            )
+
+        self.assertEqual(
+            self.window.inventory_text_edit.toPlainText(), original_devices
+        )
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "show version\n")
 
     def test_queued_worker_failure_does_not_open_blocking_dialog(self):
         prepared = runner.prepare_run(
@@ -2081,6 +2209,7 @@ class MainWindowTests(unittest.TestCase):
             batch_queue.BatchPayload.from_prepared(prepared),
             prepared,
             datetime.now(timezone.utc) + timedelta(hours=1),
+            datetime.now(timezone.utc) + timedelta(hours=2),
         )
         self.window.queue_controller.mark_running(completed.job_id)
         self.window.queue_controller.mark_terminal(
@@ -2141,6 +2270,7 @@ class MainWindowTests(unittest.TestCase):
             failed_line="2",
             transcript_file=str(transcript),
             error="configuration rejected",
+            failure_category=runner.FailureCategory.COMMAND_REJECTED,
         )
         runner.write_summary(summary, [device])
         self.add_history_record(
@@ -2162,11 +2292,98 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window._results_attention_pending)
         self.assertEqual(self.window.device_table.rowCount(), 1)
         self.assertEqual(self.window.device_table.item(0, 0).text(), "192.0.2.5")
-        self.assertEqual(self.window.device_table.item(0, 2).text(), "config / 2")
+        self.assertEqual(self.window.device_table.item(0, 2).text(), "Command Rejected")
+        self.assertEqual(self.window.device_table.item(0, 3).text(), "config / 2")
         self.assertEqual(
-            self.window.device_table.item(0, 3).text(), "configuration rejected"
+            self.window.device_table.item(0, 4).text(), "configuration rejected"
         )
-        self.assertEqual(self.window.device_table.item(0, 4).text(), str(transcript))
+        self.assertEqual(self.window.device_table.item(0, 5).text(), str(transcript))
+
+    def test_history_retry_restores_saved_profile_and_failed_devices(self):
+        env_path = self.base / "night-ops.env"
+        env_path.write_text(
+            "SSH_USERNAME=night-user\nSSH_PASSWORD=night-secret\n",
+            encoding="utf-8",
+        )
+        profile = self.window.profile_store.add("Night Ops", env_path)
+        run_directory = self.base / "outputs" / "run_history_retry"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        results = (
+            runner.DeviceResult(
+                "192.0.2.10",
+                "failed",
+                "",
+                failure_category=runner.FailureCategory.AUTHENTICATION,
+            ),
+            runner.DeviceResult("192.0.2.11", "cancelled", ""),
+        )
+        runner.write_summary(summary, results)
+        record = self.add_history_record(
+            "retry-history",
+            "completed_with_failures",
+            failures=1,
+            cancelled=1,
+            profile=profile.name,
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        self.history_commands.set(
+            record.job_id,
+            history.HistoryCommandSnapshot(
+                (
+                    runner.Command("exec", "show version", 1),
+                    runner.Command("config", "interface loopback 1", 1),
+                )
+            ),
+        )
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        self.window.retry_failed_history_batch()
+
+        self.assertEqual(self.window.inventory_text_edit.toPlainText(), "192.0.2.10")
+        self.assertEqual(self.window.exec_commands_edit.toPlainText(), "show version")
+        self.assertEqual(
+            self.window.config_commands_edit.toPlainText(), "interface loopback 1"
+        )
+        self.assertEqual(self.window.profile_combo.currentData(), profile.profile_id)
+        self.assertEqual(self.window.username_edit.text(), "night-user")
+        self.assertFalse(self.window.run_button.isEnabled())
+
+    def test_history_retry_missing_command_snapshot_preserves_form(self):
+        run_directory = self.base / "outputs" / "run_missing_snapshot"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        runner.write_summary(
+            summary,
+            [
+                runner.DeviceResult(
+                    "192.0.2.20",
+                    "failed",
+                    "",
+                    failure_category=runner.FailureCategory.CONNECTIVITY,
+                )
+            ],
+        )
+        self.add_history_record(
+            "missing-snapshot",
+            "completed_with_failures",
+            failures=1,
+            run_directory=str(run_directory),
+            summary_path=str(summary),
+        )
+        self.window.inventory_text_edit.setPlainText("192.0.2.99")
+        self.window._ensure_history_ui()
+        self.window.history_table.selectRow(0)
+
+        with patch.object(gui.QMessageBox, "critical") as critical:
+            self.window.retry_failed_history_batch()
+
+        critical.assert_called_once()
+        self.assertEqual(
+            self.window.inventory_text_edit.toPlainText(), "192.0.2.99"
+        )
 
     def test_missing_history_summary_is_shown_as_output_unavailable(self):
         self.add_history_record(
@@ -2634,7 +2851,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(start_worker.call_args.kwargs["operation"], "connection_test")
         self.assertEqual(self.window.device_table.rowCount(), 1)
         self.assertEqual(
-            self.window.device_table.horizontalHeaderItem(2).text(),
+            self.window.device_table.horizontalHeaderItem(3).text(),
             "Stage / Line",
         )
 
@@ -2676,12 +2893,12 @@ class MainWindowTests(unittest.TestCase):
 
         row = self.window._rows["192.0.2.1"]
         self.assertEqual(self.window.device_table.item(row, 1).text(), "Passed")
-        self.assertEqual(self.window.device_table.item(row, 2).text(), "Complete")
+        self.assertEqual(self.window.device_table.item(row, 3).text(), "Complete")
         self.assertEqual(
-            self.window.device_table.item(row, 3).text(),
+            self.window.device_table.item(row, 4).text(),
             "SSH connection test passed",
         )
-        self.assertEqual(self.window.device_table.item(row, 4).text(), str(diagnostic))
+        self.assertEqual(self.window.device_table.item(row, 5).text(), str(diagnostic))
 
     def test_progress_event_never_requires_command_text(self):
         self.populate_valid_inputs()
@@ -2699,7 +2916,7 @@ class MainWindowTests(unittest.TestCase):
 
         row = self.window._rows["192.0.2.1"]
         self.assertEqual(self.window.device_table.item(row, 1).text(), "Running")
-        self.assertEqual(self.window.device_table.item(row, 2).text(), "exec / 2")
+        self.assertEqual(self.window.device_table.item(row, 3).text(), "exec / 2")
 
     def test_cancel_requests_cooperative_stop(self):
         self.assertEqual(self.window.cancel_button.text(), "Stop Run")
@@ -2751,14 +2968,14 @@ class MainWindowTests(unittest.TestCase):
     def test_double_clicking_transcript_column_opens_existing_file(self):
         self.populate_valid_inputs()
         self.assertTrue(self.window.validate_inputs(show_success=False))
-        self.assertEqual(self.window.device_table.horizontalHeaderItem(4).text(), "Output")
+        self.assertEqual(self.window.device_table.horizontalHeaderItem(5).text(), "Output")
         transcript = self.base / "device-transcript.txt"
         transcript.write_text("show version output\n", encoding="utf-8")
         row = self.window._rows["192.0.2.1"]
-        self.window._set_cell(row, 4, str(transcript))
+        self.window._set_cell(row, 5, str(transcript))
 
         with patch.object(gui.QDesktopServices, "openUrl") as open_url:
-            self.window.open_transcript_at(row, 4)
+            self.window.open_transcript_at(row, 5)
 
         open_url.assert_called_once()
         self.assertEqual(
@@ -2775,10 +2992,10 @@ class MainWindowTests(unittest.TestCase):
             "Verify the IP address, port, and network reachability."
         )
         self.window._set_cell(row, 1, "Failed")
-        self.window._set_cell(row, 3, full_error)
+        self.window._set_cell(row, 4, full_error)
 
         with patch.object(gui.QDialog, "exec", autospec=True) as execute_dialog:
-            self.window.handle_table_double_click(row, 3)
+            self.window.handle_table_double_click(row, 4)
 
         execute_dialog.assert_called_once()
         dialogs = self.window.findChildren(gui.QDialog)
@@ -2787,7 +3004,7 @@ class MainWindowTests(unittest.TestCase):
         detail_boxes = dialog.findChildren(gui.QPlainTextEdit)
         self.assertEqual(len(detail_boxes), 1)
         self.assertEqual(detail_boxes[0].toPlainText(), full_error)
-        self.assertIn("Double-click", self.window.device_table.item(row, 3).toolTip())
+        self.assertIn("Double-click", self.window.device_table.item(row, 4).toolTip())
 
     def test_double_clicking_another_column_does_not_open_transcript(self):
         self.populate_valid_inputs()

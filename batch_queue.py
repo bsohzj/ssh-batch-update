@@ -24,6 +24,7 @@ TERMINAL_STATUSES = {
     "completed_with_failures",
     "failed",
     "cancelled",
+    "expired",
 }
 
 
@@ -223,7 +224,9 @@ class QueuedBatch:
     name: str
     created_utc: datetime
     scheduled_utc: Optional[datetime]
+    latest_start_utc: Optional[datetime]
     device_type: str
+    profile_label: str
     valid_devices: int
     invalid_devices: int
     command_count: int
@@ -232,6 +235,9 @@ class QueuedBatch:
 
     def is_due(self, now_utc: datetime) -> bool:
         return self.scheduled_utc is None or self.scheduled_utc <= now_utc
+
+    def is_expired(self, now_utc: datetime) -> bool:
+        return self.latest_start_utc is not None and now_utc > self.latest_start_utc
 
 
 class QueueMetadataStore:
@@ -254,6 +260,7 @@ class QueueMetadataStore:
             if not name or not created:
                 continue
             scheduled = self.settings.value(f"{base}/scheduled_utc", "", str)
+            latest_start = self.settings.value(f"{base}/latest_start_utc", "", str)
             status = self.settings.value(f"{base}/status", "ready", str)
             if status == "running":
                 status = "interrupted"
@@ -264,7 +271,13 @@ class QueueMetadataStore:
                         name=name,
                         created_utc=_parse_utc(created),
                         scheduled_utc=_parse_utc(scheduled) if scheduled else None,
+                        latest_start_utc=(
+                            _parse_utc(latest_start) if latest_start else None
+                        ),
                         device_type=self.settings.value(f"{base}/device_type", "", str),
+                        profile_label=self.settings.value(
+                            f"{base}/profile_label", "Unknown (legacy)", str
+                        ),
                         valid_devices=int(
                             self.settings.value(f"{base}/valid_devices", 0)
                         ),
@@ -308,7 +321,12 @@ class QueueMetadataStore:
             f"{base}/scheduled_utc",
             _iso_utc(job.scheduled_utc) if job.scheduled_utc else "",
         )
+        self.settings.setValue(
+            f"{base}/latest_start_utc",
+            _iso_utc(job.latest_start_utc) if job.latest_start_utc else "",
+        )
         self.settings.setValue(f"{base}/device_type", job.device_type)
+        self.settings.setValue(f"{base}/profile_label", job.profile_label)
         self.settings.setValue(f"{base}/valid_devices", job.valid_devices)
         self.settings.setValue(f"{base}/invalid_devices", job.invalid_devices)
         self.settings.setValue(f"{base}/command_count", job.command_count)
@@ -332,16 +350,25 @@ class QueueController:
         self.restored = bool(self.jobs)
         self.paused = self.restored
         self.active_job_id: Optional[str] = None
-        self.refresh_due()
+        self.cleanup_warnings = self.refresh_due()
 
     def add(
         self,
         payload: BatchPayload,
         prepared: PreparedRun,
         scheduled_utc: Optional[datetime] = None,
+        latest_start_utc: Optional[datetime] = None,
     ) -> QueuedBatch:
         now = _as_utc(self.clock())
         scheduled = _as_utc(scheduled_utc) if scheduled_utc else None
+        latest_start = _as_utc(latest_start_utc) if latest_start_utc else None
+        if scheduled is not None:
+            if latest_start is None:
+                raise QueueStorageError("A scheduled batch requires a latest-start time.")
+            if latest_start <= scheduled:
+                raise QueueStorageError("Latest start must be later than the scheduled time.")
+        elif latest_start is not None:
+            raise QueueStorageError("A Run Live batch cannot have a latest-start time.")
         job_id = uuid4().hex
         job = QueuedBatch(
             job_id=job_id,
@@ -351,7 +378,9 @@ class QueueController:
             ),
             created_utc=now,
             scheduled_utc=scheduled,
+            latest_start_utc=latest_start,
             device_type=prepared.request.device_type,
+            profile_label=payload.profile_label,
             valid_devices=len(prepared.valid_entries),
             invalid_devices=len(prepared.invalid_entries),
             command_count=len(prepared.commands),
@@ -389,6 +418,7 @@ class QueueController:
         updated = replace(
             job,
             device_type=prepared.request.device_type,
+            profile_label=payload.profile_label,
             valid_devices=len(prepared.valid_entries),
             invalid_devices=len(prepared.invalid_entries),
             command_count=len(prepared.commands),
@@ -398,18 +428,34 @@ class QueueController:
         self._replace(updated)
         return updated
 
-    def refresh_due(self) -> None:
+    def refresh_due(self) -> list[str]:
         now = _as_utc(self.clock())
         changed = False
+        warnings: list[str] = []
         updated: list[QueuedBatch] = []
         for job in self.jobs:
-            if job.status == "scheduled" and job.is_due(now):
+            if job.status in {"scheduled", "ready"} and job.is_expired(now):
+                local_deadline = job.latest_start_utc.astimezone().strftime(
+                    "%Y-%m-%d %H:%M"
+                )
+                job = replace(
+                    job,
+                    status="expired",
+                    result=f"Not started: latest start passed at {local_deadline}",
+                )
+                try:
+                    self.secret_store.delete(job.job_id)
+                except QueueStorageError as exc:
+                    warnings.append(str(exc))
+                changed = True
+            elif job.status == "scheduled" and job.is_due(now):
                 job = replace(job, status="ready")
                 changed = True
             updated.append(job)
         self.jobs = updated
         if changed:
             self.metadata_store.save_all(self.jobs)
+        return warnings
 
     def next_eligible(self) -> Optional[QueuedBatch]:
         self.refresh_due()
@@ -419,6 +465,8 @@ class QueueController:
 
     def mark_running(self, job_id: str) -> QueuedBatch:
         job = self._required(job_id)
+        if job.status != "ready":
+            raise QueueStorageError("Only a ready batch can start.")
         updated = replace(job, status="running", result="")
         self.active_job_id = job_id
         self._replace(updated)
@@ -459,13 +507,22 @@ class QueueController:
             candidate += direction
         return False
 
-    def reschedule(self, job_id: str, scheduled_utc: Optional[datetime]) -> QueuedBatch:
+    def reschedule(
+        self,
+        job_id: str,
+        scheduled_utc: datetime,
+        latest_start_utc: datetime,
+    ) -> QueuedBatch:
         job = self._editable(job_id)
-        scheduled = _as_utc(scheduled_utc) if scheduled_utc else None
+        scheduled = _as_utc(scheduled_utc)
+        latest_start = _as_utc(latest_start_utc)
+        if latest_start <= scheduled:
+            raise QueueStorageError("Latest start must be later than the scheduled time.")
         now = _as_utc(self.clock())
         updated = replace(
             job,
             scheduled_utc=scheduled,
+            latest_start_utc=latest_start,
             status="scheduled" if scheduled and scheduled > now else "ready",
             result="",
         )

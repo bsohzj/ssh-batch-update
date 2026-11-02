@@ -55,7 +55,8 @@ class BatchQueueTests(unittest.TestCase):
     def add(self, device_type="huawei", scheduled=None):
         prepared = self.prepared(device_type)
         payload = batch_queue.BatchPayload.from_prepared(prepared)
-        return self.controller.add(payload, prepared, scheduled)
+        latest_start = scheduled + timedelta(hours=1) if scheduled else None
+        return self.controller.add(payload, prepared, scheduled, latest_start)
 
     def test_payload_round_trip_reconstructs_complete_prepared_run(self):
         prepared = self.prepared("cisco_ios")
@@ -201,6 +202,100 @@ class BatchQueueTests(unittest.TestCase):
         self.assertEqual(self.controller.next_eligible().job_id, ready.job_id)
         self.controller.retry(blocked.job_id)
         self.assertEqual(self.controller.job(blocked.job_id).status, "ready")
+
+    def test_scheduled_batch_requires_valid_latest_start(self):
+        prepared = self.prepared()
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        scheduled = self.now + timedelta(hours=1)
+
+        with self.assertRaisesRegex(batch_queue.QueueStorageError, "latest-start"):
+            self.controller.add(payload, prepared, scheduled)
+        with self.assertRaisesRegex(batch_queue.QueueStorageError, "later"):
+            self.controller.add(payload, prepared, scheduled, scheduled)
+
+    def test_latest_start_is_inclusive_then_expires_and_deletes_payload(self):
+        scheduled = self.now + timedelta(minutes=5)
+        latest = scheduled + timedelta(minutes=10)
+        prepared = self.prepared()
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        job = self.controller.add(payload, prepared, scheduled, latest)
+
+        self.now = latest
+        self.controller.refresh_due()
+        self.assertEqual(self.controller.job(job.job_id).status, "ready")
+        self.assertIn(job.job_id, self.secrets.values)
+
+        self.now += timedelta(seconds=1)
+        self.controller.refresh_due()
+        expired = self.controller.job(job.job_id)
+        self.assertEqual(expired.status, "expired")
+        self.assertIn("Not started", expired.result)
+        self.assertNotIn(job.job_id, self.secrets.values)
+        self.assertIsNone(self.controller.next_eligible())
+
+    def test_expired_restored_batch_remains_visible_for_session(self):
+        scheduled = self.now + timedelta(minutes=5)
+        prepared = self.prepared()
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        job = self.controller.add(
+            payload,
+            prepared,
+            scheduled,
+            scheduled + timedelta(minutes=30),
+        )
+        self.now = scheduled + timedelta(minutes=31)
+
+        restored = batch_queue.QueueController(
+            batch_queue.QueueMetadataStore(self.settings),
+            self.secrets,
+            clock=lambda: self.now,
+        )
+
+        self.assertTrue(restored.paused)
+        self.assertEqual(restored.job(job.job_id).status, "expired")
+        self.assertNotIn(job.job_id, self.secrets.values)
+        self.assertNotIn(job.job_id, self.settings.value(batch_queue.QUEUE_ORDER_KEY, []))
+
+    def test_profile_and_deadline_restore_from_metadata(self):
+        scheduled = self.now + timedelta(hours=2)
+        prepared = self.prepared()
+        payload = batch_queue.BatchPayload.from_prepared(prepared, "Night Ops")
+        job = self.controller.add(
+            payload,
+            prepared,
+            scheduled,
+            scheduled + timedelta(hours=1),
+        )
+
+        restored = batch_queue.QueueController(
+            batch_queue.QueueMetadataStore(self.settings),
+            self.secrets,
+            clock=lambda: self.now,
+        ).job(job.job_id)
+
+        self.assertIn("huawei", restored.name)
+        self.assertEqual(restored.profile_label, "Night Ops")
+        self.assertEqual(restored.latest_start_utc, scheduled + timedelta(hours=1))
+
+    def test_legacy_schedule_without_deadline_remains_ready(self):
+        scheduled = self.now + timedelta(minutes=5)
+        job = self.add(scheduled=scheduled)
+        self.settings.remove(
+            f"{batch_queue.QUEUE_GROUP}/{job.job_id}/latest_start_utc"
+        )
+        self.settings.sync()
+        self.now = scheduled + timedelta(hours=2)
+
+        restored = batch_queue.QueueController(
+            batch_queue.QueueMetadataStore(self.settings),
+            self.secrets,
+            clock=lambda: self.now,
+        )
+
+        legacy = restored.job(job.job_id)
+        self.assertEqual(legacy.status, "ready")
+        self.assertIsNone(legacy.latest_start_utc)
+        self.assertIn(job.job_id, self.secrets.values)
 
 
 if __name__ == "__main__":

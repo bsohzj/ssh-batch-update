@@ -1,13 +1,15 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import history
-from run_commands import Command
+from run_commands import Command, DeviceResult, FailureCategory, write_summary
 
 
 class HistoryStoreTests(unittest.TestCase):
@@ -80,6 +82,56 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(completed.duration_seconds, 95)
         self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.store.path.parent).st_mode & 0o777, 0o700)
+
+    def test_version_one_database_migrates_latest_start_without_data_loss(self):
+        legacy_path = self.base / "legacy" / "history.sqlite3"
+        legacy_path.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE history (
+                    job_id TEXT PRIMARY KEY, batch_name TEXT NOT NULL,
+                    created_utc TEXT NOT NULL, scheduled_utc TEXT NOT NULL DEFAULT '',
+                    started_utc TEXT NOT NULL, completed_utc TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL, profile_label TEXT NOT NULL,
+                    device_type TEXT NOT NULL, valid_devices INTEGER NOT NULL,
+                    invalid_devices INTEGER NOT NULL, command_count INTEGER NOT NULL,
+                    status TEXT NOT NULL, success_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    cancelled_count INTEGER NOT NULL DEFAULT 0,
+                    result_text TEXT NOT NULL DEFAULT '', run_directory TEXT NOT NULL DEFAULT '',
+                    summary_path TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO history (
+                    job_id, batch_name, created_utc, scheduled_utc, started_utc,
+                    source, profile_label, device_type, valid_devices,
+                    invalid_devices, command_count, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-job", "Legacy batch", "2026-10-26T10:00:00Z", "",
+                    "2026-10-26T10:05:00Z", "manual", "Operations", "huawei",
+                    1, 0, 2, "succeeded",
+                ),
+            )
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+        migrated = history.HistoryStore(legacy_path, clock=lambda: self.now)
+        record = migrated.get("legacy-job")
+
+        self.assertEqual(record.batch_name, "Legacy batch")
+        self.assertIsNone(record.latest_start_utc)
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(history)")
+            }
+        self.assertIn("latest_start_utc", columns)
 
     def test_restart_marks_running_records_interrupted(self):
         self.store.start(self.record())
@@ -335,10 +387,28 @@ class HistoryCommandAndOutputTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].address, "192.0.2.1")
         self.assertEqual(results[0].status, "success")
+        self.assertIsNone(results[0].failure_category)
         malformed = self.base / "bad.csv"
         malformed.write_text("device,status\n192.0.2.1,success\n", encoding="utf-8")
         with self.assertRaises(history.HistoryError):
             history.read_summary(malformed)
+
+        categorized = self.base / "categorized.csv"
+        write_summary(
+            categorized,
+            [
+                DeviceResult(
+                    "192.0.2.2",
+                    "failed",
+                    "",
+                    failure_category=FailureCategory.CONNECTIVITY,
+                )
+            ],
+        )
+        self.assertEqual(
+            history.read_summary(categorized)[0].failure_category,
+            FailureCategory.CONNECTIVITY,
+        )
 
     def test_output_deletion_requires_matching_marker_and_summary(self):
         run_directory = self.base / "run_2026-10-26_18-30-00"
