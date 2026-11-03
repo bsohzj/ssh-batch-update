@@ -45,7 +45,10 @@ progress never displays literal commands. Reports default to
 Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
 Failed-device output files include the sanitized exception message, with known
-connection secrets redacted.
+connection secrets redacted. Failed results also show an operational category,
+such as Connectivity, Authentication, Privilege, Command Rejected, or Command
+Timeout. The category summarizes the failure; the sanitized result and
+transcript remain the detailed diagnostic record.
 
 ### Credential profiles
 
@@ -72,16 +75,19 @@ The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
 earlier ready work. Use **Schedule Run** to select a future local date from the
-calendar and a separate time field; the dialog shows a readable schedule
-preview before submission. Future jobs do not block ready jobs, and batches scheduled for the same
-time run in the visible queue order.
+calendar, a time, and a required latest-start deadline. New schedules default
+to a one-hour start window. A batch may begin at the deadline, but it becomes
+**Expired** if it has not started after that time. Expiry never stops work that
+is already running. Future jobs do not block ready jobs, and batches scheduled
+for the same time run in visible queue order.
 
-The **Queue** tab shows order, device and command counts, schedule, status, and
-result. Pending jobs can be moved, edited, rescheduled, retried, or removed.
-Cancelled and completed history entries can also be removed; removing an entry
-never deletes its transcripts, summary, or output directory. **Clear Completed**
-removes all successful, partially failed, failed, and cancelled history entries
-at once while leaving running, queued, and scheduled batches untouched.
+The **Queue** tab shows order, batch name, device and command counts, schedule,
+latest start, status, and result. Pending jobs can be moved, edited,
+rescheduled, retried, or removed. Cancelled, completed, and expired Queue
+entries can also be removed; removing an entry never deletes its transcripts,
+summary, or output directory. **Clear Completed** removes all successful,
+partially failed, failed, cancelled, and expired Queue entries at once while
+leaving running, queued, and scheduled batches untouched.
 Editing loads the encrypted snapshot into the normal form and requires fresh
 validation and confirmation before replacing it. Double-click a queue row to
 open its per-device results. **Pause Queue** stops new batches from starting;
@@ -89,15 +95,25 @@ open its per-device results. **Pause Queue** stops new batches from starting;
 pauses the queue. A batch with device failures does not prevent the next ready
 batch from starting.
 
+For a completed batch with device failures, **Retry Failed Devices…** creates an
+editable SSH-form draft containing only failed devices and the original
+commands. Successful and cancelled devices are excluded. The app reloads the
+original named profile when it still exists; otherwise it clears credentials
+and selects Manual. Review and validate the draft before submitting it as a new
+batch. No retry is queued or executed automatically.
+
 Queued device addresses, commands, output settings, and credentials are stored
 as a complete macOS Keychain payload. Ordinary application settings contain
-only an opaque job ID, ordering, schedule, device type, and counts. The Keychain
-payload is deleted when the batch completes, is cancelled, or is removed. A
+only an opaque job ID, batch name, ordering, schedule window, friendly profile
+label, device type, and counts. The Keychain payload is deleted when the batch
+completes, is cancelled, expires, or is removed. A
 profile is snapshotted when submitted, so later changes to its `.env` do not
 change the queued batch.
 
-Queued work is restored after reopening, but the queue starts paused. An
-overdue schedule becomes **Ready** and requires **Resume Queue**. A batch that
+Queued work is restored after reopening, but the queue starts paused. A new
+schedule restored after its latest-start deadline becomes **Expired** and its
+Keychain payload is deleted. Older saved schedules that predate deadlines keep
+their legacy no-expiry behavior. A batch that
 was running when the app stopped becomes **Interrupted** and must be retried
 manually because some commands may already have run. The app prevents idle
 system sleep while an unpaused schedule is armed or a run is active, but it
@@ -111,8 +127,8 @@ lab switches before using the feature on production access switches.
 
 The full-window **History** screen keeps a persistent audit index for live
 batches that run after the feature is installed. It does not import older
-output folders and does not record connection tests. The three top-level tabs
-are **SSH**, **History**, and **Dictionary**; the app always starts on **SSH**.
+output folders and does not record connection tests. The two top-level tabs
+are **SSH** and **History**; the app always starts on **SSH**.
 History is loaded only when its screen is first opened, so it does not delay
 normal queue use or SSH execution.
 
@@ -122,20 +138,24 @@ tabs pulse briefly and retain a dot until **SSH** → **Device Results** is open
 without interrupting History review.
 
 The dashboard defaults to the last 30 days and provides summary cards, a line
-chart of successful and failed devices, a run-status donut chart, searchable
-and filterable records, and 100-row pagination. Filters include date range,
-status, manual or scheduled source, device type, and credential-profile label.
+chart of successful and failed devices, a donut chart that switches between
+run status and failure causes, searchable and filterable records, and 100-row
+pagination. Legacy failures without stored categories appear as
+**Uncategorized**. Filters include date range, status, manual or scheduled
+source, device type, and credential-profile label.
 Selecting a record can load its `summary.csv` into **Device Results**, open its
 output or summary, or show its encrypted command snapshot after a sensitive
-content warning.
+content warning. **Retry Failed Devices…** can also create a failed-only draft
+from a historical summary and encrypted command snapshot; credentials are
+reloaded from an existing named profile rather than History.
 
 Audit metadata is stored in an owner-private SQLite database at the app's
 macOS Application Support location. The database contains batch metadata,
-aggregate result counts, friendly profile labels, and output paths. It never
-contains usernames, passwords, enable secrets, command text, device addresses,
-or per-device error details. Device details are read from the existing
-`summary.csv` only when requested, so moved or deleted output is shown as
-unavailable rather than copied into another data store.
+aggregate result and failure-category counts, friendly profile labels, and
+output paths. It never contains usernames, passwords, enable secrets, command
+text, device addresses, or per-device error details. Device details are read
+from the existing `summary.csv` only when requested, so moved or deleted output
+is shown as unavailable rather than copied into another data store.
 
 Exact command snapshots are encrypted separately in macOS Keychain under
 service `com.sg4291.sshbatchupdate.history.commands`. They can include literal
@@ -157,7 +177,8 @@ does not stop an already confirmed live batch.
 
 ### Command dictionary
 
-The full-window **Command Dictionary** is an offline reference containing 96
+The reusable, non-modal **Command Dictionary** window is opened from the SSH
+command controls and contains 96
 entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
 CloudEngine S5755-S. Seventy entries are read-only operational commands. The
 remaining entries are explicitly marked as configuration changes, service-
@@ -186,6 +207,38 @@ command context first, treat rollback text as a reviewed aid rather than an
 automatic restoration of prior state, and validate the result on an approved
 lab switch before production use. Save commands may prompt interactively and
 must not be treated as unattended operations.
+
+### Config converter
+
+The reusable, non-modal **Config Converter** window opens below the Command
+Dictionary control. It converts a conservative command and configuration
+baseline between generic Cisco IOS XE and Huawei VRP syntax entirely in memory;
+it does not connect to a device, queue work, or create audit History. Source text
+can be pasted or imported from `.cfg` and `.txt` files. Select a source vendor or
+use auto-detection, then click **Convert** to produce an editable target candidate.
+
+The reviewed baseline includes the Dictionary's operational command pairs plus
+hostnames, VLANs, common interface access/trunk settings, descriptions, MTU and
+administrative state, SVIs and IPv4 addresses, static routes, link aggregation,
+LLDP, DNS, NTP, syslog, and directly compatible basic STP settings. Interface
+numbering and command availability still depend on the actual hardware and
+software release. High-speed interface names and site-, security-, or
+hardware-specific features such as AAA/NAC, QoS, SNMP credentials, PKI, stack/HA,
+and non-equivalent STP behavior are left as blocking review items rather than
+guessed.
+
+Unsupported input remains visible as a target-native `REVIEW` comment and is
+explained in the review table. Passwords, hashes, communities, shared keys, and
+cipher values are redacted instead of copied. Editing the result requires
+**Recheck** before executable handoff. Plain target text can be exported as a
+review candidate even when issues remain, but SSH `[exec]`/`[config]` export and
+**Import to SSH Commands** are blocked until every review marker, unknown command,
+and placeholder is resolved. Importing a clean result classifies operational and
+configuration commands, updates Device Type, and offers Replace or Append when
+the SSH command boxes already contain text.
+
+Converted output is a human-review candidate, not a production-ready migration.
+Validate it against vendor documentation and an approved lab switch before use.
 
 ## Use
 

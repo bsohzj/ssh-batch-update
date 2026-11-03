@@ -11,7 +11,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 from uuid import uuid4
 
 from PySide6.QtCore import (
@@ -37,6 +37,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QPainter,
     QPalette,
+    QTextCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -83,6 +84,22 @@ from batch_queue import (
 
 from command_dictionary import COMMAND_ENTRIES, CommandEntry, search_commands
 
+from config_converter import (
+    DISPOSITION_IGNORED,
+    DISPOSITION_REVIEW,
+    DISPOSITION_UNMAPPED,
+    VENDOR_CISCO,
+    VENDOR_HUAWEI,
+    ConversionIssue,
+    ConversionResult,
+    analyze_target_text,
+    convert_text,
+    detect_vendor,
+    opposite_vendor,
+    render_sectioned_commands,
+    vendor_label,
+)
+
 from history import (
     HistoryCommandSnapshot,
     HistoryCommandStore,
@@ -92,6 +109,7 @@ from history import (
     HistoryStore,
     KeychainHistoryCommandStore,
     MemoryHistoryCommandStore,
+    UNCATEGORIZED_FAILURE,
     default_history_path,
     delete_output_directory,
     read_summary,
@@ -102,11 +120,16 @@ from history import (
 from run_commands import (
     BatchResult,
     CancellationToken,
+    Command,
     ConfigurationError,
+    DeviceResult,
+    FailureCategory,
     PreparedRun,
     ProgressEvent,
     RunRequest,
     Settings,
+    failure_category_label,
+    format_batch_summary,
     load_settings,
     parse_commands,
     parse_inline_commands,
@@ -126,6 +149,10 @@ THEME_DARK = "dark"
 THEME_MODES = (THEME_SYSTEM, THEME_LIGHT, THEME_DARK)
 RESULTS_ATTENTION_INTERVAL_MS = 500
 RESULTS_ATTENTION_TICKS = 6
+HISTORY_TREND_DEVICES = "devices"
+HISTORY_TREND_DURATION = "duration"
+HISTORY_BREAKDOWN_STATUS = "status"
+HISTORY_BREAKDOWN_FAILURES = "failures"
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -188,6 +215,15 @@ def apply_application_theme(app: QApplication, mode: object) -> str:
     else:
         app.setPalette(_forced_theme_palette(normalized))
     return normalized
+
+
+def _repolish_application_widgets(app: QApplication) -> None:
+    """Refresh native widget styling after an application palette change."""
+    for widget in app.allWidgets():
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+        widget.update()
 
 
 PROFILE_GROUP = "credential_profiles/items"
@@ -546,19 +582,19 @@ class BatchWorker(QObject):
 
 
 class ScheduleDialog(QDialog):
-    """Select one future local date and time with minute precision."""
+    """Select a scheduled start and required latest-start deadline."""
 
     def __init__(
         self,
         initial_utc: Optional[datetime] = None,
+        initial_latest_start_utc: Optional[datetime] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Schedule Run")
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        label = QLabel("Run this batch at:")
-        layout.addWidget(label)
+        layout.addWidget(QLabel("Run this batch during this start window:"))
 
         minimum = QDateTime.currentDateTime().addSecs(60)
         if initial_utc is not None:
@@ -570,6 +606,17 @@ class ScheduleDialog(QDialog):
             selected = selected.addSecs(60 - selected.time().second())
         selected.setTime(selected.time().addMSecs(-selected.time().msec()))
 
+        window_seconds = 3600
+        if initial_utc is not None and initial_latest_start_utc is not None:
+            window_seconds = max(
+                60,
+                int((initial_latest_start_utc - initial_utc).total_seconds()),
+            )
+        latest = selected.addSecs(window_seconds)
+        self._latest_manually_edited = False
+        self._updating_schedule = False
+        self._last_start_local = selected
+
         fields = QFormLayout()
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
@@ -579,14 +626,26 @@ class ScheduleDialog(QDialog):
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("h:mm AP")
         self.time_edit.setTime(selected.time())
+        self.latest_date_edit = QDateEdit()
+        self.latest_date_edit.setCalendarPopup(True)
+        self.latest_date_edit.setDisplayFormat("ddd, d MMM yyyy")
+        self.latest_date_edit.setMinimumDate(QDateTime.currentDateTime().date())
+        self.latest_date_edit.setDate(latest.date())
+        self.latest_time_edit = QTimeEdit()
+        self.latest_time_edit.setDisplayFormat("h:mm AP")
+        self.latest_time_edit.setTime(latest.time())
         fields.addRow("Date", self.date_edit)
         fields.addRow("Time", self.time_edit)
+        fields.addRow("Latest start date", self.latest_date_edit)
+        fields.addRow("Latest start time", self.latest_time_edit)
         layout.addLayout(fields)
 
         self.preview_label = QLabel()
         self.preview_label.setWordWrap(True)
-        self.date_edit.dateChanged.connect(self._update_preview)
-        self.time_edit.timeChanged.connect(self._update_preview)
+        self.date_edit.dateChanged.connect(self._start_changed)
+        self.time_edit.timeChanged.connect(self._start_changed)
+        self.latest_date_edit.dateChanged.connect(self._latest_changed)
+        self.latest_time_edit.timeChanged.connect(self._latest_changed)
         layout.addWidget(self.preview_label)
         self._update_preview()
 
@@ -601,15 +660,48 @@ class ScheduleDialog(QDialog):
     def _selected_local(self) -> QDateTime:
         return QDateTime(self.date_edit.date(), self.time_edit.time())
 
+    def _latest_local(self) -> QDateTime:
+        return QDateTime(self.latest_date_edit.date(), self.latest_time_edit.time())
+
+    @Slot()
+    def _start_changed(self) -> None:
+        selected = self._selected_local()
+        if not self._latest_manually_edited:
+            delta = self._last_start_local.secsTo(selected)
+            self._updating_schedule = True
+            try:
+                shifted = self._latest_local().addSecs(delta)
+                self.latest_date_edit.setDate(shifted.date())
+                self.latest_time_edit.setTime(shifted.time())
+            finally:
+                self._updating_schedule = False
+        self._last_start_local = selected
+        self._update_preview()
+
+    @Slot()
+    def _latest_changed(self) -> None:
+        if not self._updating_schedule:
+            self._latest_manually_edited = True
+        self._update_preview()
+
     @Slot()
     def _update_preview(self) -> None:
         display = self._selected_local().toString(
             "dddd, d MMMM yyyy 'at' h:mm AP"
         )
-        self.preview_label.setText(f"Scheduled for {display}")
+        latest = self._latest_local().toString(
+            "dddd, d MMMM yyyy 'at' h:mm AP"
+        )
+        self.preview_label.setText(f"Scheduled for {display}\nMust start by {latest}")
 
     def selected_utc(self) -> datetime:
         local = self._selected_local().toPython().replace(second=0, microsecond=0)
+        if local.tzinfo is None:
+            local = local.astimezone()
+        return local.astimezone(timezone.utc)
+
+    def latest_start_utc(self) -> datetime:
+        local = self._latest_local().toPython().replace(second=0, microsecond=0)
         if local.tzinfo is None:
             local = local.astimezone()
         return local.astimezone(timezone.utc)
@@ -618,6 +710,13 @@ class ScheduleDialog(QDialog):
     def _accept_if_future(self) -> None:
         if self.selected_utc() <= datetime.now(timezone.utc):
             QMessageBox.critical(self, "Invalid schedule", "Choose a future date and time.")
+            return
+        if self.latest_start_utc() <= self.selected_utc():
+            QMessageBox.critical(
+                self,
+                "Invalid schedule",
+                "Latest start must be later than the scheduled time.",
+            )
             return
         self.accept()
 
@@ -727,6 +826,17 @@ class MainWindow(QMainWindow):
         self._credential_file: Optional[Path] = None
         self._history_ui_built = False
         self._dictionary_ui_built = False
+        self.dictionary_dialog: Optional[QDialog] = None
+        self._converter_ui_built = False
+        self.converter_dialog: Optional[QDialog] = None
+        self._converter_result: Optional[ConversionResult] = None
+        self._converter_target_vendor: Optional[str] = None
+        self._converter_source_stale = False
+        self._converter_output_dirty = False
+        self._converter_setting_output = False
+        self._converter_result_is_analysis = False
+        self._last_converter_import = ""
+        self._last_converter_export = ""
         self._history_page = 0
         self._history_records: dict[str, HistoryRecord] = {}
         self._results_attention_pending = False
@@ -751,6 +861,11 @@ class MainWindow(QMainWindow):
         self._update_queue_controls()
         if self._history_startup_warning:
             self.validation_label.setText(self._history_startup_warning)
+        if self.queue_controller.cleanup_warnings:
+            self.validation_label.setText(
+                "Keychain cleanup warning: "
+                + " ".join(self.queue_controller.cleanup_warnings)
+            )
 
     def _build_ui(self) -> None:
         self._build_menu()
@@ -805,12 +920,6 @@ class MainWindow(QMainWindow):
         inventory_buttons_layout.addWidget(self.clear_devices_button)
         inventory_buttons_layout.addWidget(self.test_connections_button)
         inventory_buttons_layout.addStretch()
-        inventory_container = QWidget()
-        inventory_layout = QHBoxLayout(inventory_container)
-        inventory_layout.setContentsMargins(0, 0, 0, 0)
-        inventory_layout.addWidget(self.inventory_text_edit, 1)
-        inventory_layout.addWidget(inventory_buttons, 0)
-        form.addRow("Devices", inventory_container)
 
         self.exec_commands_edit = QPlainTextEdit()
         self.exec_commands_edit.setPlaceholderText("One exec command per line")
@@ -825,7 +934,20 @@ class MainWindow(QMainWindow):
         self.clear_commands_button = QPushButton("Clear Commands")
         self.clear_commands_button.setEnabled(False)
         self.clear_commands_button.clicked.connect(self._clear_commands)
+        self.command_dictionary_button = QPushButton("Command Dictionary")
+        self.command_dictionary_button.setToolTip(
+            "Open the offline command dictionary in a separate window."
+        )
+        self.command_dictionary_button.clicked.connect(
+            self._open_command_dictionary
+        )
+        self.config_converter_button = QPushButton("Config Converter")
+        self.config_converter_button.setToolTip(
+            "Convert reviewed Cisco IOS XE and Huawei VRP commands locally."
+        )
+        self.config_converter_button.clicked.connect(self._open_config_converter)
         command_file_buttons = QWidget()
+        self.command_file_buttons = command_file_buttons
         command_file_buttons_layout = QGridLayout(command_file_buttons)
         command_file_buttons_layout.setContentsMargins(0, 0, 0, 0)
         command_file_buttons_layout.addWidget(import_sectioned_button, 0, 0, 1, 2)
@@ -834,9 +956,33 @@ class MainWindow(QMainWindow):
         command_file_buttons_layout.setColumnStretch(0, 1)
         command_file_buttons_layout.setColumnStretch(1, 1)
 
-        form.addRow("Exec Commands", self.exec_commands_edit)
-        form.addRow("Config Commands", self.config_commands_edit)
-        form.addRow("", command_file_buttons)
+        self.command_inputs_container = QWidget()
+        command_inputs_layout = QGridLayout(self.command_inputs_container)
+        command_inputs_layout.setContentsMargins(0, 0, 0, 0)
+        devices_label = QLabel("Devices")
+        devices_label.setBuddy(self.inventory_text_edit)
+        exec_commands_label = QLabel("Exec Commands")
+        exec_commands_label.setBuddy(self.exec_commands_edit)
+        config_commands_label = QLabel("Config Commands")
+        config_commands_label.setBuddy(self.config_commands_edit)
+        command_inputs_layout.addWidget(devices_label, 4, 0)
+        command_inputs_layout.addWidget(self.inventory_text_edit, 4, 1)
+        command_inputs_layout.addWidget(inventory_buttons, 4, 2)
+        command_inputs_layout.addWidget(exec_commands_label, 5, 0)
+        command_inputs_layout.addWidget(self.exec_commands_edit, 5, 1)
+        command_inputs_layout.addWidget(config_commands_label, 6, 0)
+        command_inputs_layout.addWidget(self.config_commands_edit, 6, 1)
+        command_tools = QWidget()
+        command_tools_layout = QVBoxLayout(command_tools)
+        command_tools_layout.setContentsMargins(0, 0, 0, 0)
+        command_tools_layout.addWidget(self.command_dictionary_button)
+        command_tools_layout.addWidget(self.config_converter_button)
+        command_inputs_layout.addWidget(
+            command_tools, 5, 2, 2, 1, Qt.AlignmentFlag.AlignVCenter
+        )
+        self.command_tools_container = command_tools
+        command_inputs_layout.addWidget(command_file_buttons, 7, 1, 1, 2)
+        command_inputs_layout.setColumnStretch(1, 1)
 
         self.username_edit = QLineEdit()
         self.username_edit.setPlaceholderText("SSH Username")
@@ -846,21 +992,35 @@ class MainWindow(QMainWindow):
         self.profile_combo = QComboBox()
         self.manage_profiles_button = QPushButton("Manage Profiles…")
         self.manage_profiles_button.clicked.connect(self.manage_profiles)
-        profile_container = QWidget()
-        profile_layout = QHBoxLayout(profile_container)
-        profile_layout.setContentsMargins(0, 0, 0, 0)
-        profile_layout.addWidget(self.profile_combo, 1)
-        profile_layout.addWidget(self.manage_profiles_button)
         self.output_edit, output_row = self._path_row("Choose output folder…", self._choose_output)
-        form.insertRow(0, "Profile", profile_container)
-        form.insertRow(1, "Username", self.username_edit)
-        form.insertRow(2, "Password", self.password_edit)
-        form.addRow("Output Folder", output_row)
 
         self.device_type_combo = QComboBox()
         self.device_type_combo.setEditable(True)
         self.device_type_combo.addItems(["huawei", "cisco_ios"])
-        form.insertRow(3, "Device Type", self.device_type_combo)
+
+        profile_label = QLabel("Profile")
+        profile_label.setBuddy(self.profile_combo)
+        username_label = QLabel("Username")
+        username_label.setBuddy(self.username_edit)
+        password_label = QLabel("Password")
+        password_label.setBuddy(self.password_edit)
+        device_type_label = QLabel("Device Type")
+        device_type_label.setBuddy(self.device_type_combo)
+        output_label = QLabel("Output Folder")
+        output_label.setBuddy(self.output_edit)
+        command_inputs_layout.addWidget(profile_label, 0, 0)
+        command_inputs_layout.addWidget(self.profile_combo, 0, 1)
+        command_inputs_layout.addWidget(self.manage_profiles_button, 0, 2)
+        command_inputs_layout.addWidget(username_label, 1, 0)
+        command_inputs_layout.addWidget(self.username_edit, 1, 1)
+        command_inputs_layout.addWidget(password_label, 2, 0)
+        command_inputs_layout.addWidget(self.password_edit, 2, 1)
+        command_inputs_layout.addWidget(device_type_label, 3, 0)
+        command_inputs_layout.addWidget(self.device_type_combo, 3, 1)
+        command_inputs_layout.addWidget(output_label, 8, 0)
+        command_inputs_layout.addWidget(output_row, 8, 1)
+
+        form.addRow(self.command_inputs_container)
 
         settings_layout.addWidget(self.configuration_group)
 
@@ -897,9 +1057,12 @@ class MainWindow(QMainWindow):
         self.results_tabs = QTabWidget()
         queue_tab = QWidget()
         queue_layout = QVBoxLayout(queue_tab)
-        self.queue_table = QTableWidget(0, 8)
+        self.queue_table = QTableWidget(0, 9)
         self.queue_table.setHorizontalHeaderLabels(
-            ["Order", "Batch", "Device Type", "Devices", "Commands", "Run At", "Status", "Result"]
+            [
+                "Order", "Batch", "Device Type", "Devices", "Commands",
+                "Run At", "Latest Start", "Status", "Result",
+            ]
         )
         self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -908,10 +1071,10 @@ class MainWindow(QMainWindow):
         self.queue_table.itemSelectionChanged.connect(self._queue_selection_changed)
         self.queue_table.cellDoubleClicked.connect(self._queue_double_clicked)
         queue_header = self.queue_table.horizontalHeader()
-        for column in (0, 2, 3, 4, 5, 6):
+        for column in (0, 2, 3, 4, 5, 6, 7):
             queue_header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         queue_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        queue_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
+        queue_header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         queue_layout.addWidget(self.queue_table, 1)
 
         queue_actions = QGridLayout()
@@ -921,6 +1084,7 @@ class MainWindow(QMainWindow):
         self.edit_batch_button = QPushButton("Edit Batch")
         self.reschedule_button = QPushButton("Reschedule…")
         self.retry_button = QPushButton("Retry")
+        self.retry_failed_button = QPushButton("Retry Failed Devices…")
         self.remove_batch_button = QPushButton("Remove")
         self.clear_completed_button = QPushButton("Clear Completed")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
@@ -929,6 +1093,7 @@ class MainWindow(QMainWindow):
         self.edit_batch_button.clicked.connect(self.edit_selected_batch)
         self.reschedule_button.clicked.connect(self.reschedule_selected_batch)
         self.retry_button.clicked.connect(self.retry_selected_batch)
+        self.retry_failed_button.clicked.connect(self.retry_failed_queue_batch)
         self.remove_batch_button.clicked.connect(self.remove_selected_batch)
         self.clear_completed_button.clicked.connect(self.clear_completed_batches)
         for index, button in enumerate(
@@ -939,6 +1104,7 @@ class MainWindow(QMainWindow):
                 self.edit_batch_button,
                 self.reschedule_button,
                 self.retry_button,
+                self.retry_failed_button,
                 self.remove_batch_button,
                 self.clear_completed_button,
             )
@@ -948,9 +1114,9 @@ class MainWindow(QMainWindow):
 
         device_results_tab = QWidget()
         device_results_layout = QVBoxLayout(device_results_tab)
-        self.device_table = QTableWidget(0, 5)
+        self.device_table = QTableWidget(0, 6)
         self.device_table.setHorizontalHeaderLabels(
-            ["Device", "Status", "Stage / Line", "Result", "Output"]
+            ["Device", "Status", "Category", "Stage / Line", "Result", "Output"]
         )
         self.device_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.device_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -959,8 +1125,9 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         device_results_layout.addWidget(self.device_table, 1)
 
         progress_grid = QGridLayout()
@@ -999,14 +1166,6 @@ class MainWindow(QMainWindow):
         self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_layout.addWidget(self.history_placeholder, 1)
 
-        self.dictionary_tab = QWidget()
-        self.dictionary_layout = QVBoxLayout(self.dictionary_tab)
-        self.dictionary_placeholder = QLabel(
-            "Open Command Dictionary to browse supported network commands."
-        )
-        self.dictionary_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.dictionary_layout.addWidget(self.dictionary_placeholder, 1)
-
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
@@ -1016,7 +1175,6 @@ class MainWindow(QMainWindow):
 
         self.main_tabs.addTab(ssh_tab, "SSH")
         self.main_tabs.addTab(self.history_tab, "History")
-        self.main_tabs.addTab(self.dictionary_tab, "Dictionary")
         self.main_tabs.currentChanged.connect(self._main_tab_changed)
         self.main_tabs.setCurrentWidget(ssh_tab)
         self.ssh_tab = ssh_tab
@@ -1066,6 +1224,8 @@ class MainWindow(QMainWindow):
         if app is None:
             return
         self._theme_mode = apply_application_theme(app, mode)
+        _repolish_application_widgets(app)
+        QTimer.singleShot(0, lambda: _repolish_application_widgets(app))
         self.settings.setValue("appearance/theme", self._theme_mode)
         self.settings.sync()
         self._update_destructive_button_styles()
@@ -1089,6 +1249,620 @@ class MainWindow(QMainWindow):
             button = getattr(self, name, None)
             if button is not None:
                 button.setStyleSheet(style)
+
+    @Slot()
+    def _open_config_converter(self) -> None:
+        self._ensure_converter_ui()
+        if self.converter_dialog is None:
+            return
+        if self.converter_dialog.isMinimized():
+            self.converter_dialog.showNormal()
+        else:
+            self.converter_dialog.show()
+        self.converter_dialog.raise_()
+        self.converter_dialog.activateWindow()
+        QTimer.singleShot(0, self.converter_source_edit.setFocus)
+
+    def _ensure_converter_ui(self) -> None:
+        if self._converter_ui_built:
+            return
+        self._converter_ui_built = True
+        self.converter_dialog = QDialog(self)
+        self.converter_dialog.setWindowTitle("Config Converter")
+        self.converter_dialog.setAccessibleName("Config Converter")
+        self.converter_dialog.setModal(False)
+        self.converter_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self.converter_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.converter_dialog.setMinimumSize(900, 650)
+        self.converter_dialog.resize(1180, 780)
+        layout = QVBoxLayout(self.converter_dialog)
+
+        scope_label = QLabel(
+            "Generic Cisco IOS XE / Huawei VRP candidate conversion. Verify every "
+            "result against the target model, software release, and site policy."
+        )
+        scope_label.setWordWrap(True)
+        scope_label.setAccessibleName("Converter scope warning")
+        layout.addWidget(scope_label)
+        self.converter_scope_label = scope_label
+
+        direction_row = QHBoxLayout()
+        self.converter_source_vendor_combo = QComboBox()
+        self.converter_source_vendor_combo.addItem("Auto-detect", None)
+        self.converter_source_vendor_combo.addItem("Cisco IOS XE", VENDOR_CISCO)
+        self.converter_source_vendor_combo.addItem("Huawei VRP", VENDOR_HUAWEI)
+        self.converter_swap_button = QPushButton("Swap Direction")
+        self.converter_target_label = QLabel("Target: detected on Convert")
+        self.converter_target_label.setWordWrap(True)
+        direction_row.addWidget(QLabel("Source"))
+        direction_row.addWidget(self.converter_source_vendor_combo)
+        direction_row.addWidget(self.converter_swap_button)
+        direction_row.addWidget(self.converter_target_label, 1)
+        layout.addLayout(direction_row)
+
+        editor_splitter = QSplitter(Qt.Orientation.Horizontal)
+        editor_splitter.setChildrenCollapsible(False)
+
+        source_panel = QWidget()
+        source_layout = QVBoxLayout(source_panel)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_heading = QLabel("Source configuration or commands")
+        source_layout.addWidget(source_heading)
+        self.converter_source_edit = QPlainTextEdit()
+        self.converter_source_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.converter_source_edit.setPlaceholderText(
+            "Paste a configuration, command list, or [exec]/[config] command file."
+        )
+        source_layout.addWidget(self.converter_source_edit, 1)
+        source_actions = QHBoxLayout()
+        self.converter_import_button = QPushButton("Import Configuration")
+        self.converter_clear_button = QPushButton("Clear")
+        self.converter_clear_button.setEnabled(False)
+        self.converter_convert_button = QPushButton("Convert")
+        self.converter_convert_button.setEnabled(False)
+        source_actions.addWidget(self.converter_import_button)
+        source_actions.addWidget(self.converter_clear_button)
+        source_actions.addStretch()
+        source_actions.addWidget(self.converter_convert_button)
+        source_layout.addLayout(source_actions)
+        editor_splitter.addWidget(source_panel)
+
+        output_panel = QWidget()
+        output_layout = QVBoxLayout(output_panel)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_heading = QLabel("Converted target text")
+        output_layout.addWidget(output_heading)
+        self.converter_output_edit = QPlainTextEdit()
+        self.converter_output_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.converter_output_edit.setPlaceholderText(
+            "Converted candidate output appears here and remains editable for review."
+        )
+        output_layout.addWidget(self.converter_output_edit, 1)
+        output_actions = QHBoxLayout()
+        self.converter_recheck_button = QPushButton("Recheck")
+        self.converter_export_button = QPushButton("Export…")
+        self.converter_import_to_ssh_button = QPushButton("Import to SSH Commands")
+        for button in (
+            self.converter_recheck_button,
+            self.converter_export_button,
+            self.converter_import_to_ssh_button,
+        ):
+            button.setEnabled(False)
+        output_actions.addWidget(self.converter_recheck_button)
+        output_actions.addStretch()
+        output_actions.addWidget(self.converter_export_button)
+        output_actions.addWidget(self.converter_import_to_ssh_button)
+        output_layout.addLayout(output_actions)
+        editor_splitter.addWidget(output_panel)
+        editor_splitter.setStretchFactor(0, 1)
+        editor_splitter.setStretchFactor(1, 1)
+        editor_splitter.setSizes([580, 580])
+        self.converter_editor_splitter = editor_splitter
+        layout.addWidget(editor_splitter, 2)
+
+        self.converter_status_label = QLabel(
+            "Enter or import source text, select its vendor or use auto-detect, then Convert."
+        )
+        self.converter_status_label.setWordWrap(True)
+        layout.addWidget(self.converter_status_label)
+
+        self.converter_issue_table = QTableWidget(0, 4)
+        self.converter_issue_table.setHorizontalHeaderLabels(
+            ["Source line", "Disposition", "Section", "Explanation"]
+        )
+        self.converter_issue_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.converter_issue_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.converter_issue_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.converter_issue_table.setAlternatingRowColors(True)
+        self.converter_issue_table.verticalHeader().setVisible(False)
+        issue_header = self.converter_issue_table.horizontalHeader()
+        for column in (0, 1, 2):
+            issue_header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
+            )
+        issue_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.converter_issue_table.setMinimumHeight(150)
+        layout.addWidget(self.converter_issue_table, 1)
+
+        self.converter_source_edit.textChanged.connect(
+            self._converter_source_changed
+        )
+        self.converter_output_edit.textChanged.connect(
+            self._converter_output_changed
+        )
+        self.converter_source_vendor_combo.currentIndexChanged.connect(
+            self._converter_direction_changed
+        )
+        self.converter_swap_button.clicked.connect(self._swap_converter_direction)
+        self.converter_import_button.clicked.connect(self._import_converter_source)
+        self.converter_clear_button.clicked.connect(self._clear_converter)
+        self.converter_convert_button.clicked.connect(self._convert_converter_source)
+        self.converter_recheck_button.clicked.connect(self._recheck_converter_output)
+        self.converter_export_button.clicked.connect(self._export_converter_output)
+        self.converter_import_to_ssh_button.clicked.connect(
+            self._import_converter_to_ssh
+        )
+        self.converter_issue_table.itemSelectionChanged.connect(
+            self._converter_issue_selected
+        )
+
+    @Slot()
+    def _converter_source_changed(self) -> None:
+        if not self._converter_ui_built:
+            return
+        has_source = bool(self.converter_source_edit.toPlainText().strip())
+        self.converter_convert_button.setEnabled(has_source)
+        if self._converter_result is not None:
+            self._converter_source_stale = True
+            self.converter_status_label.setText(
+                "Source changed. Click Convert to replace the stale result."
+            )
+        self._update_converter_actions()
+
+    @Slot()
+    def _converter_output_changed(self) -> None:
+        if not self._converter_ui_built or self._converter_setting_output:
+            return
+        self._converter_output_dirty = True
+        self.converter_status_label.setText(
+            "Output edited. Recheck before SSH import or sectioned export."
+        )
+        self._update_converter_actions()
+
+    @Slot()
+    def _converter_direction_changed(self) -> None:
+        if not self._converter_ui_built:
+            return
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected:
+            self.converter_target_label.setText(
+                f"Target: {vendor_label(opposite_vendor(str(selected)))}"
+            )
+        else:
+            self.converter_target_label.setText("Target: detected on Convert")
+        if self._converter_result is not None:
+            self._converter_source_stale = True
+            self.converter_status_label.setText(
+                "Direction changed. Click Convert to replace the stale result."
+            )
+        self._update_converter_actions()
+
+    @Slot()
+    def _swap_converter_direction(self) -> None:
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected is None:
+            detection = detect_vendor(self.converter_source_edit.toPlainText())
+            if detection.vendor is None:
+                QMessageBox.critical(
+                    self.converter_dialog,
+                    "Cannot swap direction",
+                    "Select a source vendor or enter text with recognizable vendor syntax.",
+                )
+                return
+            selected = detection.vendor
+        target = opposite_vendor(str(selected))
+        index = self.converter_source_vendor_combo.findData(target)
+        self.converter_source_vendor_combo.setCurrentIndex(index)
+
+    def _resolved_converter_source(self, show_error: bool = True) -> Optional[str]:
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected:
+            return str(selected)
+        detection = detect_vendor(self.converter_source_edit.toPlainText())
+        if detection.vendor:
+            return detection.vendor
+        if show_error:
+            QMessageBox.critical(
+                self.converter_dialog,
+                "Source vendor required",
+                "The source is unknown or contains mixed Cisco and Huawei syntax. "
+                "Choose Cisco IOS XE or Huawei VRP explicitly.",
+            )
+        return None
+
+    @Slot()
+    def _convert_converter_source(self) -> None:
+        source_vendor = self._resolved_converter_source()
+        if source_vendor is None:
+            return
+        try:
+            result = convert_text(
+                self.converter_source_edit.toPlainText(), source_vendor
+            )
+        except ValueError as exc:
+            QMessageBox.critical(
+                self.converter_dialog, "Conversion failed", str(exc)
+            )
+            return
+        self._converter_target_vendor = result.target_vendor
+        self.converter_target_label.setText(
+            f"Target: {vendor_label(result.target_vendor)}"
+        )
+        self._converter_setting_output = True
+        try:
+            self.converter_output_edit.setPlainText(result.output_text)
+        finally:
+            self._converter_setting_output = False
+        self._converter_source_stale = False
+        self._converter_output_dirty = False
+        self._set_converter_result(result, is_analysis=False)
+
+    @Slot()
+    def _recheck_converter_output(self) -> None:
+        if self._converter_target_vendor is None:
+            source_vendor = self._resolved_converter_source()
+            if source_vendor is None:
+                return
+            self._converter_target_vendor = opposite_vendor(source_vendor)
+            self.converter_target_label.setText(
+                f"Target: {vendor_label(self._converter_target_vendor)}"
+            )
+        result = analyze_target_text(
+            self.converter_output_edit.toPlainText(),
+            self._converter_target_vendor,
+        )
+        self._converter_output_dirty = False
+        self._set_converter_result(result, is_analysis=True)
+
+    def _set_converter_result(
+        self, result: ConversionResult, *, is_analysis: bool
+    ) -> None:
+        self._converter_result = result
+        self._converter_result_is_analysis = is_analysis
+        table = self.converter_issue_table
+        table.blockSignals(True)
+        table.setRowCount(0)
+        for row, issue in enumerate(result.issues):
+            table.insertRow(row)
+            values = (
+                str(issue.line_number),
+                issue.disposition.title(),
+                issue.section.title(),
+                issue.message,
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, issue)
+                table.setItem(row, column, item)
+        table.blockSignals(False)
+        dispositions = [issue.disposition for issue in result.issues]
+        review_count = dispositions.count(DISPOSITION_REVIEW)
+        unmapped_count = dispositions.count(DISPOSITION_UNMAPPED)
+        ignored_count = dispositions.count(DISPOSITION_IGNORED)
+        blocking_count = len(result.blocking_issues)
+        self.converter_status_label.setText(
+            f"{len(result.commands)} converted | {review_count} review | "
+            f"{unmapped_count} unmapped | {ignored_count} ignored | "
+            f"{blocking_count} blocking"
+        )
+        self._update_converter_actions()
+
+    def _update_converter_actions(self) -> None:
+        if not self._converter_ui_built:
+            return
+        has_source = bool(self.converter_source_edit.toPlainText())
+        has_output = bool(self.converter_output_edit.toPlainText().strip())
+        self.converter_clear_button.setEnabled(has_source or has_output)
+        self.converter_recheck_button.setEnabled(has_output)
+        self.converter_export_button.setEnabled(has_output)
+        self.converter_import_to_ssh_button.setEnabled(has_output)
+
+    @Slot()
+    def _clear_converter(self) -> None:
+        self._converter_result = None
+        self._converter_target_vendor = None
+        self._converter_source_stale = False
+        self._converter_output_dirty = False
+        self._converter_result_is_analysis = False
+        self._converter_setting_output = True
+        try:
+            self.converter_output_edit.clear()
+        finally:
+            self._converter_setting_output = False
+        self.converter_source_edit.clear()
+        self.converter_issue_table.clearContents()
+        self.converter_issue_table.setRowCount(0)
+        selected = self.converter_source_vendor_combo.currentData()
+        if selected:
+            self.converter_target_label.setText(
+                f"Target: {vendor_label(opposite_vendor(str(selected)))}"
+            )
+        else:
+            self.converter_target_label.setText("Target: detected on Convert")
+        self.converter_status_label.setText(
+            "Enter or import source text, select its vendor or use auto-detect, then Convert."
+        )
+        self._update_converter_actions()
+
+    @Slot()
+    def _converter_issue_selected(self) -> None:
+        selected = self.converter_issue_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        item = self.converter_issue_table.item(row, 0)
+        issue = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        if not isinstance(issue, ConversionIssue):
+            return
+        editor = (
+            self.converter_output_edit
+            if self._converter_result_is_analysis
+            else self.converter_source_edit
+        )
+        block = editor.document().findBlockByLineNumber(max(0, issue.line_number - 1))
+        if not block.isValid():
+            return
+        cursor = QTextCursor(block)
+        cursor.select(QTextCursor.SelectionType.LineUnderCursor)
+        editor.setTextCursor(cursor)
+        editor.setFocus()
+
+    @Slot()
+    def _import_converter_source(self) -> None:
+        start = (
+            str(Path(self._last_converter_import).parent)
+            if self._last_converter_import
+            else str(Path.home())
+        )
+        converter_was_visible = bool(
+            self.converter_dialog is not None and self.converter_dialog.isVisible()
+        )
+        selected, _ = QFileDialog.getOpenFileName(
+            self.converter_dialog,
+            "Import configuration or commands",
+            start,
+            "Configuration files (*.cfg *.txt);;All files (*)",
+        )
+        self._restore_converter_after_file_dialog(converter_was_visible)
+        if not selected:
+            return
+        path = Path(selected)
+        text = self._read_import_file(path)
+        if text is None:
+            return
+        self.converter_source_edit.setPlainText(text)
+        self._last_converter_import = str(path)
+
+    def _choose_converter_export_format(self) -> Optional[str]:
+        message = QMessageBox(self.converter_dialog)
+        message.setWindowTitle("Export converted output")
+        message.setText("Choose the export format.")
+        plain_button = message.addButton(
+            "Plain Target Configuration", QMessageBox.ButtonRole.AcceptRole
+        )
+        ssh_button = message.addButton(
+            "SSH [exec]/[config] File", QMessageBox.ButtonRole.ActionRole
+        )
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked is plain_button:
+            return "plain"
+        if clicked is ssh_button:
+            return "ssh"
+        return None
+
+    def _select_converter_export_file(
+        self, title: str, default_name: str, file_filter: str
+    ) -> Optional[Path]:
+        start = (
+            Path(self._last_converter_export).parent
+            if self._last_converter_export
+            else Path.home()
+        )
+        converter_was_visible = bool(
+            self.converter_dialog is not None and self.converter_dialog.isVisible()
+        )
+        selected, _ = QFileDialog.getSaveFileName(
+            self.converter_dialog,
+            title,
+            str(start / default_name),
+            file_filter,
+        )
+        self._restore_converter_after_file_dialog(converter_was_visible)
+        return Path(selected) if selected else None
+
+    def _restore_converter_after_file_dialog(self, was_visible: bool) -> None:
+        if not was_visible or self.converter_dialog is None or self._closing:
+            return
+
+        def restore() -> None:
+            if self.converter_dialog is None or self._closing:
+                return
+            if self.converter_dialog.isMinimized():
+                self.converter_dialog.showNormal()
+            else:
+                self.converter_dialog.show()
+            self.converter_dialog.raise_()
+            self.converter_dialog.activateWindow()
+
+        # Native macOS file panels can deliver their Cancel close event to the
+        # non-modal parent. Restore after that event has drained from the queue.
+        restore()
+        QTimer.singleShot(0, restore)
+
+    @Slot()
+    def _export_converter_output(self) -> None:
+        export_format = self._choose_converter_export_format()
+        if export_format is None:
+            return
+        if export_format == "plain":
+            has_review_risk = bool(
+                self._converter_source_stale
+                or self._converter_output_dirty
+                or (
+                    self._converter_result is not None
+                    and self._converter_result.blocking_issues
+                )
+            )
+            if has_review_risk:
+                answer = QMessageBox.warning(
+                    self.converter_dialog,
+                    "Export review-only output?",
+                    "This output is stale, modified, or contains blocking review items. "
+                    "Export it only as a review candidate.",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+            path = self._select_converter_export_file(
+                "Export target configuration",
+                "converted-config.cfg",
+                "Configuration files (*.cfg *.txt);;All files (*)",
+            )
+            text = self.converter_output_edit.toPlainText()
+        else:
+            result = self._converter_handoff_result()
+            if result is None:
+                return
+            try:
+                text = render_sectioned_commands(result)
+            except ValueError as exc:
+                QMessageBox.critical(
+                    self.converter_dialog, "SSH export blocked", str(exc)
+                )
+                return
+            path = self._select_converter_export_file(
+                "Export SSH command file",
+                "converted-commands.txt",
+                "Text files (*.txt);;All files (*)",
+            )
+        if path is not None and self._write_export_file(path, text):
+            self._last_converter_export = str(path)
+
+    def _converter_handoff_result(self) -> Optional[ConversionResult]:
+        if self._converter_source_stale:
+            QMessageBox.critical(
+                self.converter_dialog,
+                "Stale conversion",
+                "The source or conversion direction changed. Click Convert again first.",
+            )
+            return None
+        if self._converter_output_dirty or self._converter_result is None:
+            self._recheck_converter_output()
+        result = self._converter_result
+        if result is None:
+            return None
+        if result.blocking_issues:
+            QMessageBox.critical(
+                self.converter_dialog,
+                "Import blocked",
+                f"Resolve all {len(result.blocking_issues)} blocking review item(s) "
+                "before executable export or SSH import.",
+            )
+            return None
+        return result
+
+    def _choose_converter_import_mode(
+        self, exec_count: int, config_count: int
+    ) -> Optional[str]:
+        message = QMessageBox(self.converter_dialog)
+        message.setWindowTitle("Import converted commands")
+        message.setText(
+            f"The result contains {exec_count} Exec and {config_count} Config commands. "
+            "The SSH command boxes already contain text."
+        )
+        replace_button = message.addButton(
+            "Replace", QMessageBox.ButtonRole.AcceptRole
+        )
+        append_button = message.addButton(
+            "Append", QMessageBox.ButtonRole.ActionRole
+        )
+        message.addButton(QMessageBox.StandardButton.Cancel)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked is replace_button:
+            return "replace"
+        if clicked is append_button:
+            return "append"
+        return None
+
+    @staticmethod
+    def _append_command_text(existing: str, additional: str) -> str:
+        if not additional:
+            return existing
+        if not existing.strip():
+            return additional
+        return f"{existing.rstrip()}\n{additional}"
+
+    @Slot()
+    def _import_converter_to_ssh(self) -> None:
+        result = self._converter_handoff_result()
+        if result is None:
+            return
+        exec_text = "\n".join(result.exec_commands)
+        config_text = "\n".join(result.config_commands)
+        existing_exec = self.exec_commands_edit.toPlainText()
+        existing_config = self.config_commands_edit.toPlainText()
+        mode = "replace"
+        if existing_exec.strip() or existing_config.strip():
+            selected = self._choose_converter_import_mode(
+                len(result.exec_commands), len(result.config_commands)
+            )
+            if selected is None:
+                return
+            mode = selected
+        if mode == "replace":
+            self.exec_commands_edit.setPlainText(exec_text)
+            self.config_commands_edit.setPlainText(config_text)
+        else:
+            self.exec_commands_edit.setPlainText(
+                self._append_command_text(existing_exec, exec_text)
+            )
+            self.config_commands_edit.setPlainText(
+                self._append_command_text(existing_config, config_text)
+            )
+        device_type = (
+            "cisco_ios"
+            if result.target_vendor == VENDOR_CISCO
+            else "huawei"
+        )
+        self.device_type_combo.setCurrentText(device_type)
+        self._prepared = None
+        self._set_validated(False)
+        self.validation_label.setText(
+            f"Imported {len(result.exec_commands)} Exec and "
+            f"{len(result.config_commands)} Config commands from Config Converter. "
+            "Validate before running."
+        )
+        QMessageBox.information(
+            self.converter_dialog,
+            "SSH commands imported",
+            f"Imported {len(result.exec_commands)} Exec and "
+            f"{len(result.config_commands)} Config commands successfully.\n\n"
+            "Review the converted commands carefully and confirm they are correct "
+            "for the target device before validating or running them.",
+            QMessageBox.StandardButton.Ok,
+        )
 
     def _path_row(self, placeholder: str, callback) -> tuple[QLineEdit, QWidget]:
         edit = QLineEdit()
@@ -1404,9 +2178,10 @@ class MainWindow(QMainWindow):
             self._rows[entry.address] = row
             self._set_cell(row, 0, entry.address)
             self._set_cell(row, 1, "Invalid" if entry.error else "Ready")
-            self._set_cell(row, 2, "")
-            self._set_cell(row, 3, entry.error)
-            self._set_cell(row, 4, "")
+            self._set_cell(row, 2, "Input Validation" if entry.error else "")
+            self._set_cell(row, 3, "Input validation" if entry.error else "")
+            self._set_cell(row, 4, entry.error)
+            self._set_cell(row, 5, "")
         self.progress_bar.setRange(0, max(1, len(prepared.entries)))
         self.progress_bar.setValue(0)
         self.status_label.setText("Validated")
@@ -1420,7 +2195,14 @@ class MainWindow(QMainWindow):
 
     def _initialize_job_rows(self, job_id: str, prepared: PreparedRun) -> None:
         self._job_rows[job_id] = [
-            [entry.address, "Invalid" if entry.error else "Ready", "", entry.error, ""]
+            [
+                entry.address,
+                "Invalid" if entry.error else "Ready",
+                "Input Validation" if entry.error else "",
+                "Input validation" if entry.error else "",
+                entry.error,
+                "",
+            ]
             for entry in prepared.entries
         ]
         self._job_progress[job_id] = (
@@ -1480,20 +2262,20 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.device_table.setItem(row, column, item)
         item.setText(value)
-        if column == 3:
+        if column == 4:
             item.setToolTip("Double-click to view the full result" if value else "")
-        elif column == 4:
+        elif column == 5:
             item.setToolTip("Double-click to open this output file" if value else "")
 
     @Slot(int, int)
     def handle_table_double_click(self, row: int, column: int) -> None:
-        if column == 3:
+        if column == 4:
             self.show_result_details(row)
-        elif column == 4:
+        elif column == 5:
             self.open_transcript_at(row, column)
 
     def show_result_details(self, row: int) -> None:
-        result_item = self.device_table.item(row, 3)
+        result_item = self.device_table.item(row, 4)
         if result_item is None or not result_item.text().strip():
             return
 
@@ -1519,7 +2301,7 @@ class MainWindow(QMainWindow):
 
     @Slot(int, int)
     def open_transcript_at(self, row: int, column: int) -> None:
-        if column != 4:
+        if column != 5:
             return
         item = self.device_table.item(row, column)
         if item is None or not item.text().strip():
@@ -1557,18 +2339,27 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def start_run(self) -> None:
-        self._submit_batch(scheduled_utc=None, request_dispatch=True)
+        self._submit_batch(
+            scheduled_utc=None,
+            latest_start_utc=None,
+            request_dispatch=True,
+        )
 
     @Slot()
     def schedule_batch(self) -> None:
         dialog = ScheduleDialog(parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self._submit_batch(scheduled_utc=dialog.selected_utc(), request_dispatch=False)
+        self._submit_batch(
+            scheduled_utc=dialog.selected_utc(),
+            latest_start_utc=dialog.latest_start_utc(),
+            request_dispatch=False,
+        )
 
     def _submit_batch(
         self,
         scheduled_utc: Optional[datetime],
+        latest_start_utc: Optional[datetime],
         request_dispatch: bool,
     ) -> None:
         if not self.validate_inputs(show_success=False) or self._prepared is None:
@@ -1580,6 +2371,8 @@ class MainWindow(QMainWindow):
             schedule_text = (
                 "\nScheduled for "
                 f"{scheduled_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
+                "Must start by "
+                f"{latest_start_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
             )
         answer = QMessageBox.warning(
             self,
@@ -1602,7 +2395,12 @@ class MainWindow(QMainWindow):
                 prepared,
                 self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
             )
-            job = self.queue_controller.add(payload, prepared, scheduled_utc)
+            job = self.queue_controller.add(
+                payload,
+                prepared,
+                scheduled_utc,
+                latest_start_utc,
+            )
         except (QueueStorageError, OSError) as exc:
             QMessageBox.critical(self, "Could not queue batch", str(exc))
             return
@@ -1621,7 +2419,11 @@ class MainWindow(QMainWindow):
     def _queue_tick(self) -> None:
         if self._closing:
             return
-        self.queue_controller.refresh_due()
+        warnings = self.queue_controller.refresh_due()
+        if warnings:
+            self.validation_label.setText(
+                "Keychain cleanup warning: " + " ".join(warnings)
+            )
         self._refresh_queue_table(select_job_id=self._selected_job_id)
         future_armed = any(
             job.status == "scheduled" for job in self.queue_controller.pending_jobs()
@@ -1671,6 +2473,7 @@ class MainWindow(QMainWindow):
             batch_name=job.name,
             created_utc=job.created_utc,
             scheduled_utc=job.scheduled_utc,
+            latest_start_utc=job.latest_start_utc,
             started_utc=self._clock(),
             completed_utc=None,
             source="scheduled" if job.scheduled_utc else "manual",
@@ -1734,6 +2537,7 @@ class MainWindow(QMainWindow):
                 str(result.run_directory) if result else "",
                 str(result.summary_path) if result else "",
                 completed_utc=self._clock(),
+                failure_counts=result.failure_counts if result else None,
             )
             record = self.history_store.get(job_id)
             if record and record.run_directory:
@@ -1803,21 +2607,22 @@ class MainWindow(QMainWindow):
         elif event.kind == "device_status":
             self._set_cell(row, 1, event.status.title())
             if event.section:
-                self._set_cell(row, 2, event.section)
+                self._set_cell(row, 3, event.section)
         elif event.kind == "command_started":
             self._set_cell(row, 1, "Running")
-            self._set_cell(row, 2, f"{event.section} / {event.line_number}")
+            self._set_cell(row, 3, f"{event.section} / {event.line_number}")
         elif event.kind == "device_finished":
             status = event.status.title()
             if self._operation == "connection_test" and event.status == "success":
                 status = "Passed"
             self._set_cell(row, 1, status)
+            self._set_cell(row, 2, failure_category_label(event.failure_category))
             if event.line_number:
-                self._set_cell(row, 2, f"{event.section} / {event.line_number}")
+                self._set_cell(row, 3, f"{event.section} / {event.line_number}")
             elif event.section:
-                self._set_cell(row, 2, event.section)
-            self._set_cell(row, 3, event.message or status)
-            self._set_cell(row, 4, event.transcript_file)
+                self._set_cell(row, 3, event.section)
+            self._set_cell(row, 4, event.message or status)
+            self._set_cell(row, 5, event.transcript_file)
             self.progress_bar.setValue(event.index)
 
     def _handle_job_progress(self, job_id: str, event: ProgressEvent) -> None:
@@ -1833,29 +2638,35 @@ class MainWindow(QMainWindow):
         elif event.kind == "device_status":
             self._set_job_cell(job_id, event.address, 1, event.status.title())
             if event.section:
-                self._set_job_cell(job_id, event.address, 2, event.section)
+                self._set_job_cell(job_id, event.address, 3, event.section)
         elif event.kind == "command_started":
             self._set_job_cell(job_id, event.address, 1, "Running")
             self._set_job_cell(
                 job_id,
                 event.address,
-                2,
+                3,
                 f"{event.section} / {event.line_number}",
             )
         elif event.kind == "device_finished":
             shown_status = event.status.title()
             self._set_job_cell(job_id, event.address, 1, shown_status)
+            self._set_job_cell(
+                job_id,
+                event.address,
+                2,
+                failure_category_label(event.failure_category),
+            )
             if event.line_number:
                 self._set_job_cell(
                     job_id,
                     event.address,
-                    2,
+                    3,
                     f"{event.section} / {event.line_number}",
                 )
             elif event.section:
-                self._set_job_cell(job_id, event.address, 2, event.section)
-            self._set_job_cell(job_id, event.address, 3, event.message or shown_status)
-            self._set_job_cell(job_id, event.address, 4, event.transcript_file)
+                self._set_job_cell(job_id, event.address, 3, event.section)
+            self._set_job_cell(job_id, event.address, 4, event.message or shown_status)
+            self._set_job_cell(job_id, event.address, 5, event.transcript_file)
             value = event.index
         self._job_progress[job_id] = (value, maximum, status_text, totals)
         if self._selected_job_id == job_id:
@@ -1887,10 +2698,7 @@ class MainWindow(QMainWindow):
                 if result.failures
                 else "succeeded"
             )
-            result_text = (
-                f"{result.successes} succeeded, {result.failures} failed, "
-                f"{result.cancelled} cancelled"
-            )
+            result_text = format_batch_summary(result)
             self._finalize_audit_record(
                 job_id, terminal_status, result_text, result
             )
@@ -1914,8 +2722,7 @@ class MainWindow(QMainWindow):
         self._batch_result = result
         if self._operation == "connection_test":
             self.totals_label.setText(
-                f"{result.successes} passed, {result.failures} failed, "
-                f"{result.cancelled} cancelled"
+                format_batch_summary(result, "passed")
             )
             self.status_label.setText(
                 "Connection test complete"
@@ -1924,8 +2731,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.totals_label.setText(
-                f"{result.successes} succeeded, {result.failures} failed, "
-                f"{result.cancelled} cancelled"
+                format_batch_summary(result)
             )
             self.status_label.setText(
                 "Run complete" if not result.cancelled else "Run cancelled"
@@ -2004,6 +2810,11 @@ class MainWindow(QMainWindow):
                     if job.scheduled_utc
                     else "Ready now"
                 )
+                latest_start = (
+                    job.latest_start_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+                    if job.latest_start_utc
+                    else "No expiry (legacy)" if job.scheduled_utc else "—"
+                )
                 status = job.status.replace("_", " ").title()
                 values = (
                     order_item,
@@ -2015,6 +2826,7 @@ class MainWindow(QMainWindow):
                     ),
                     QTableWidgetItem(str(job.command_count)),
                     QTableWidgetItem(scheduled),
+                    QTableWidgetItem(latest_start),
                     QTableWidgetItem(status),
                     QTableWidgetItem(job.result),
                 )
@@ -2056,6 +2868,10 @@ class MainWindow(QMainWindow):
         self.edit_batch_button.setEnabled(editable and self._editing_job_id is None)
         self.reschedule_button.setEnabled(editable)
         self.retry_button.setEnabled(bool(job and job.status in {"blocked", "interrupted"}))
+        result = self._job_results.get(job.job_id) if job else None
+        self.retry_failed_button.setEnabled(
+            bool(result and any(item.status == "failed" for item in result.results))
+        )
         self.remove_batch_button.setEnabled(bool(job and job.status != "running"))
         self.clear_completed_button.setEnabled(
             bool(self.queue_controller.completed_jobs())
@@ -2084,6 +2900,9 @@ class MainWindow(QMainWindow):
     def edit_selected_batch(self) -> None:
         job_id = self._selected_queue_job_id()
         if not job_id:
+            return
+        job = self.queue_controller.job(job_id)
+        if job is None:
             return
         if any(
             (
@@ -2161,7 +2980,11 @@ class MainWindow(QMainWindow):
                 self._prepared,
                 self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
             )
-            self.queue_controller.replace_payload(job_id, payload, self._prepared)
+            self.queue_controller.replace_payload(
+                job_id,
+                payload,
+                self._prepared,
+            )
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not save batch", str(exc))
             return
@@ -2190,11 +3013,19 @@ class MainWindow(QMainWindow):
         job = self.queue_controller.job(job_id)
         if job is None:
             return
-        dialog = ScheduleDialog(job.scheduled_utc, self)
+        dialog = ScheduleDialog(
+            job.scheduled_utc,
+            job.latest_start_utc,
+            self,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.queue_controller.reschedule(job.job_id, dialog.selected_utc())
+            self.queue_controller.reschedule(
+                job.job_id,
+                dialog.selected_utc(),
+                dialog.latest_start_utc(),
+            )
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not reschedule batch", str(exc))
             return
@@ -2228,6 +3059,132 @@ class MainWindow(QMainWindow):
             return
         self._refresh_queue_table(select_job_id=job.job_id)
         QTimer.singleShot(0, self._queue_tick)
+
+    @Slot()
+    def retry_failed_queue_batch(self) -> None:
+        job_id = self._selected_queue_job_id()
+        job = self.queue_controller.job(job_id)
+        result = self._job_results.get(job_id or "")
+        prepared = self._job_prepared.get(job_id or "")
+        if job is None or result is None or prepared is None:
+            QMessageBox.critical(
+                self,
+                "Retry unavailable",
+                "The completed batch details are no longer available in this session.",
+            )
+            return
+        self._create_retry_draft(
+            profile_label=job.profile_label,
+            device_type=job.device_type,
+            output_dir=prepared.request.output_dir,
+            commands=prepared.commands,
+            results=result.results,
+        )
+
+    @Slot()
+    def retry_failed_history_batch(self) -> None:
+        record = self._selected_history_record()
+        if record is None:
+            return
+        try:
+            results = read_summary(Path(record.summary_path))
+            snapshot = self.history_command_store.get(record.job_id)
+        except HistoryError as exc:
+            QMessageBox.critical(self, "Retry unavailable", str(exc))
+            return
+        output_dir = (
+            Path(record.run_directory).parent
+            if record.run_directory
+            else Path(self.output_edit.text().strip()).expanduser()
+        )
+        self._create_retry_draft(
+            profile_label=record.profile_label,
+            device_type=record.device_type,
+            output_dir=output_dir,
+            commands=snapshot.commands,
+            results=results,
+        )
+
+    def _create_retry_draft(
+        self,
+        *,
+        profile_label: str,
+        device_type: str,
+        output_dir: Path,
+        commands: Sequence[Command],
+        results: Sequence[DeviceResult],
+    ) -> None:
+        failed = tuple(result for result in results if result.status == "failed")
+        if not failed:
+            QMessageBox.critical(
+                self,
+                "Retry unavailable",
+                "This batch has no failed devices to retry.",
+            )
+            return
+        has_form_content = any(
+            (
+                self.inventory_text_edit.toPlainText().strip(),
+                self.exec_commands_edit.toPlainText().strip(),
+                self.config_commands_edit.toPlainText().strip(),
+                self.username_edit.text(),
+                self.password_edit.text(),
+            )
+        )
+        if has_form_content or self._editing_job_id is not None:
+            answer = QMessageBox.question(
+                self,
+                "Replace current form?",
+                "Creating this retry draft will replace the current form contents.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        exec_text = "\n".join(
+            command.text for command in commands if command.section == "exec"
+        )
+        config_text = "\n".join(
+            command.text for command in commands if command.section == "config"
+        )
+        matching_profile = next(
+            (profile for profile in self.profile_store.profiles() if profile.name == profile_label),
+            None,
+        )
+
+        self._loading_settings = True
+        try:
+            self.inventory_text_edit.setPlainText(
+                "\n".join(result.address for result in failed)
+            )
+            self.exec_commands_edit.setPlainText(exec_text)
+            self.config_commands_edit.setPlainText(config_text)
+            self.device_type_combo.setCurrentText(device_type)
+            self.output_edit.setText(str(output_dir))
+        finally:
+            self._loading_settings = False
+
+        self._editing_job_id = None
+        self._editing_connection_settings = None
+        self.save_edit_button.hide()
+        self.cancel_edit_button.hide()
+        if matching_profile is not None:
+            self._refresh_profile_combo(matching_profile.profile_id)
+            if not self._load_profile_by_id(matching_profile.profile_id, startup=False):
+                self._switch_to_manual(clear_credentials=True)
+        else:
+            self._switch_to_manual(clear_credentials=True)
+        self._selected_job_id = None
+        self._prepared = None
+        self._set_validated(False)
+        self.validation_label.setText(
+            f"Retry draft created for {len(failed)} failed device(s). "
+            "Review and validate before running."
+        )
+        self.main_tabs.setCurrentWidget(self.ssh_tab)
+        self.results_tabs.setCurrentIndex(0)
+        self._update_queue_controls()
 
     @Slot()
     def remove_selected_batch(self) -> None:
@@ -2266,7 +3223,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Clear completed runs?",
-            f"Remove {len(completed)} completed run(s) from the queue history?\n\n"
+            f"Remove {len(completed)} completed or expired queue entry/entries?\n\n"
             "Running, queued, and scheduled batches will remain. Output files, "
             "transcripts, and summaries will not be deleted.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
@@ -2306,9 +3263,6 @@ class MainWindow(QMainWindow):
     def _main_tab_changed(self, index: int) -> None:
         if index == self.main_tabs.indexOf(self.history_tab):
             self._ensure_history_ui()
-        elif index == self.main_tabs.indexOf(self.dictionary_tab):
-            self._ensure_dictionary_ui()
-            QTimer.singleShot(0, self.dictionary_search_edit.setFocus)
         self._acknowledge_results_attention_if_visible()
 
     def _device_results_visible(self) -> bool:
@@ -2377,12 +3331,34 @@ class MainWindow(QMainWindow):
                 self._results_attention_highlighted
             )
 
+    @Slot()
+    def _open_command_dictionary(self) -> None:
+        self._ensure_dictionary_ui()
+        if self.dictionary_dialog is None:
+            return
+        if self.dictionary_dialog.isMinimized():
+            self.dictionary_dialog.showNormal()
+        else:
+            self.dictionary_dialog.show()
+        self.dictionary_dialog.raise_()
+        self.dictionary_dialog.activateWindow()
+        QTimer.singleShot(0, self.dictionary_search_edit.setFocus)
+
     def _ensure_dictionary_ui(self) -> None:
         if self._dictionary_ui_built:
             return
         self._dictionary_ui_built = True
-        self.dictionary_layout.removeWidget(self.dictionary_placeholder)
-        self.dictionary_placeholder.deleteLater()
+        self.dictionary_dialog = QDialog(self)
+        self.dictionary_dialog.setWindowTitle("Command Dictionary")
+        self.dictionary_dialog.setAccessibleName("Command Dictionary")
+        self.dictionary_dialog.setModal(False)
+        self.dictionary_dialog.setWindowModality(Qt.WindowModality.NonModal)
+        self.dictionary_dialog.setAttribute(
+            Qt.WidgetAttribute.WA_DeleteOnClose, False
+        )
+        self.dictionary_dialog.setMinimumSize(900, 600)
+        self.dictionary_dialog.resize(1000, 680)
+        self.dictionary_layout = QVBoxLayout(self.dictionary_dialog)
 
         filters = QHBoxLayout()
         self.dictionary_search_edit = QLineEdit()
@@ -2819,6 +3795,28 @@ class MainWindow(QMainWindow):
             cards.addWidget(group)
         self.history_layout.addLayout(cards)
 
+        trend_controls = QHBoxLayout()
+        trend_label = QLabel("Trend")
+        self.history_trend_combo = QComboBox()
+        self.history_trend_combo.addItem("Device Results", HISTORY_TREND_DEVICES)
+        self.history_trend_combo.addItem("Run Duration", HISTORY_TREND_DURATION)
+        trend_label.setBuddy(self.history_trend_combo)
+        trend_controls.addWidget(trend_label)
+        trend_controls.addWidget(self.history_trend_combo)
+        trend_controls.addStretch()
+        breakdown_label = QLabel("Breakdown")
+        self.history_breakdown_combo = QComboBox()
+        self.history_breakdown_combo.addItem(
+            "Run Status", HISTORY_BREAKDOWN_STATUS
+        )
+        self.history_breakdown_combo.addItem(
+            "Failure Causes", HISTORY_BREAKDOWN_FAILURES
+        )
+        breakdown_label.setBuddy(self.history_breakdown_combo)
+        trend_controls.addWidget(breakdown_label)
+        trend_controls.addWidget(self.history_breakdown_combo)
+        self.history_layout.addLayout(trend_controls)
+
         charts = QHBoxLayout()
         self.history_line_view = QChartView()
         self.history_pie_view = QChartView()
@@ -2879,6 +3877,7 @@ class MainWindow(QMainWindow):
         actions = QGridLayout()
         self.history_results_button = QPushButton("View Device Results")
         self.history_commands_button = QPushButton("View Commands")
+        self.history_retry_failed_button = QPushButton("Retry Failed Devices…")
         self.history_output_button = QPushButton("Open Output Folder")
         self.history_summary_button = QPushButton("Open Summary")
         self.history_remove_button = QPushButton("Remove from History")
@@ -2886,6 +3885,7 @@ class MainWindow(QMainWindow):
         self.history_clear_button = QPushButton("Clear History")
         self.history_results_button.clicked.connect(self.view_history_results)
         self.history_commands_button.clicked.connect(self.view_history_commands)
+        self.history_retry_failed_button.clicked.connect(self.retry_failed_history_batch)
         self.history_output_button.clicked.connect(self.open_history_output)
         self.history_summary_button.clicked.connect(self.open_history_summary)
         self.history_remove_button.clicked.connect(self.remove_history_record)
@@ -2897,6 +3897,7 @@ class MainWindow(QMainWindow):
             (
                 self.history_results_button,
                 self.history_commands_button,
+                self.history_retry_failed_button,
                 self.history_output_button,
                 self.history_summary_button,
                 self.history_remove_button,
@@ -2917,6 +3918,12 @@ class MainWindow(QMainWindow):
             self.history_profile_combo,
         ):
             combo.currentIndexChanged.connect(self._history_filters_changed)
+        self.history_trend_combo.currentIndexChanged.connect(
+            self._history_chart_changed
+        )
+        self.history_breakdown_combo.currentIndexChanged.connect(
+            self._history_chart_changed
+        )
         self._refresh_history_filter_values()
         self._refresh_history()
 
@@ -2945,6 +3952,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _history_filters_changed(self) -> None:
         self._history_page = 0
+        self._refresh_history()
+
+    @Slot()
+    def _history_chart_changed(self) -> None:
         self._refresh_history()
 
     def _history_filter(self) -> HistoryFilter:
@@ -2981,7 +3992,13 @@ class MainWindow(QMainWindow):
             stats = self.history_store.stats(filters)
             granularity = self._history_granularity()
             timeline = self.history_store.timeline(filters, granularity)
+            duration_timeline = (
+                self.history_store.duration_timeline(filters, granularity)
+                if self.history_trend_combo.currentData() == HISTORY_TREND_DURATION
+                else []
+            )
             statuses = self.history_store.status_counts(filters)
+            failure_categories = self.history_store.failure_category_counts(filters)
         except HistoryError as exc:
             self.validation_label.setText(f"Audit history warning: {exc}")
             return
@@ -2990,7 +4007,13 @@ class MainWindow(QMainWindow):
         self.history_success_value.setText(str(stats.successes))
         self.history_failure_value.setText(str(stats.failures))
         self.history_rate_value.setText(f"{stats.success_rate:.1f}%")
-        self._update_history_charts(timeline, statuses, granularity)
+        self._update_history_charts(
+            timeline,
+            duration_timeline,
+            statuses,
+            failure_categories,
+            granularity,
+        )
 
         self.history_table.blockSignals(True)
         self.history_table.setRowCount(0)
@@ -3085,6 +4108,30 @@ class MainWindow(QMainWindow):
         return detail
 
     @staticmethod
+    def _history_failure_detail(label: str, count: int, total: int) -> str:
+        noun = "device" if count == 1 else "devices"
+        detail = f"{label}\n{count} {noun}"
+        if total > 0:
+            detail += f" ({count / total:.1%})"
+        return detail
+
+    @classmethod
+    def _history_duration_detail(
+        cls,
+        label: str,
+        granularity: str,
+        median_seconds: float,
+        average_seconds: float,
+        run_count: int,
+    ) -> str:
+        return (
+            f"{cls._history_bucket_heading(label, granularity)}\n"
+            f"Median: {cls._format_duration(round(median_seconds))}\n"
+            f"Average: {cls._format_duration(round(average_seconds))}\n"
+            f"Runs: {run_count}"
+        )
+
+    @staticmethod
     def _show_history_chart_tooltip(view: QWidget, detail: str) -> None:
         if detail:
             QToolTip.showText(QCursor.pos(), detail, view)
@@ -3094,7 +4141,9 @@ class MainWindow(QMainWindow):
     def _update_history_charts(
         self,
         timeline,
+        duration_timeline,
         statuses: dict[str, int],
+        failure_categories: dict[str, int],
         granularity: str = "daily",
     ) -> None:
         from PySide6.QtCharts import (
@@ -3113,132 +4162,275 @@ class MainWindow(QMainWindow):
         failure_color = QColor("#ef5350" if dark_mode else "#c62828")
 
         chart = QChart()
-        chart.setTitle("Successful and failed devices over time")
-        success_series = QLineSeries()
-        success_series.setName("Succeeded")
-        success_series.setColor(success_color)
-        success_series.setPointsVisible(True)
-        success_series.setMarkerSize(8.0)
-        failure_series = QLineSeries()
-        failure_series.setName("Failed")
-        failure_series.setColor(failure_color)
-        failure_series.setPointsVisible(True)
-        failure_series.setMarkerSize(8.0)
         labels: list[str] = []
-        maximum = 1
-        for index, bucket in enumerate(timeline):
-            labels.append(bucket.label)
-            success_series.append(index, bucket.successes)
-            failure_series.append(index, bucket.failures)
-            maximum = max(maximum, bucket.successes, bucket.failures)
-
-        timeline_values = tuple(
-            (bucket.label, int(bucket.successes), int(bucket.failures))
-            for bucket in timeline
-        )
-
-        def line_detail(point, series_name: str, value_index: int) -> str:
-            try:
-                index = int(round(point.x()))
-            except (OverflowError, TypeError, ValueError):
-                return ""
-            if index < 0 or index >= len(timeline_values):
-                return ""
-            label, successes, failures = timeline_values[index]
-            count = (successes, failures)[value_index]
-            return self._history_line_detail(
-                label, granularity, series_name, count
-            )
-
-        for series, series_name, value_index in (
-            (success_series, "Succeeded", 0),
-            (failure_series, "Failed", 1),
-        ):
-            series.hovered.connect(
-                lambda point, state, name=series_name, index=value_index: (
-                    self._show_history_chart_tooltip(
-                        self.history_line_view,
-                        line_detail(point, name, index) if state else "",
-                    )
-                )
-            )
-            series.clicked.connect(
-                lambda point, name=series_name, index=value_index: (
-                    self._show_history_chart_tooltip(
-                        self.history_line_view,
-                        line_detail(point, name, index),
-                    )
-                )
-            )
-        chart.addSeries(success_series)
-        chart.addSeries(failure_series)
         x_axis = QBarCategoryAxis()
-        x_axis.append(labels or ["No data"])
         y_axis = QValueAxis()
-        y_axis.setLabelFormat("%d")
-        y_axis.setRange(0, maximum)
-        y_axis.setTickCount(min(6, maximum + 1))
+        if self.history_trend_combo.currentData() == HISTORY_TREND_DURATION:
+            duration_color = QColor("#64b5f6" if dark_mode else "#1565c0")
+            duration_series = QLineSeries()
+            duration_series.setName("Median Duration")
+            duration_series.setColor(duration_color)
+            duration_series.setPointsVisible(True)
+            duration_series.setMarkerSize(8.0)
+            duration_values = tuple(
+                (
+                    bucket.label,
+                    float(bucket.median_seconds),
+                    float(bucket.average_seconds),
+                    int(bucket.run_count),
+                )
+                for bucket in duration_timeline
+            )
+            chart.setTitle(
+                "Median run duration over time"
+                if duration_values
+                else "No completed run duration data"
+            )
+            maximum_minutes = 1.0
+            for index, (label, median_seconds, _average, _count) in enumerate(
+                duration_values
+            ):
+                labels.append(label)
+                median_minutes = median_seconds / 60.0
+                duration_series.append(index, median_minutes)
+                maximum_minutes = max(maximum_minutes, median_minutes)
+
+            def duration_detail(point) -> str:
+                try:
+                    index = int(round(point.x()))
+                except (OverflowError, TypeError, ValueError):
+                    return ""
+                if index < 0 or index >= len(duration_values):
+                    return ""
+                label, median_seconds, average_seconds, run_count = (
+                    duration_values[index]
+                )
+                return self._history_duration_detail(
+                    label,
+                    granularity,
+                    median_seconds,
+                    average_seconds,
+                    run_count,
+                )
+
+            duration_series.hovered.connect(
+                lambda point, state: self._show_history_chart_tooltip(
+                    self.history_line_view,
+                    duration_detail(point) if state else "",
+                )
+            )
+            duration_series.clicked.connect(
+                lambda point: self._show_history_chart_tooltip(
+                    self.history_line_view,
+                    duration_detail(point),
+                )
+            )
+            chart.addSeries(duration_series)
+            y_axis.setTitleText("Duration (minutes)")
+            y_axis.setLabelFormat("%.1f")
+            y_axis.setRange(0.0, maximum_minutes)
+            y_axis.setTickCount(6)
+            self.history_line_view.setAccessibleName(
+                "Median run duration over time"
+            )
+            duration_accessible = [
+                self._history_duration_detail(
+                    label,
+                    granularity,
+                    median_seconds,
+                    average_seconds,
+                    run_count,
+                ).replace("\n", ": ", 1).replace("\n", ", ")
+                for label, median_seconds, average_seconds, run_count in (
+                    duration_values
+                )
+            ]
+            self.history_line_view.setAccessibleDescription(
+                "; ".join(duration_accessible)
+                or "No completed run duration data"
+            )
+            line_series = (duration_series,)
+        else:
+            chart.setTitle("Successful and failed devices over time")
+            success_series = QLineSeries()
+            success_series.setName("Succeeded")
+            success_series.setColor(success_color)
+            success_series.setPointsVisible(True)
+            success_series.setMarkerSize(8.0)
+            failure_series = QLineSeries()
+            failure_series.setName("Failed")
+            failure_series.setColor(failure_color)
+            failure_series.setPointsVisible(True)
+            failure_series.setMarkerSize(8.0)
+            maximum = 1
+            for index, bucket in enumerate(timeline):
+                labels.append(bucket.label)
+                success_series.append(index, bucket.successes)
+                failure_series.append(index, bucket.failures)
+                maximum = max(maximum, bucket.successes, bucket.failures)
+
+            timeline_values = tuple(
+                (bucket.label, int(bucket.successes), int(bucket.failures))
+                for bucket in timeline
+            )
+
+            def line_detail(point, series_name: str, value_index: int) -> str:
+                try:
+                    index = int(round(point.x()))
+                except (OverflowError, TypeError, ValueError):
+                    return ""
+                if index < 0 or index >= len(timeline_values):
+                    return ""
+                label, successes, failures = timeline_values[index]
+                count = (successes, failures)[value_index]
+                return self._history_line_detail(
+                    label, granularity, series_name, count
+                )
+
+            for series, series_name, value_index in (
+                (success_series, "Succeeded", 0),
+                (failure_series, "Failed", 1),
+            ):
+                series.hovered.connect(
+                    lambda point, state, name=series_name, index=value_index: (
+                        self._show_history_chart_tooltip(
+                            self.history_line_view,
+                            line_detail(point, name, index) if state else "",
+                        )
+                    )
+                )
+                series.clicked.connect(
+                    lambda point, name=series_name, index=value_index: (
+                        self._show_history_chart_tooltip(
+                            self.history_line_view,
+                            line_detail(point, name, index),
+                        )
+                    )
+                )
+            chart.addSeries(success_series)
+            chart.addSeries(failure_series)
+            y_axis.setLabelFormat("%d")
+            y_axis.setRange(0, maximum)
+            y_axis.setTickCount(min(6, maximum + 1))
+            self.history_line_view.setAccessibleName(
+                "Successful and failed devices over time"
+            )
+            line_accessible = []
+            for label, successes, failures in timeline_values:
+                heading = self._history_bucket_heading(label, granularity)
+                success_noun = "device" if successes == 1 else "devices"
+                failure_noun = "device" if failures == 1 else "devices"
+                line_accessible.append(
+                    f"{heading}: {successes} succeeded {success_noun}, "
+                    f"{failures} failed {failure_noun}"
+                )
+            self.history_line_view.setAccessibleDescription(
+                "; ".join(line_accessible) or "No timeline data"
+            )
+            line_series = (success_series, failure_series)
+
+        x_axis.append(labels or ["No data"])
         chart.addAxis(x_axis, Qt.AlignmentFlag.AlignBottom)
         chart.addAxis(y_axis, Qt.AlignmentFlag.AlignLeft)
-        success_series.attachAxis(x_axis)
-        success_series.attachAxis(y_axis)
-        failure_series.attachAxis(x_axis)
-        failure_series.attachAxis(y_axis)
+        for series in line_series:
+            series.attachAxis(x_axis)
+            series.attachAxis(y_axis)
         self._style_history_chart(chart, (x_axis, y_axis))
         self.history_line_view.setBackgroundBrush(
             QBrush(palette.color(QPalette.ColorRole.Window))
         )
-        self.history_line_view.setAccessibleName(
-            "Successful and failed devices over time"
-        )
-        line_accessible = []
-        for label, successes, failures in timeline_values:
-            heading = self._history_bucket_heading(label, granularity)
-            success_noun = "device" if successes == 1 else "devices"
-            failure_noun = "device" if failures == 1 else "devices"
-            line_accessible.append(
-                f"{heading}: {successes} succeeded {success_noun}, "
-                f"{failures} failed {failure_noun}"
-            )
-        self.history_line_view.setAccessibleDescription(
-            "; ".join(line_accessible) or "No timeline data"
-        )
         self.history_line_view.setChart(chart)
 
         pie_chart = QChart()
-        pie_chart.setTitle("Run status")
         pie = QPieSeries()
         pie.setHoleSize(0.45)
-        colors = (
-            {
-                "succeeded": "#66bb6a",
-                "completed_with_failures": "#ffca28",
-                "failed": "#ef5350",
-                "cancelled": "#b0bec5",
-                "interrupted": "#ba68c8",
-                "running": "#64b5f6",
-            }
-            if dark_mode
-            else {
-                "succeeded": "#2e7d32",
-                "completed_with_failures": "#f9a825",
-                "failed": "#c62828",
-                "cancelled": "#616161",
-                "interrupted": "#6a1b9a",
-                "running": "#1565c0",
-            }
-        )
-        status_total = sum(count for count in statuses.values() if count > 0)
-        status_accessible = []
-        for status, count in statuses.items():
+        if self.history_breakdown_combo.currentData() == HISTORY_BREAKDOWN_FAILURES:
+            colors = (
+                {
+                    "input_validation": "#90a4ae",
+                    "connectivity": "#64b5f6",
+                    "authentication": "#ef5350",
+                    "privilege": "#ffa726",
+                    "command_rejected": "#ffca28",
+                    "command_timeout": "#ba68c8",
+                    "device_operation": "#4db6ac",
+                    "unexpected": "#a1887f",
+                    UNCATEGORIZED_FAILURE: "#b0bec5",
+                }
+                if dark_mode
+                else {
+                    "input_validation": "#546e7a",
+                    "connectivity": "#1565c0",
+                    "authentication": "#c62828",
+                    "privilege": "#ef6c00",
+                    "command_rejected": "#f9a825",
+                    "command_timeout": "#6a1b9a",
+                    "device_operation": "#00796b",
+                    "unexpected": "#6d4c41",
+                    UNCATEGORIZED_FAILURE: "#616161",
+                }
+            )
+            values = [
+                (
+                    category.value,
+                    failure_category_label(category),
+                    failure_categories.get(category.value, 0),
+                )
+                for category in FailureCategory
+            ]
+            values.append(
+                (
+                    UNCATEGORIZED_FAILURE,
+                    "Uncategorized",
+                    failure_categories.get(UNCATEGORIZED_FAILURE, 0),
+                )
+            )
+            total = sum(count for _key, _label, count in values if count > 0)
+            pie_chart.setTitle(
+                "Failure causes" if total else "No failure cause data"
+            )
+            accessible_name = "Failure causes"
+            empty_description = "No failure cause data"
+            detail_builder = self._history_failure_detail
+        else:
+            colors = (
+                {
+                    "succeeded": "#66bb6a",
+                    "completed_with_failures": "#ffca28",
+                    "failed": "#ef5350",
+                    "cancelled": "#b0bec5",
+                    "interrupted": "#ba68c8",
+                    "running": "#64b5f6",
+                }
+                if dark_mode
+                else {
+                    "succeeded": "#2e7d32",
+                    "completed_with_failures": "#f9a825",
+                    "failed": "#c62828",
+                    "cancelled": "#616161",
+                    "interrupted": "#6a1b9a",
+                    "running": "#1565c0",
+                }
+            )
+            values = [
+                (status, status.replace("_", " ").title(), count)
+                for status, count in statuses.items()
+            ]
+            total = sum(count for _key, _label, count in values if count > 0)
+            pie_chart.setTitle("Run status")
+            accessible_name = "Run status"
+            empty_description = "No run status data"
+            detail_builder = self._history_status_detail
+
+        accessible_details = []
+        for key, label, count in values:
             if count:
-                label = status.replace("_", " ").title()
                 piece = pie.append(label, count)
-                piece.setColor(QColor(colors.get(status, "#546e7a")))
+                piece.setColor(QColor(colors.get(key, "#546e7a")))
                 piece.setBorderColor(palette.color(QPalette.ColorRole.Base))
                 piece.setLabelColor(palette.color(QPalette.ColorRole.WindowText))
-                detail = self._history_status_detail(label, count, status_total)
-                status_accessible.append(detail.replace("\n", ": "))
+                detail = detail_builder(label, count, total)
+                accessible_details.append(detail.replace("\n", ": "))
                 piece.hovered.connect(
                     lambda state, text=detail: self._show_history_chart_tooltip(
                         self.history_pie_view, text if state else ""
@@ -3254,9 +4446,9 @@ class MainWindow(QMainWindow):
         self.history_pie_view.setBackgroundBrush(
             QBrush(palette.color(QPalette.ColorRole.Window))
         )
-        self.history_pie_view.setAccessibleName("Run status")
+        self.history_pie_view.setAccessibleName(accessible_name)
         self.history_pie_view.setAccessibleDescription(
-            "; ".join(status_accessible) or "No run status data"
+            "; ".join(accessible_details) or empty_description
         )
         self.history_pie_view.setChart(pie_chart)
 
@@ -3319,6 +4511,9 @@ class MainWindow(QMainWindow):
         output_exists = bool(record and Path(record.run_directory).is_dir())
         self.history_results_button.setEnabled(summary_exists)
         self.history_commands_button.setEnabled(has_record)
+        self.history_retry_failed_button.setEnabled(
+            bool(summary_exists and record and record.failure_count > 0)
+        )
         self.history_output_button.setEnabled(output_exists)
         self.history_summary_button.setEnabled(summary_exists)
         self.history_remove_button.setEnabled(has_record)
@@ -3349,12 +4544,13 @@ class MainWindow(QMainWindow):
             self._rows[result.address] = row
             self._set_cell(row, 0, result.address)
             self._set_cell(row, 1, result.status.title())
+            self._set_cell(row, 2, failure_category_label(result.failure_category))
             stage = result.failed_section
             if result.failed_line:
                 stage = f"{stage} / {result.failed_line}" if stage else result.failed_line
-            self._set_cell(row, 2, stage)
-            self._set_cell(row, 3, result.error or result.status.title())
-            self._set_cell(row, 4, result.transcript_file)
+            self._set_cell(row, 3, stage)
+            self._set_cell(row, 4, result.error or result.status.title())
+            self._set_cell(row, 5, result.transcript_file)
         self._batch_result = BatchResult(
             results, Path(record.run_directory), Path(record.summary_path)
         )
@@ -3523,6 +4719,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._closing:
             self._save_settings()
+            if self.dictionary_dialog is not None:
+                self.dictionary_dialog.hide()
+            if self.converter_dialog is not None:
+                self.converter_dialog.hide()
             if hasattr(self, "scheduler_timer"):
                 self.scheduler_timer.stop()
             if hasattr(self, "results_attention_timer"):
@@ -3559,6 +4759,10 @@ class MainWindow(QMainWindow):
                 return
         self._save_settings()
         self._closing = True
+        if self.dictionary_dialog is not None:
+            self.dictionary_dialog.hide()
+        if self.converter_dialog is not None:
+            self.converter_dialog.hide()
         if hasattr(self, "scheduler_timer"):
             self.scheduler_timer.stop()
         if hasattr(self, "results_attention_timer"):
@@ -3720,8 +4924,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             window.show()
             app.processEvents()
             window._ensure_history_ui()
-            window._ensure_dictionary_ui()
+            window._open_command_dictionary()
             window.dictionary_search_edit.setText("interface")
+            window._open_config_converter()
+            window.converter_source_edit.setPlainText("show version")
+            window._convert_converter_source()
             app.processEvents()
             window.close()
             app.processEvents()

@@ -11,11 +11,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Protocol
+from statistics import median
+from typing import Callable, Iterator, Mapping, Optional, Protocol
 
 from PySide6.QtCore import QStandardPaths
 
-from run_commands import Command, DeviceResult
+from run_commands import Command, DeviceResult, FailureCategory
 
 
 HISTORY_COMMAND_SERVICE = "com.sg4291.sshbatchupdate.history.commands"
@@ -29,6 +30,7 @@ HISTORY_STATUSES = (
     "cancelled",
     "interrupted",
 )
+UNCATEGORIZED_FAILURE = "uncategorized"
 
 
 class HistoryError(RuntimeError):
@@ -76,6 +78,7 @@ class HistoryRecord:
     valid_devices: int
     invalid_devices: int
     command_count: int
+    latest_start_utc: Optional[datetime] = None
     status: str = "running"
     success_count: int = 0
     failure_count: int = 0
@@ -119,6 +122,14 @@ class HistoryBucket:
     label: str
     successes: int
     failures: int
+
+
+@dataclass(frozen=True)
+class HistoryDurationBucket:
+    label: str
+    median_seconds: float
+    average_seconds: float
+    run_count: int
 
 
 @dataclass(frozen=True)
@@ -250,6 +261,7 @@ class HistoryStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
             connection.commit()
@@ -268,6 +280,7 @@ class HistoryStore:
                     batch_name TEXT NOT NULL,
                     created_utc TEXT NOT NULL,
                     scheduled_utc TEXT NOT NULL DEFAULT '',
+                    latest_start_utc TEXT NOT NULL DEFAULT '',
                     started_utc TEXT NOT NULL,
                     completed_utc TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL,
@@ -286,13 +299,39 @@ class HistoryStore:
                 )
                 """
             )
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > 3:
+                raise HistoryError(
+                    f"Audit history schema version {version} is newer than this application supports."
+                )
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(history)")
+            }
+            if "latest_start_utc" not in columns:
+                connection.execute(
+                    "ALTER TABLE history ADD COLUMN latest_start_utc TEXT NOT NULL DEFAULT ''"
+                )
+            category_values = ", ".join(
+                f"'{category.value}'" for category in FailureCategory
+            )
+            connection.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS history_failure_counts (
+                    job_id TEXT NOT NULL,
+                    category TEXT NOT NULL CHECK (category IN ({category_values})),
+                    count INTEGER NOT NULL CHECK (count >= 0),
+                    PRIMARY KEY (job_id, category),
+                    FOREIGN KEY (job_id) REFERENCES history(job_id) ON DELETE CASCADE
+                )
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_started ON history(started_utc DESC)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_status ON history(status)"
             )
-            connection.execute("PRAGMA user_version = 1")
+            connection.execute("PRAGMA user_version = 3")
 
     def start(self, record: HistoryRecord) -> None:
         values = self._record_values(record)
@@ -318,9 +357,22 @@ class HistoryStore:
         run_directory: str = "",
         summary_path: str = "",
         completed_utc: Optional[datetime] = None,
+        failure_counts: Optional[Mapping[FailureCategory, int]] = None,
     ) -> None:
         if status not in HISTORY_STATUSES or status == "running":
             raise HistoryError(f"Invalid final history status: {status}")
+        normalized_counts: dict[FailureCategory, int] = {}
+        for category, count in (failure_counts or {}).items():
+            if not isinstance(category, FailureCategory):
+                raise HistoryError(f"Invalid failure category: {category}")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise HistoryError(
+                    f"Invalid failure count for {category.value}: {count}"
+                )
+            if count:
+                normalized_counts[category] = count
+        if sum(normalized_counts.values()) > failures:
+            raise HistoryError("Failure category counts exceed the total failures.")
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
@@ -344,6 +396,19 @@ class HistoryStore:
                 )
                 if cursor.rowcount != 1:
                     raise HistoryError("The active audit record is missing.")
+                connection.execute(
+                    "DELETE FROM history_failure_counts WHERE job_id = ?", (job_id,)
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO history_failure_counts (job_id, category, count)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        (job_id, category.value, count)
+                        for category, count in normalized_counts.items()
+                    ),
+                )
         except sqlite3.Error as exc:
             raise HistoryError(f"Could not finalize audit record: {exc}") from exc
 
@@ -426,18 +491,60 @@ class HistoryStore:
             started = _parse(row["started_utc"])
             if started is None:
                 continue
-            local = started.astimezone()
-            if granularity == "monthly":
-                label = local.strftime("%Y-%m")
-            elif granularity == "weekly":
-                monday = local.date() - timedelta(days=local.weekday())
-                label = monday.isoformat()
-            else:
-                label = local.date().isoformat()
+            label = self._timeline_label(started, granularity)
             totals = buckets.setdefault(label, [0, 0])
             totals[0] += int(row["success_count"])
             totals[1] += int(row["failure_count"])
         return [HistoryBucket(label, *values) for label, values in buckets.items()]
+
+    def duration_timeline(
+        self,
+        filters: HistoryFilter,
+        granularity: str,
+    ) -> list[HistoryDurationBucket]:
+        where, parameters = self._where(filters)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"SELECT started_utc, completed_utc, status FROM history {where} "
+                    "ORDER BY started_utc",
+                    parameters,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise HistoryError(
+                f"Could not calculate history duration timeline: {exc}"
+            ) from exc
+        buckets: dict[str, list[int]] = {}
+        completed_statuses = {"succeeded", "completed_with_failures"}
+        for row in rows:
+            if str(row["status"]) not in completed_statuses:
+                continue
+            started = _parse(row["started_utc"])
+            completed = _parse(row["completed_utc"])
+            if started is None or completed is None:
+                continue
+            label = self._timeline_label(started, granularity)
+            duration = max(0, int((completed - started).total_seconds()))
+            buckets.setdefault(label, []).append(duration)
+        return [
+            HistoryDurationBucket(
+                label=label,
+                median_seconds=float(median(durations)),
+                average_seconds=sum(durations) / len(durations),
+                run_count=len(durations),
+            )
+            for label, durations in buckets.items()
+        ]
+
+    @staticmethod
+    def _timeline_label(started: datetime, granularity: str) -> str:
+        local = started.astimezone()
+        if granularity == "monthly":
+            return local.strftime("%Y-%m")
+        if granularity == "weekly":
+            monday = local.date() - timedelta(days=local.weekday())
+            return monday.isoformat()
+        return local.date().isoformat()
 
     def status_counts(self, filters: HistoryFilter) -> dict[str, int]:
         where, parameters = self._where(filters)
@@ -450,6 +557,39 @@ class HistoryStore:
         except sqlite3.Error as exc:
             raise HistoryError(f"Could not calculate status totals: {exc}") from exc
         return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def failure_category_counts(self, filters: HistoryFilter) -> dict[str, int]:
+        where, parameters = self._where(filters)
+        counts = {category.value: 0 for category in FailureCategory}
+        try:
+            with self._connect() as connection:
+                failure_total = int(
+                    connection.execute(
+                        f"SELECT COALESCE(SUM(failure_count), 0) FROM history {where}",
+                        parameters,
+                    ).fetchone()[0]
+                )
+                rows = connection.execute(
+                    f"""
+                    SELECT category, SUM(count) AS total
+                    FROM history_failure_counts
+                    WHERE job_id IN (SELECT job_id FROM history {where})
+                    GROUP BY category
+                    """,
+                    parameters,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise HistoryError(
+                f"Could not calculate failure category totals: {exc}"
+            ) from exc
+        categorized_total = 0
+        for row in rows:
+            category = str(row["category"])
+            count = int(row["total"])
+            counts[category] = count
+            categorized_total += count
+        counts[UNCATEGORIZED_FAILURE] = max(0, failure_total - categorized_total)
+        return counts
 
     def distinct(self, column: str) -> list[str]:
         if column not in {"device_type", "profile_label"}:
@@ -506,6 +646,7 @@ class HistoryStore:
             "batch_name": record.batch_name,
             "created_utc": _iso(record.created_utc),
             "scheduled_utc": _iso(record.scheduled_utc),
+            "latest_start_utc": _iso(record.latest_start_utc),
             "started_utc": _iso(record.started_utc),
             "completed_utc": _iso(record.completed_utc),
             "source": record.source,
@@ -530,6 +671,7 @@ class HistoryStore:
             batch_name=str(row["batch_name"]),
             created_utc=_parse(row["created_utc"]),  # type: ignore[arg-type]
             scheduled_utc=_parse(row["scheduled_utc"]),
+            latest_start_utc=_parse(row["latest_start_utc"]),
             started_utc=_parse(row["started_utc"]),  # type: ignore[arg-type]
             completed_utc=_parse(row["completed_utc"]),
             source=str(row["source"]),
@@ -569,9 +711,17 @@ def read_summary(path: Path) -> tuple[DeviceResult, ...]:
             failed_command=row.get("failed_command", ""),
             transcript_file=row.get("transcript_file", ""),
             error=row.get("error", ""),
+            failure_category=_read_failure_category(row.get("failure_category", "")),
         )
         for row in rows
     )
+
+
+def _read_failure_category(value: str) -> Optional[FailureCategory]:
+    try:
+        return FailureCategory(value) if value else None
+    except ValueError:
+        return None
 
 
 def write_output_marker(record: HistoryRecord) -> None:

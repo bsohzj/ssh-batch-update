@@ -13,6 +13,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
@@ -27,6 +28,19 @@ class CommandRejected(RuntimeError):
 
 class RunCancelled(RuntimeError):
     """Raised at a safe checkpoint after cancellation is requested."""
+
+
+class FailureCategory(StrEnum):
+    """Stable operational categories for failed device work."""
+
+    INPUT_VALIDATION = "input_validation"
+    CONNECTIVITY = "connectivity"
+    AUTHENTICATION = "authentication"
+    PRIVILEGE = "privilege"
+    COMMAND_REJECTED = "command_rejected"
+    COMMAND_TIMEOUT = "command_timeout"
+    DEVICE_OPERATION = "device_operation"
+    UNEXPECTED = "unexpected"
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,7 @@ class DeviceResult:
     failed_command: str = ""
     transcript_file: str = ""
     error: str = ""
+    failure_category: Optional[FailureCategory] = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +121,7 @@ class ProgressEvent:
     status: str = ""
     message: str = ""
     transcript_file: str = ""
+    failure_category: Optional[FailureCategory] = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +141,15 @@ class BatchResult:
     @property
     def failures(self) -> int:
         return len(self.results) - self.successes - self.cancelled
+
+    @property
+    def failure_counts(self) -> dict[FailureCategory, int]:
+        counts: dict[FailureCategory, int] = {}
+        for result in self.results:
+            if result.status != "failed" or result.failure_category is None:
+                continue
+            counts[result.failure_category] = counts.get(result.failure_category, 0) + 1
+        return counts
 
 
 class CancellationToken:
@@ -352,6 +377,67 @@ def _safe_error(exc: Exception, settings: Settings) -> str:
     return f"{exc.__class__.__name__}: {message}"
 
 
+def failure_category_label(category: Optional[FailureCategory]) -> str:
+    return category.value.replace("_", " ").title() if category else ""
+
+
+def _exception_names(exc: Exception) -> set[str]:
+    return {item.__name__ for item in type(exc).__mro__}
+
+
+def _failure_category(exc: Exception, operation: str) -> FailureCategory:
+    names = _exception_names(exc)
+    if isinstance(exc, CommandRejected) or "ConfigInvalidException" in names:
+        return FailureCategory.COMMAND_REJECTED
+    if names.intersection(
+        {
+            "AuthenticationException",
+            "NetMikoAuthenticationException",
+            "NetmikoAuthenticationException",
+        }
+    ):
+        return FailureCategory.AUTHENTICATION
+    if "ReadTimeout" in names and operation in {"Exec command", "Config command"}:
+        return FailureCategory.COMMAND_TIMEOUT
+    if operation in {"Enable mode", "Enter configuration mode", "Exit configuration mode"}:
+        return FailureCategory.PRIVILEGE
+    if operation == "SSH connection" and names.intersection(
+        {
+            "ConnectionException",
+            "NetMikoTimeoutException",
+            "NetmikoTimeoutException",
+            "SSHException",
+            "TimeoutError",
+            "OSError",
+        }
+    ):
+        return FailureCategory.CONNECTIVITY
+    if operation in {
+        "Prompt detection",
+        "Session preparation",
+        "Exec command",
+        "Config command",
+    }:
+        return FailureCategory.DEVICE_OPERATION
+    return FailureCategory.UNEXPECTED
+
+
+def format_batch_summary(result: BatchResult, success_word: str = "succeeded") -> str:
+    failure_text = f"{result.failures} failed"
+    counts = result.failure_counts
+    if counts:
+        details = ", ".join(
+            f"{counts[category]} {failure_category_label(category)}"
+            for category in FailureCategory
+            if category in counts
+        )
+        failure_text += f" ({details})"
+    return (
+        f"{result.successes} {success_word}, {failure_text}, "
+        f"{result.cancelled} cancelled"
+    )
+
+
 def _redact_secrets(value: Any, settings: Settings) -> str:
     message = str(value)
     for secret in (settings.username, settings.password, settings.enable_secret):
@@ -409,6 +495,7 @@ def execute_device(
     connection = None
     in_config_mode = False
     current: Optional[Command] = None
+    operation = "SSH connection"
     result: Optional[DeviceResult] = None
     try:
         if cancellation_token:
@@ -421,11 +508,13 @@ def execute_device(
         if cancellation_token:
             cancellation_token.raise_if_cancelled()
         if settings.enable_secret:
+            operation = "Enable mode"
             if progress:
                 progress(f"ENABLING {address}")
             if event_callback:
                 event_callback(ProgressEvent("device_status", address=address, status="enabling"))
             _append_transcript(transcript, "=== enable ===\n", connection.enable())
+        operation = "Session preparation"
         if progress:
             progress(f"DISABLING PAGER {address}")
         if event_callback:
@@ -439,6 +528,7 @@ def execute_device(
                 cancellation_token.raise_if_cancelled()
             current = next_command
             if current.section == "config" and not in_config_mode:
+                operation = "Enter configuration mode"
                 if progress:
                     progress(f"ENTERING CONFIG MODE {address}")
                 _append_transcript(
@@ -446,6 +536,7 @@ def execute_device(
                 )
                 in_config_mode = True
             elif current.section == "exec" and in_config_mode:
+                operation = "Exit configuration mode"
                 if progress:
                     progress(f"EXITING CONFIG MODE {address}")
                 _append_transcript(
@@ -453,6 +544,7 @@ def execute_device(
                 )
                 in_config_mode = False
 
+            operation = "Exec command" if current.section == "exec" else "Config command"
             label = f"=== [{current.section}] line {current.line_number} ===\n> {current.text}\n"
             if progress:
                 progress(
@@ -494,14 +586,16 @@ def execute_device(
     except Exception as exc:
         error = _safe_error(exc, settings)
         _append_transcript(transcript, "=== error ===\n", error)
+        command_operation = operation in {"Exec command", "Config command"}
         result = DeviceResult(
             address=address,
             status="failed",
             transcript="",
-            failed_section=current.section if current else "",
+            failed_section=(current.section if current and command_operation else operation),
             failed_line=str(current.line_number) if current else "",
-            failed_command=current.text if current else "",
+            failed_command=current.text if current and command_operation else "",
             error=error,
+            failure_category=_failure_category(exc, operation),
         )
     finally:
         if connection is not None:
@@ -626,6 +720,7 @@ def test_device_connection(
             transcript="",
             failed_section=stage,
             error=error,
+            failure_category=_failure_category(exc, stage),
         )
     finally:
         if connection is not None:
@@ -706,7 +801,7 @@ def write_summary(path: Path, results: Iterable[DeviceResult]) -> None:
                 temporary_file,
                 fieldnames=(
                     "device", "status", "failed_section", "failed_line", "failed_command",
-                    "transcript_file", "error",
+                    "transcript_file", "error", "failure_category",
                 ),
             )
             writer.writeheader()
@@ -720,6 +815,9 @@ def write_summary(path: Path, results: Iterable[DeviceResult]) -> None:
                         "failed_command": result.failed_command,
                         "transcript_file": result.transcript_file,
                         "error": result.error,
+                        "failure_category": (
+                            result.failure_category.value if result.failure_category else ""
+                        ),
                     }
                 )
             temporary_file.flush()
@@ -840,7 +938,14 @@ def run_batch(
                 error="cancelled before device started",
             )
         elif entry.error:
-            result = DeviceResult(entry.address, "failed", "", error=entry.error)
+            result = DeviceResult(
+                entry.address,
+                "failed",
+                "",
+                failed_section="Input validation",
+                error=entry.error,
+                failure_category=FailureCategory.INPUT_VALIDATION,
+            )
         else:
             result = execute_device(
                 entry.address,
@@ -869,6 +974,7 @@ def run_batch(
                     transcript_file=result.transcript_file,
                     section=result.failed_section,
                     line_number=int(result.failed_line) if result.failed_line.isdigit() else 0,
+                    failure_category=result.failure_category,
                 )
             )
 
@@ -881,10 +987,7 @@ def run_batch(
                 "run_finished",
                 total=total,
                 status="cancelled" if batch_result.cancelled else "finished",
-                message=(
-                    f"{batch_result.successes} succeeded, {batch_result.failures} failed, "
-                    f"{batch_result.cancelled} cancelled"
-                ),
+                message=format_batch_summary(batch_result),
             )
         )
     return batch_result
@@ -944,6 +1047,7 @@ def run_connection_test(
                 "",
                 failed_section="Input validation",
                 error=entry.error,
+                failure_category=FailureCategory.INPUT_VALIDATION,
             )
         else:
             result = test_device_connection(
@@ -969,6 +1073,7 @@ def run_connection_test(
                     message=result.error or "SSH connection test passed",
                     transcript_file=result.transcript_file,
                     section=result.failed_section or "Complete",
+                    failure_category=result.failure_category,
                 )
             )
 
@@ -981,10 +1086,7 @@ def run_connection_test(
                 "run_finished",
                 total=total,
                 status="cancelled" if batch_result.cancelled else "finished",
-                message=(
-                    f"{batch_result.successes} passed, {batch_result.failures} failed, "
-                    f"{batch_result.cancelled} cancelled"
-                ),
+                message=format_batch_summary(batch_result, "passed"),
             )
         )
     return batch_result
@@ -1050,7 +1152,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             elif event.status == "cancelled":
                 print(f"CANCELLED {event.address}: {event.message}", file=sys.stderr)
             else:
-                print(f"FAILED  {event.address}: {event.message}", file=sys.stderr)
+                category = failure_category_label(event.failure_category)
+                prefix = f"FAILED  {event.address} [{category}]" if category else f"FAILED  {event.address}"
+                print(f"{prefix}: {event.message}", file=sys.stderr)
 
     try:
         batch_result = run_batch(
@@ -1062,10 +1166,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    print(
-        f"Completed: {batch_result.successes} succeeded, "
-        f"{batch_result.failures} failed"
-    )
+    print(f"Completed: {format_batch_summary(batch_result)}")
     print(f"Summary: {batch_result.summary_path}")
     return 0 if batch_result.failures == 0 and batch_result.cancelled == 0 else 1
 

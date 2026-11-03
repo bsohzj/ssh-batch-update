@@ -143,6 +143,10 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertNotIn("must not run", result.transcript)
         self.assertEqual(connection.send_command.call_count, 2)
         self.assertIn("failure pattern", result.error)
+        self.assertEqual(
+            result.failure_category,
+            runner.FailureCategory.COMMAND_REJECTED,
+        )
 
     def test_custom_failure_pattern_is_used_for_other_netmiko_platforms(self):
         connection = Mock()
@@ -160,6 +164,90 @@ class CommandRunnerTests(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.failed_command, "run restricted task")
+        self.assertEqual(
+            result.failure_category,
+            runner.FailureCategory.COMMAND_REJECTED,
+        )
+
+    def test_failure_categories_use_exception_type_and_operation(self):
+        exception_cases = (
+            ("NetmikoAuthenticationException", "authentication"),
+            ("NetmikoTimeoutException", "connectivity"),
+            ("RuntimeError", "unexpected"),
+        )
+        for exception_name, expected in exception_cases:
+            with self.subTest(exception_name=exception_name):
+                exception_type = type(exception_name, (Exception,), {})
+                netmiko = types.SimpleNamespace(
+                    ConnectHandler=Mock(side_effect=exception_type("failed"))
+                )
+                result = runner.execute_device(
+                    "192.0.2.1",
+                    self.settings(),
+                    [runner.Command("exec", "show version", 1)],
+                    [],
+                    netmiko,
+                )
+                self.assertEqual(result.failure_category.value, expected)
+                self.assertEqual(result.failed_section, "SSH connection")
+
+        privilege_connection = Mock()
+        privilege_connection.enable.side_effect = RuntimeError("denied")
+        privilege_result = runner.execute_device(
+            "192.0.2.2",
+            self.settings(enable_secret="enable-secret"),
+            [runner.Command("exec", "show version", 1)],
+            [],
+            types.SimpleNamespace(ConnectHandler=Mock(return_value=privilege_connection)),
+        )
+        self.assertEqual(
+            privilege_result.failure_category,
+            runner.FailureCategory.PRIVILEGE,
+        )
+        self.assertEqual(privilege_result.failed_section, "Enable mode")
+
+        read_timeout = type("ReadTimeout", (Exception,), {})
+        timeout_connection = Mock()
+        timeout_connection.disable_paging.return_value = ""
+        timeout_connection.send_command.side_effect = read_timeout("timed out")
+        timeout_result = runner.execute_device(
+            "192.0.2.3",
+            self.settings(),
+            [runner.Command("exec", "show version", 4)],
+            [],
+            types.SimpleNamespace(ConnectHandler=Mock(return_value=timeout_connection)),
+        )
+        self.assertEqual(
+            timeout_result.failure_category,
+            runner.FailureCategory.COMMAND_TIMEOUT,
+        )
+        self.assertEqual(timeout_result.failed_line, "4")
+
+    def test_batch_failure_counts_and_summary_are_deterministic(self):
+        result = runner.BatchResult(
+            (
+                runner.DeviceResult("192.0.2.1", "success", ""),
+                runner.DeviceResult(
+                    "192.0.2.2",
+                    "failed",
+                    "",
+                    failure_category=runner.FailureCategory.AUTHENTICATION,
+                ),
+                runner.DeviceResult(
+                    "192.0.2.3",
+                    "failed",
+                    "",
+                    failure_category=runner.FailureCategory.COMMAND_REJECTED,
+                ),
+            ),
+            Path("outputs/run"),
+            Path("outputs/run/summary.csv"),
+        )
+
+        self.assertEqual(
+            runner.format_batch_summary(result),
+            "1 succeeded, 2 failed (1 Authentication, 1 Command Rejected), 0 cancelled",
+        )
 
     def test_progress_reports_connection_mode_and_current_command(self):
         connection = Mock()
