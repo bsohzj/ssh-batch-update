@@ -109,6 +109,7 @@ from history import (
     HistoryStore,
     KeychainHistoryCommandStore,
     MemoryHistoryCommandStore,
+    UNCATEGORIZED_FAILURE,
     default_history_path,
     delete_output_directory,
     read_summary,
@@ -122,6 +123,7 @@ from run_commands import (
     Command,
     ConfigurationError,
     DeviceResult,
+    FailureCategory,
     PreparedRun,
     ProgressEvent,
     RunRequest,
@@ -149,6 +151,8 @@ RESULTS_ATTENTION_INTERVAL_MS = 500
 RESULTS_ATTENTION_TICKS = 6
 HISTORY_TREND_DEVICES = "devices"
 HISTORY_TREND_DURATION = "duration"
+HISTORY_BREAKDOWN_STATUS = "status"
+HISTORY_BREAKDOWN_FAILURES = "failures"
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -2533,6 +2537,7 @@ class MainWindow(QMainWindow):
                 str(result.run_directory) if result else "",
                 str(result.summary_path) if result else "",
                 completed_utc=self._clock(),
+                failure_counts=result.failure_counts if result else None,
             )
             record = self.history_store.get(job_id)
             if record and record.run_directory:
@@ -3799,6 +3804,17 @@ class MainWindow(QMainWindow):
         trend_controls.addWidget(trend_label)
         trend_controls.addWidget(self.history_trend_combo)
         trend_controls.addStretch()
+        breakdown_label = QLabel("Breakdown")
+        self.history_breakdown_combo = QComboBox()
+        self.history_breakdown_combo.addItem(
+            "Run Status", HISTORY_BREAKDOWN_STATUS
+        )
+        self.history_breakdown_combo.addItem(
+            "Failure Causes", HISTORY_BREAKDOWN_FAILURES
+        )
+        breakdown_label.setBuddy(self.history_breakdown_combo)
+        trend_controls.addWidget(breakdown_label)
+        trend_controls.addWidget(self.history_breakdown_combo)
         self.history_layout.addLayout(trend_controls)
 
         charts = QHBoxLayout()
@@ -3903,7 +3919,10 @@ class MainWindow(QMainWindow):
         ):
             combo.currentIndexChanged.connect(self._history_filters_changed)
         self.history_trend_combo.currentIndexChanged.connect(
-            self._history_trend_changed
+            self._history_chart_changed
+        )
+        self.history_breakdown_combo.currentIndexChanged.connect(
+            self._history_chart_changed
         )
         self._refresh_history_filter_values()
         self._refresh_history()
@@ -3936,7 +3955,7 @@ class MainWindow(QMainWindow):
         self._refresh_history()
 
     @Slot()
-    def _history_trend_changed(self) -> None:
+    def _history_chart_changed(self) -> None:
         self._refresh_history()
 
     def _history_filter(self) -> HistoryFilter:
@@ -3979,6 +3998,7 @@ class MainWindow(QMainWindow):
                 else []
             )
             statuses = self.history_store.status_counts(filters)
+            failure_categories = self.history_store.failure_category_counts(filters)
         except HistoryError as exc:
             self.validation_label.setText(f"Audit history warning: {exc}")
             return
@@ -3991,6 +4011,7 @@ class MainWindow(QMainWindow):
             timeline,
             duration_timeline,
             statuses,
+            failure_categories,
             granularity,
         )
 
@@ -4086,6 +4107,14 @@ class MainWindow(QMainWindow):
             detail += f" ({count / total:.1%})"
         return detail
 
+    @staticmethod
+    def _history_failure_detail(label: str, count: int, total: int) -> str:
+        noun = "device" if count == 1 else "devices"
+        detail = f"{label}\n{count} {noun}"
+        if total > 0:
+            detail += f" ({count / total:.1%})"
+        return detail
+
     @classmethod
     def _history_duration_detail(
         cls,
@@ -4114,6 +4143,7 @@ class MainWindow(QMainWindow):
         timeline,
         duration_timeline,
         statuses: dict[str, int],
+        failure_categories: dict[str, int],
         granularity: str = "daily",
     ) -> None:
         from PySide6.QtCharts import (
@@ -4312,39 +4342,95 @@ class MainWindow(QMainWindow):
         self.history_line_view.setChart(chart)
 
         pie_chart = QChart()
-        pie_chart.setTitle("Run status")
         pie = QPieSeries()
         pie.setHoleSize(0.45)
-        colors = (
-            {
-                "succeeded": "#66bb6a",
-                "completed_with_failures": "#ffca28",
-                "failed": "#ef5350",
-                "cancelled": "#b0bec5",
-                "interrupted": "#ba68c8",
-                "running": "#64b5f6",
-            }
-            if dark_mode
-            else {
-                "succeeded": "#2e7d32",
-                "completed_with_failures": "#f9a825",
-                "failed": "#c62828",
-                "cancelled": "#616161",
-                "interrupted": "#6a1b9a",
-                "running": "#1565c0",
-            }
-        )
-        status_total = sum(count for count in statuses.values() if count > 0)
-        status_accessible = []
-        for status, count in statuses.items():
+        if self.history_breakdown_combo.currentData() == HISTORY_BREAKDOWN_FAILURES:
+            colors = (
+                {
+                    "input_validation": "#90a4ae",
+                    "connectivity": "#64b5f6",
+                    "authentication": "#ef5350",
+                    "privilege": "#ffa726",
+                    "command_rejected": "#ffca28",
+                    "command_timeout": "#ba68c8",
+                    "device_operation": "#4db6ac",
+                    "unexpected": "#a1887f",
+                    UNCATEGORIZED_FAILURE: "#b0bec5",
+                }
+                if dark_mode
+                else {
+                    "input_validation": "#546e7a",
+                    "connectivity": "#1565c0",
+                    "authentication": "#c62828",
+                    "privilege": "#ef6c00",
+                    "command_rejected": "#f9a825",
+                    "command_timeout": "#6a1b9a",
+                    "device_operation": "#00796b",
+                    "unexpected": "#6d4c41",
+                    UNCATEGORIZED_FAILURE: "#616161",
+                }
+            )
+            values = [
+                (
+                    category.value,
+                    failure_category_label(category),
+                    failure_categories.get(category.value, 0),
+                )
+                for category in FailureCategory
+            ]
+            values.append(
+                (
+                    UNCATEGORIZED_FAILURE,
+                    "Uncategorized",
+                    failure_categories.get(UNCATEGORIZED_FAILURE, 0),
+                )
+            )
+            total = sum(count for _key, _label, count in values if count > 0)
+            pie_chart.setTitle(
+                "Failure causes" if total else "No failure cause data"
+            )
+            accessible_name = "Failure causes"
+            empty_description = "No failure cause data"
+            detail_builder = self._history_failure_detail
+        else:
+            colors = (
+                {
+                    "succeeded": "#66bb6a",
+                    "completed_with_failures": "#ffca28",
+                    "failed": "#ef5350",
+                    "cancelled": "#b0bec5",
+                    "interrupted": "#ba68c8",
+                    "running": "#64b5f6",
+                }
+                if dark_mode
+                else {
+                    "succeeded": "#2e7d32",
+                    "completed_with_failures": "#f9a825",
+                    "failed": "#c62828",
+                    "cancelled": "#616161",
+                    "interrupted": "#6a1b9a",
+                    "running": "#1565c0",
+                }
+            )
+            values = [
+                (status, status.replace("_", " ").title(), count)
+                for status, count in statuses.items()
+            ]
+            total = sum(count for _key, _label, count in values if count > 0)
+            pie_chart.setTitle("Run status")
+            accessible_name = "Run status"
+            empty_description = "No run status data"
+            detail_builder = self._history_status_detail
+
+        accessible_details = []
+        for key, label, count in values:
             if count:
-                label = status.replace("_", " ").title()
                 piece = pie.append(label, count)
-                piece.setColor(QColor(colors.get(status, "#546e7a")))
+                piece.setColor(QColor(colors.get(key, "#546e7a")))
                 piece.setBorderColor(palette.color(QPalette.ColorRole.Base))
                 piece.setLabelColor(palette.color(QPalette.ColorRole.WindowText))
-                detail = self._history_status_detail(label, count, status_total)
-                status_accessible.append(detail.replace("\n", ": "))
+                detail = detail_builder(label, count, total)
+                accessible_details.append(detail.replace("\n", ": "))
                 piece.hovered.connect(
                     lambda state, text=detail: self._show_history_chart_tooltip(
                         self.history_pie_view, text if state else ""
@@ -4360,9 +4446,9 @@ class MainWindow(QMainWindow):
         self.history_pie_view.setBackgroundBrush(
             QBrush(palette.color(QPalette.ColorRole.Window))
         )
-        self.history_pie_view.setAccessibleName("Run status")
+        self.history_pie_view.setAccessibleName(accessible_name)
         self.history_pie_view.setAccessibleDescription(
-            "; ".join(status_accessible) or "No run status data"
+            "; ".join(accessible_details) or empty_description
         )
         self.history_pie_view.setChart(pie_chart)
 

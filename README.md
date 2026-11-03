@@ -138,9 +138,11 @@ tabs pulse briefly and retain a dot until **SSH** → **Device Results** is open
 without interrupting History review.
 
 The dashboard defaults to the last 30 days and provides summary cards, a line
-chart of successful and failed devices, a run-status donut chart, searchable
-and filterable records, and 100-row pagination. Filters include date range,
-status, manual or scheduled source, device type, and credential-profile label.
+chart of successful and failed devices, a donut chart that switches between
+run status and failure causes, searchable and filterable records, and 100-row
+pagination. Legacy failures without stored categories appear as
+**Uncategorized**. Filters include date range, status, manual or scheduled
+source, device type, and credential-profile label.
 Selecting a record can load its `summary.csv` into **Device Results**, open its
 output or summary, or show its encrypted command snapshot after a sensitive
 content warning. **Retry Failed Devices…** can also create a failed-only draft
@@ -149,11 +151,11 @@ reloaded from an existing named profile rather than History.
 
 Audit metadata is stored in an owner-private SQLite database at the app's
 macOS Application Support location. The database contains batch metadata,
-aggregate result counts, friendly profile labels, and output paths. It never
-contains usernames, passwords, enable secrets, command text, device addresses,
-or per-device error details. Device details are read from the existing
-`summary.csv` only when requested, so moved or deleted output is shown as
-unavailable rather than copied into another data store.
+aggregate result and failure-category counts, friendly profile labels, and
+output paths. It never contains usernames, passwords, enable secrets, command
+text, device addresses, or per-device error details. Device details are read
+from the existing `summary.csv` only when requested, so moved or deleted output
+is shown as unavailable rather than copied into another data store.
 
 Exact command snapshots are encrypted separately in macOS Keychain under
 service `com.sg4291.sshbatchupdate.history.commands`. They can include literal

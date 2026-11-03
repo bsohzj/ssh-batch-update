@@ -43,7 +43,15 @@ class HistoryStoreTests(unittest.TestCase):
         values.update(changes)
         return history.HistoryRecord(**values)
 
-    def finish(self, record, status="succeeded", success=2, failure=0, cancelled=0):
+    def finish(
+        self,
+        record,
+        status="succeeded",
+        success=2,
+        failure=0,
+        cancelled=0,
+        failure_counts=None,
+    ):
         self.store.start(record)
         self.now += timedelta(minutes=2)
         self.store.finalize(
@@ -53,6 +61,7 @@ class HistoryStoreTests(unittest.TestCase):
             failure,
             cancelled,
             f"{success} succeeded, {failure} failed, {cancelled} cancelled",
+            failure_counts=failure_counts,
         )
 
     def test_database_is_private_and_round_trips_lifecycle(self):
@@ -83,7 +92,7 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(os.stat(self.store.path).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(self.store.path.parent).st_mode & 0o777, 0o700)
 
-    def test_version_one_database_migrates_latest_start_without_data_loss(self):
+    def test_version_one_database_migrates_to_version_three_without_data_loss(self):
         legacy_path = self.base / "legacy" / "history.sqlite3"
         legacy_path.parent.mkdir(parents=True)
         with closing(sqlite3.connect(legacy_path)) as connection:
@@ -127,11 +136,39 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(record.batch_name, "Legacy batch")
         self.assertIsNone(record.latest_start_utc)
         with closing(sqlite3.connect(legacy_path)) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(history)")
             }
+            failure_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'history_failure_counts'"
+            ).fetchone()
         self.assertIn("latest_start_utc", columns)
+        self.assertIsNotNone(failure_table)
+
+    def test_version_two_database_adds_failure_counts_without_data_loss(self):
+        legacy_path = self.base / "version-two" / "history.sqlite3"
+        store = history.HistoryStore(legacy_path, clock=lambda: self.now)
+        store.start(self.record("version-two-job"))
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute("DROP TABLE history_failure_counts")
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+
+        migrated = history.HistoryStore(legacy_path, clock=lambda: self.now)
+
+        self.assertEqual(
+            migrated.get("version-two-job").batch_name,
+            self.record().batch_name,
+        )
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 3)
+            failure_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'history_failure_counts'"
+            ).fetchone()
+        self.assertIsNotNone(failure_table)
 
     def test_restart_marks_running_records_interrupted(self):
         self.store.start(self.record())
@@ -186,6 +223,117 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertEqual(statuses["succeeded"], 1)
         self.assertEqual(statuses["completed_with_failures"], 1)
         self.assertEqual(self.store.distinct("device_type"), ["cisco_ios", "huawei"])
+
+    def test_failure_category_counts_follow_filters_and_include_legacy_residual(self):
+        operations = self.record("operations", profile_label="Operations")
+        night = self.record(
+            "night",
+            profile_label="Night Shift",
+            started_utc=self.now + timedelta(hours=1),
+        )
+        self.finish(
+            operations,
+            "completed_with_failures",
+            success=1,
+            failure=3,
+            failure_counts={
+                FailureCategory.AUTHENTICATION: 1,
+                FailureCategory.CONNECTIVITY: 1,
+            },
+        )
+        self.finish(
+            night,
+            "completed_with_failures",
+            success=0,
+            failure=1,
+            failure_counts={FailureCategory.COMMAND_TIMEOUT: 1},
+        )
+
+        all_counts = self.store.failure_category_counts(history.HistoryFilter())
+        night_counts = self.store.failure_category_counts(
+            history.HistoryFilter(profile_label="Night Shift")
+        )
+
+        self.assertEqual(all_counts[FailureCategory.AUTHENTICATION.value], 1)
+        self.assertEqual(all_counts[FailureCategory.CONNECTIVITY.value], 1)
+        self.assertEqual(all_counts[FailureCategory.COMMAND_TIMEOUT.value], 1)
+        self.assertEqual(all_counts[history.UNCATEGORIZED_FAILURE], 1)
+        self.assertEqual(night_counts[FailureCategory.COMMAND_TIMEOUT.value], 1)
+        self.assertEqual(night_counts[history.UNCATEGORIZED_FAILURE], 0)
+        self.assertEqual(
+            set(all_counts),
+            {category.value for category in FailureCategory}
+            | {history.UNCATEGORIZED_FAILURE},
+        )
+
+    def test_failure_category_validation_and_cascade_cleanup(self):
+        record = self.record("categorized")
+        self.store.start(record)
+        with self.assertRaises(history.HistoryError):
+            self.store.finalize(
+                record.job_id,
+                "completed_with_failures",
+                0,
+                1,
+                0,
+                "invalid category",
+                failure_counts={"unknown": 1},
+            )
+        with self.assertRaises(history.HistoryError):
+            self.store.finalize(
+                record.job_id,
+                "completed_with_failures",
+                0,
+                1,
+                0,
+                "negative count",
+                failure_counts={FailureCategory.CONNECTIVITY: -1},
+            )
+        with self.assertRaises(history.HistoryError):
+            self.store.finalize(
+                record.job_id,
+                "completed_with_failures",
+                0,
+                1,
+                0,
+                "excess count",
+                failure_counts={FailureCategory.CONNECTIVITY: 2},
+            )
+
+        self.store.finalize(
+            record.job_id,
+            "completed_with_failures",
+            0,
+            1,
+            0,
+            "categorized",
+            failure_counts={FailureCategory.CONNECTIVITY: 1},
+        )
+        self.store.remove(record.job_id)
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM history_failure_counts"
+                ).fetchone()[0],
+                0,
+            )
+
+        second = self.record("second-categorized")
+        self.finish(
+            second,
+            "completed_with_failures",
+            success=0,
+            failure=1,
+            failure_counts={FailureCategory.UNEXPECTED: 1},
+        )
+        self.store.clear()
+        with closing(sqlite3.connect(self.store.path)) as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM history_failure_counts"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_duration_timeline_groups_median_average_and_count(self):
         def add_duration(

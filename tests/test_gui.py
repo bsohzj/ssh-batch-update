@@ -78,6 +78,7 @@ class MainWindowTests(unittest.TestCase):
         run_directory="",
         summary_path="",
         duration_seconds=60,
+        failure_counts=None,
     ):
         now = datetime.now(timezone.utc)
         started = now - timedelta(minutes=1)
@@ -110,6 +111,7 @@ class MainWindowTests(unittest.TestCase):
                 run_directory,
                 summary_path,
                 completed_utc=started + timedelta(seconds=duration_seconds),
+                failure_counts=failure_counts,
             )
         return self.history_store.get(job_id)
 
@@ -481,6 +483,17 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.history_runs_value.text(), "0")
         self.assertEqual(len(self.window.history_line_view.chart().series()), 2)
         self.assertEqual(len(self.window.history_pie_view.chart().series()), 1)
+        self.assertEqual(
+            self.window.history_breakdown_combo.currentData(),
+            gui.HISTORY_BREAKDOWN_STATUS,
+        )
+        self.assertEqual(
+            [
+                self.window.history_breakdown_combo.itemText(index)
+                for index in range(self.window.history_breakdown_combo.count())
+            ],
+            ["Run Status", "Failure Causes"],
+        )
         self.assertFalse(self.window.history_empty_label.isHidden())
         self.assertTrue(self.window.history_line_view.isHidden())
         self.assertTrue(self.window.history_pie_view.isHidden())
@@ -1485,6 +1498,103 @@ class MainWindowTests(unittest.TestCase):
             self.window.history_pie_view.accessibleDescription(),
         )
 
+    def test_history_failure_breakdown_filters_interacts_and_survives_theme_change(
+        self,
+    ):
+        self.add_history_record(
+            "operations",
+            "completed_with_failures",
+            successes=1,
+            failures=3,
+            profile="Operations",
+            failure_counts={
+                runner.FailureCategory.CONNECTIVITY: 1,
+                runner.FailureCategory.AUTHENTICATION: 1,
+            },
+        )
+        self.add_history_record(
+            "night",
+            "completed_with_failures",
+            failures=1,
+            profile="Night Shift",
+            failure_counts={runner.FailureCategory.COMMAND_REJECTED: 1},
+        )
+        self.window._ensure_history_ui()
+        breakdown_index = self.window.history_breakdown_combo.findData(
+            gui.HISTORY_BREAKDOWN_FAILURES
+        )
+        self.window.history_breakdown_combo.setCurrentIndex(breakdown_index)
+        self.app.processEvents()
+
+        chart = self.window.history_pie_view.chart()
+        slices = {
+            piece.label(): piece for piece in chart.series()[0].slices()
+        }
+        self.assertEqual(chart.title(), "Failure causes")
+        self.assertEqual(
+            list(slices),
+            ["Connectivity", "Authentication", "Command Rejected", "Uncategorized"],
+        )
+        self.assertEqual(
+            self.window.history_pie_view.accessibleName(), "Failure causes"
+        )
+        self.assertIn(
+            "Uncategorized: 1 device (25.0%)",
+            self.window.history_pie_view.accessibleDescription(),
+        )
+        with patch.object(gui.QToolTip, "showText") as show:
+            slices["Authentication"].hovered.emit(True)
+            self.assertEqual(
+                show.call_args.args[1], "Authentication\n1 device (25.0%)"
+            )
+            slices["Command Rejected"].clicked.emit()
+            self.assertEqual(
+                show.call_args.args[1], "Command Rejected\n1 device (25.0%)"
+            )
+
+        profile_index = self.window.history_profile_combo.findData("Night Shift")
+        self.window.history_profile_combo.setCurrentIndex(profile_index)
+        self.app.processEvents()
+        filtered_slices = self.window.history_pie_view.chart().series()[0].slices()
+        self.assertEqual(
+            [(piece.label(), piece.value()) for piece in filtered_slices],
+            [("Command Rejected", 1.0)],
+        )
+        self.assertEqual(
+            self.window.history_pie_view.accessibleDescription(),
+            "Command Rejected: 1 device (100.0%)",
+        )
+
+        self.window.theme_dark_action.trigger()
+        self.app.processEvents()
+        self.assertEqual(
+            self.window.history_breakdown_combo.currentData(),
+            gui.HISTORY_BREAKDOWN_FAILURES,
+        )
+        themed_slice = self.window.history_pie_view.chart().series()[0].slices()[0]
+        self.assertEqual(themed_slice.color().name(), "#ffca28")
+        self.assertIsNone(self.settings.value("history/breakdown"))
+
+    def test_history_failure_breakdown_has_explicit_empty_state(self):
+        self.add_history_record("successful", "succeeded", successes=2)
+        self.window._ensure_history_ui()
+        breakdown_index = self.window.history_breakdown_combo.findData(
+            gui.HISTORY_BREAKDOWN_FAILURES
+        )
+        self.window.history_breakdown_combo.setCurrentIndex(breakdown_index)
+        self.app.processEvents()
+
+        chart = self.window.history_pie_view.chart()
+        self.assertEqual(chart.title(), "No failure cause data")
+        self.assertEqual(chart.series()[0].count(), 0)
+        self.assertEqual(
+            self.window.history_pie_view.accessibleName(), "Failure causes"
+        )
+        self.assertEqual(
+            self.window.history_pie_view.accessibleDescription(),
+            "No failure cause data",
+        )
+
     def test_history_chart_tooltip_formatting_and_guards(self):
         self.assertEqual(
             self.window._history_line_detail(
@@ -1701,6 +1811,42 @@ class MainWindowTests(unittest.TestCase):
         record = self.history_store.get(job.job_id)
         self.assertEqual(record.status, "cancelled")
         self.assertEqual(record.cancelled_count, 1)
+
+    def test_completed_run_persists_failure_categories_for_history(self):
+        prepared = runner.prepare_run(
+            self._valid_request("cisco_ios", "192.0.2.1"),
+            require_credentials=True,
+            environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        job = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.mark_running(job.job_id)
+        self.window._job_prepared[job.job_id] = prepared
+        self.window._start_audit_record(job, payload, prepared)
+        self.window._active_job_id = job.job_id
+        self.window._operation = "run"
+        run_directory = self.base / "outputs" / "run_categorized"
+        run_directory.mkdir(parents=True)
+        summary = run_directory / "summary.csv"
+        device = runner.DeviceResult(
+            "192.0.2.1",
+            "failed",
+            "",
+            error="authentication failed",
+            failure_category=runner.FailureCategory.AUTHENTICATION,
+        )
+        runner.write_summary(summary, [device])
+
+        self.window._run_completed(
+            runner.BatchResult((device,), run_directory, summary)
+        )
+
+        record = self.history_store.get(job.job_id)
+        counts = self.history_store.failure_category_counts(history.HistoryFilter())
+        self.assertEqual(record.status, "completed_with_failures")
+        self.assertEqual(record.failure_count, 1)
+        self.assertEqual(counts[runner.FailureCategory.AUTHENTICATION.value], 1)
+        self.assertEqual(counts[history.UNCATEGORIZED_FAILURE], 0)
 
     def test_worker_failure_history_redacts_credentials_and_addresses(self):
         prepared = runner.prepare_run(

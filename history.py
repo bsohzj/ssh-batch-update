@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
-from typing import Callable, Iterator, Optional, Protocol
+from typing import Callable, Iterator, Mapping, Optional, Protocol
 
 from PySide6.QtCore import QStandardPaths
 
@@ -30,6 +30,7 @@ HISTORY_STATUSES = (
     "cancelled",
     "interrupted",
 )
+UNCATEGORIZED_FAILURE = "uncategorized"
 
 
 class HistoryError(RuntimeError):
@@ -260,6 +261,7 @@ class HistoryStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         try:
             yield connection
             connection.commit()
@@ -298,7 +300,7 @@ class HistoryStore:
                 """
             )
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > 2:
+            if version > 3:
                 raise HistoryError(
                     f"Audit history schema version {version} is newer than this application supports."
                 )
@@ -309,13 +311,27 @@ class HistoryStore:
                 connection.execute(
                     "ALTER TABLE history ADD COLUMN latest_start_utc TEXT NOT NULL DEFAULT ''"
                 )
+            category_values = ", ".join(
+                f"'{category.value}'" for category in FailureCategory
+            )
+            connection.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS history_failure_counts (
+                    job_id TEXT NOT NULL,
+                    category TEXT NOT NULL CHECK (category IN ({category_values})),
+                    count INTEGER NOT NULL CHECK (count >= 0),
+                    PRIMARY KEY (job_id, category),
+                    FOREIGN KEY (job_id) REFERENCES history(job_id) ON DELETE CASCADE
+                )
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_started ON history(started_utc DESC)"
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS history_status ON history(status)"
             )
-            connection.execute("PRAGMA user_version = 2")
+            connection.execute("PRAGMA user_version = 3")
 
     def start(self, record: HistoryRecord) -> None:
         values = self._record_values(record)
@@ -341,9 +357,22 @@ class HistoryStore:
         run_directory: str = "",
         summary_path: str = "",
         completed_utc: Optional[datetime] = None,
+        failure_counts: Optional[Mapping[FailureCategory, int]] = None,
     ) -> None:
         if status not in HISTORY_STATUSES or status == "running":
             raise HistoryError(f"Invalid final history status: {status}")
+        normalized_counts: dict[FailureCategory, int] = {}
+        for category, count in (failure_counts or {}).items():
+            if not isinstance(category, FailureCategory):
+                raise HistoryError(f"Invalid failure category: {category}")
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise HistoryError(
+                    f"Invalid failure count for {category.value}: {count}"
+                )
+            if count:
+                normalized_counts[category] = count
+        if sum(normalized_counts.values()) > failures:
+            raise HistoryError("Failure category counts exceed the total failures.")
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
@@ -367,6 +396,19 @@ class HistoryStore:
                 )
                 if cursor.rowcount != 1:
                     raise HistoryError("The active audit record is missing.")
+                connection.execute(
+                    "DELETE FROM history_failure_counts WHERE job_id = ?", (job_id,)
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO history_failure_counts (job_id, category, count)
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        (job_id, category.value, count)
+                        for category, count in normalized_counts.items()
+                    ),
+                )
         except sqlite3.Error as exc:
             raise HistoryError(f"Could not finalize audit record: {exc}") from exc
 
@@ -515,6 +557,39 @@ class HistoryStore:
         except sqlite3.Error as exc:
             raise HistoryError(f"Could not calculate status totals: {exc}") from exc
         return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def failure_category_counts(self, filters: HistoryFilter) -> dict[str, int]:
+        where, parameters = self._where(filters)
+        counts = {category.value: 0 for category in FailureCategory}
+        try:
+            with self._connect() as connection:
+                failure_total = int(
+                    connection.execute(
+                        f"SELECT COALESCE(SUM(failure_count), 0) FROM history {where}",
+                        parameters,
+                    ).fetchone()[0]
+                )
+                rows = connection.execute(
+                    f"""
+                    SELECT category, SUM(count) AS total
+                    FROM history_failure_counts
+                    WHERE job_id IN (SELECT job_id FROM history {where})
+                    GROUP BY category
+                    """,
+                    parameters,
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise HistoryError(
+                f"Could not calculate failure category totals: {exc}"
+            ) from exc
+        categorized_total = 0
+        for row in rows:
+            category = str(row["category"])
+            count = int(row["total"])
+            counts[category] = count
+            categorized_total += count
+        counts[UNCATEGORIZED_FAILURE] = max(0, failure_total - categorized_total)
+        return counts
 
     def distinct(self, column: str) -> list[str]:
         if column not in {"device_type", "profile_label"}:
