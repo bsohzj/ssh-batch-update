@@ -376,8 +376,19 @@ class CommandRunnerTests(unittest.TestCase):
             )
             connection = Mock()
             connection.disable_paging.return_value = ""
-            connection.send_command.return_value = "version output"
             events = []
+
+            def send_command(command):
+                self.assertEqual(command, "show version")
+                self.assertTrue(
+                    any(
+                        event.kind == "output_chunk" and "> show version\n" in event.transcript_chunk
+                        for event in events
+                    )
+                )
+                return "version output"
+
+            connection.send_command.side_effect = send_command
 
             result = runner.run_batch(
                 prepared,
@@ -397,6 +408,36 @@ class CommandRunnerTests(unittest.TestCase):
         command_event = next(event for event in events if event.kind == "command_started")
         self.assertEqual(command_event.message, "[exec] line 2")
         self.assertNotIn("show version", command_event.message)
+        live_text = "".join(event.transcript_chunk for event in events if event.kind == "output_chunk")
+        self.assertEqual(live_text, result.results[0].transcript)
+        self.assertLess(live_text.index("> show version"), live_text.index("version output"))
+
+    def test_failed_command_is_visible_live_before_ssh_call_returns(self):
+        connection = Mock()
+        connection.disable_paging.return_value = ""
+        events = []
+
+        def fail_command(command):
+            self.assertEqual(command, "set password literal-secret")
+            self.assertIn(
+                "> set password literal-secret\n",
+                "".join(event.transcript_chunk for event in events if event.kind == "output_chunk"),
+            )
+            raise RuntimeError("command failed")
+
+        connection.send_command.side_effect = fail_command
+        result = runner.execute_device(
+            "192.0.2.1",
+            self.settings(),
+            [runner.Command("exec", "set password literal-secret", 1)],
+            [],
+            types.SimpleNamespace(ConnectHandler=Mock(return_value=connection)),
+            event_callback=events.append,
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("=== error ===", result.transcript)
+        self.assertIn("=== error ===", "".join(event.transcript_chunk for event in events if event.kind == "output_chunk"))
 
     def test_cancellation_between_commands_disconnects_and_preserves_transcript(self):
         connection = Mock()
@@ -405,8 +446,10 @@ class CommandRunnerTests(unittest.TestCase):
         connection.send_command_timing.return_value = "first response"
         connection.exit_config_mode.return_value = "quit"
         token = runner.CancellationToken()
+        events = []
 
         def on_event(event):
+            events.append(event)
             if event.kind == "command_started":
                 token.cancel()
 
@@ -426,6 +469,9 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "cancelled")
         self.assertIn("first command", result.transcript)
         self.assertNotIn("second command", result.transcript)
+        live_text = "".join(event.transcript_chunk for event in events if event.kind == "output_chunk")
+        self.assertIn("=== cancellation ===", live_text)
+        self.assertNotIn("second command", live_text)
         connection.exit_config_mode.assert_called_once_with()
         connection.disconnect.assert_called_once_with()
 
@@ -617,6 +663,78 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertIn("RuntimeError: login [redacted] rejected", failed_transcript)
         self.assertNotIn("ssh-secret", failed_transcript)
         self.assertTrue(success_transcript_exists)
+
+    def test_combined_output_uses_batch_name_and_links_each_device_to_one_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            request = runner.RunRequest(
+                inventory=None,
+                command_file=None,
+                device_type="huawei",
+                output_dir=base / "outputs",
+                env_file=None,
+                apply=True,
+                inventory_text="192.0.2.10\n192.0.2.11",
+                exec_commands_text="show version",
+                output_mode=runner.OUTPUT_SINGLE_FILE,
+            )
+            prepared = runner.prepare_run(
+                request,
+                require_credentials=True,
+                environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+            )
+            first_connection = Mock()
+            first_connection.disable_paging.return_value = ""
+            first_connection.send_command.return_value = "first device output"
+            second_connection = Mock()
+            second_connection.disable_paging.return_value = ""
+            second_connection.send_command.return_value = "second device output"
+            netmiko = types.SimpleNamespace(
+                ConnectHandler=Mock(side_effect=[first_connection, second_connection])
+            )
+
+            result = runner.run_batch(
+                prepared,
+                netmiko_module=netmiko,
+                batch_name="Maintenance - Rack A / 2 devices",
+            )
+            expected = result.run_directory / "Maintenance_-_Rack_A_2_devices.txt"
+            combined_text = expected.read_text(encoding="utf-8")
+            with result.summary_path.open(encoding="utf-8", newline="") as summary:
+                rows = list(csv.DictReader(summary))
+            files = {path.name for path in result.run_directory.iterdir()}
+            file_permissions = expected.stat().st_mode & 0o777
+
+        self.assertEqual(files, {"Maintenance_-_Rack_A_2_devices.txt", "summary.csv"})
+        self.assertEqual(file_permissions, 0o600)
+        self.assertEqual([item.transcript_file for item in result.results], [str(expected)] * 2)
+        self.assertEqual([row["transcript_file"] for row in rows], [str(expected)] * 2)
+        self.assertLess(combined_text.index("Device: 192.0.2.10"), combined_text.index("Device: 192.0.2.11"))
+        self.assertIn("first device output", combined_text)
+        self.assertIn("second device output", combined_text)
+
+    def test_combined_output_requires_batch_name_before_creating_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "outputs"
+            prepared = runner.prepare_run(
+                runner.RunRequest(
+                    inventory=None,
+                    command_file=None,
+                    device_type="huawei",
+                    output_dir=output_dir,
+                    env_file=None,
+                    apply=True,
+                    inventory_text="192.0.2.10",
+                    exec_commands_text="show version",
+                    output_mode=runner.OUTPUT_SINGLE_FILE,
+                ),
+                require_credentials=True,
+                environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+            )
+
+            with self.assertRaisesRegex(runner.ConfigurationError, "batch name"):
+                runner.run_batch(prepared)
+            self.assertFalse(output_dir.exists())
 
     def test_stop_on_first_failure_skips_remaining_devices_and_writes_summary(self):
         with tempfile.TemporaryDirectory() as directory:

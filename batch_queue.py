@@ -11,13 +11,19 @@ from uuid import uuid4
 
 from PySide6.QtCore import QSettings
 
-from run_commands import PreparedRun, RunRequest, prepare_run
+from run_commands import (
+    OUTPUT_MODES,
+    OUTPUT_PER_DEVICE,
+    PreparedRun,
+    RunRequest,
+    prepare_run,
+)
 
 
 KEYCHAIN_SERVICE = "com.sg4291.sshbatchupdate.queue"
 QUEUE_GROUP = "batch_queue/jobs"
 QUEUE_ORDER_KEY = "batch_queue/order"
-PAYLOAD_VERSION = 3
+PAYLOAD_VERSION = 4
 EDITABLE_STATUSES = {"ready", "scheduled", "blocked", "interrupted"}
 TERMINAL_STATUSES = {
     "succeeded",
@@ -117,6 +123,7 @@ class BatchPayload:
     failure_patterns: tuple[str, ...] = ()
     profile_label: str = "Manual"
     stop_on_first_failure: bool = False
+    output_mode: str = OUTPUT_PER_DEVICE
 
     @classmethod
     def from_prepared(
@@ -142,6 +149,7 @@ class BatchPayload:
             failure_patterns=tuple(request.failure_patterns),
             profile_label=profile_label or "Manual",
             stop_on_first_failure=request.stop_on_first_failure,
+            output_mode=request.output_mode,
         )
 
     def to_json(self) -> str:
@@ -161,6 +169,7 @@ class BatchPayload:
                 "failure_patterns": list(self.failure_patterns),
                 "profile_label": self.profile_label,
                 "stop_on_first_failure": self.stop_on_first_failure,
+                "output_mode": self.output_mode,
             },
             separators=(",", ":"),
         )
@@ -170,11 +179,14 @@ class BatchPayload:
         try:
             data = json.loads(value)
             version = int(data.get("version", 0))
-            if version not in {1, 2, PAYLOAD_VERSION}:
+            if version not in {1, 2, 3, PAYLOAD_VERSION}:
                 raise ValueError("unsupported payload version")
             stop_on_first_failure = data.get("stop_on_first_failure", False)
             if not isinstance(stop_on_first_failure, bool):
                 raise ValueError("invalid stop_on_first_failure value")
+            output_mode = data.get("output_mode", OUTPUT_PER_DEVICE)
+            if output_mode not in OUTPUT_MODES:
+                raise ValueError("invalid output_mode value")
             return cls(
                 inventory_text=str(data["inventory_text"]),
                 exec_commands_text=str(data["exec_commands_text"]),
@@ -195,6 +207,7 @@ class BatchPayload:
                     else "Unknown (legacy)"
                 ),
                 stop_on_first_failure=stop_on_first_failure,
+                output_mode=output_mode,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise QueueStorageError(f"The stored batch payload is invalid: {exc}") from exc
@@ -212,6 +225,7 @@ class BatchPayload:
             exec_commands_text=self.exec_commands_text,
             config_commands_text=self.config_commands_text,
             stop_on_first_failure=self.stop_on_first_failure,
+            output_mode=self.output_mode,
         )
         return prepare_run(
             request,

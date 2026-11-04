@@ -39,8 +39,8 @@ Connections** logs in to each valid IP, detects the prompt, optionally verifies
 enable mode, and disconnects without running either command box. Its status,
 stage, full error, and diagnostic file appear in the same results table used by
 live runs. **Run Live** and **Schedule Run** validate and confirm a complete
-batch snapshot before it can make changes. Per-device
-progress never displays literal commands. Reports default to
+batch snapshot before it can make changes. The **Device Results** progress
+table does not display literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
 Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
@@ -77,6 +77,7 @@ or waits in FIFO order when another batch is active; it never jumps ahead of
 earlier ready work. Use **Schedule Run** to select a future local date and time.
 Use **Settings → Preferences…** in the macOS menu bar to choose the theme,
 set the scheduled batch timeout, and choose what happens after a device fails.
+Hover over the **?** next to the timeout for its explanation.
 The timeout is 30 minutes, 1 hour, or 2 hours (1 hour by default). It starts
 at the scheduled time and is saved with each new or rescheduled batch. A batch
 may begin at its expiry time, but it becomes **Expired** if it has not started after
@@ -89,6 +90,13 @@ Choose **Stop after first failure** to leave all remaining devices unrun; they
 appear as **Skipped** in Device Results and `summary.csv`. This choice is saved
 with each new batch, so changing Preferences does not affect queued work.
 It does not stop later batches in the queue.
+
+The SSH form's **Output files** choice applies to each submitted batch. By
+default, each device gets its own transcript. Choose **One file per batch**
+to put all attempted device transcripts in one file named after the batch.
+Device Results and `summary.csv` point each attempted device to that shared
+file. The output choice can be changed when editing a queued batch; connection
+tests continue to write separate device diagnostics.
 
 The **Queue** tab shows order, batch name, device and command counts, schedule,
 expiry time, status, and result. Pending jobs can be moved, edited,
@@ -103,6 +111,18 @@ open its per-device results. **Pause Queue** stops new batches from starting;
 **Stop Run** safely cancels the active batch at the next checkpoint and also
 pauses the queue. A batch with device failures does not prevent the next ready
 batch from starting.
+
+The **Live Output** tab follows the active batch regardless of which Queue row
+is selected. It shows each literal exec or config command as it is sent and the
+switch's response when that command returns. It may reveal passwords or other
+sensitive text. The last run stays visible until another starts or the app
+closes; connection tests do not appear there. The view keeps roughly the latest
+2 MB of text, while saved output files retain the complete transcript. Use the
+**Text size** controls above the output box to adjust its font from 50% to 200%;
+the percentage is remembered when the app reopens. At 100%, the text matches
+the previous 120% size. In **Settings → Preferences…**, choose **By batch** to
+keep all devices in the live view (the default), or **By device** to clear the
+view when the next device starts. Saved output files are unaffected.
 
 For a completed batch with device failures, **Retry Failed/Skipped Devices…**
 creates an editable SSH-form draft containing failed and skipped devices and

@@ -30,6 +30,11 @@ class RunCancelled(RuntimeError):
     """Raised at a safe checkpoint after cancellation is requested."""
 
 
+OUTPUT_PER_DEVICE = "per_device"
+OUTPUT_SINGLE_FILE = "single_file"
+OUTPUT_MODES = (OUTPUT_PER_DEVICE, OUTPUT_SINGLE_FILE)
+
+
 class FailureCategory(StrEnum):
     """Stable operational categories for failed device work."""
 
@@ -92,6 +97,7 @@ class RunRequest:
     exec_commands_text: Optional[str] = None
     config_commands_text: Optional[str] = None
     stop_on_first_failure: bool = False
+    output_mode: str = OUTPUT_PER_DEVICE
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,7 @@ class ProgressEvent:
     message: str = ""
     transcript_file: str = ""
     failure_category: Optional[FailureCategory] = None
+    transcript_chunk: str = ""
 
 
 @dataclass(frozen=True)
@@ -453,12 +460,12 @@ def _redact_secrets(value: Any, settings: Settings) -> str:
 
 
 # Add an operation label and its device response to a transcript buffer.
-def _append_transcript(transcript: list[str], label: str, response: Any) -> None:
+def _append_transcript(transcript: list[str], label: str, response: Any) -> str:
 
-    transcript.append(label)
     text = str(response)
-    if text:
-        transcript.append(text if text.endswith("\n") else f"{text}\n")
+    chunk = label + (text if not text or text.endswith("\n") else f"{text}\n")
+    transcript.append(chunk)
+    return chunk
 
 
 # Return the first failure regex matching a device response, if any.
@@ -498,6 +505,17 @@ def execute_device(
 ) -> DeviceResult:
 
     transcript: list[str] = [f"Device: {address}\n", f"Device type: {settings.device_type}\n\n"]
+
+    def emit_output(text: str) -> None:
+        if text and event_callback:
+            event_callback(
+                ProgressEvent("output_chunk", address=address, transcript_chunk=text)
+            )
+
+    def record_output(label: str, response: Any) -> None:
+        emit_output(_append_transcript(transcript, label, response))
+
+    emit_output("".join(transcript))
     connection = None
     in_config_mode = False
     current: Optional[Command] = None
@@ -519,7 +537,7 @@ def execute_device(
                 progress(f"ENABLING {address}")
             if event_callback:
                 event_callback(ProgressEvent("device_status", address=address, status="enabling"))
-            _append_transcript(transcript, "=== enable ===\n", connection.enable())
+            record_output("=== enable ===\n", connection.enable())
         operation = "Session preparation"
         if progress:
             progress(f"DISABLING PAGER {address}")
@@ -527,7 +545,7 @@ def execute_device(
             event_callback(
                 ProgressEvent("device_status", address=address, status="preparing session")
             )
-        _append_transcript(transcript, "=== disable paging ===\n", connection.disable_paging())
+        record_output("=== disable paging ===\n", connection.disable_paging())
 
         for next_command in commands:
             if cancellation_token:
@@ -537,17 +555,13 @@ def execute_device(
                 operation = "Enter configuration mode"
                 if progress:
                     progress(f"ENTERING CONFIG MODE {address}")
-                _append_transcript(
-                    transcript, "=== enter configuration mode ===\n", connection.config_mode()
-                )
+                record_output("=== enter configuration mode ===\n", connection.config_mode())
                 in_config_mode = True
             elif current.section == "exec" and in_config_mode:
                 operation = "Exit configuration mode"
                 if progress:
                     progress(f"EXITING CONFIG MODE {address}")
-                _append_transcript(
-                    transcript, "=== exit configuration mode ===\n", connection.exit_config_mode()
-                )
+                record_output("=== exit configuration mode ===\n", connection.exit_config_mode())
                 in_config_mode = False
 
             operation = "Exec command" if current.section == "exec" else "Config command"
@@ -568,11 +582,13 @@ def execute_device(
                         message=f"[{current.section}] line {current.line_number}",
                     )
                 )
+            emit_output(label)
             if current.section == "exec":
                 response = connection.send_command(current.text)
             else:
                 response = connection.send_command_timing(current.text, cmd_verify=False)
-            _append_transcript(transcript, label, response)
+            chunk = _append_transcript(transcript, label, response)
+            emit_output(chunk[len(label):])
             pattern = _rejected(response, failure_patterns)
             if pattern:
                 raise CommandRejected(f"device response matched failure pattern: {pattern}")
@@ -582,7 +598,7 @@ def execute_device(
         result = DeviceResult(address=address, status="success", transcript="")
     except RunCancelled as exc:
         error = str(exc)
-        _append_transcript(transcript, "=== cancellation ===\n", error)
+        record_output("=== cancellation ===\n", error)
         result = DeviceResult(
             address=address,
             status="cancelled",
@@ -591,7 +607,7 @@ def execute_device(
         )
     except Exception as exc:
         error = _safe_error(exc, settings)
-        _append_transcript(transcript, "=== error ===\n", error)
+        record_output("=== error ===\n", error)
         command_operation = operation in {"Exec command", "Config command"}
         result = DeviceResult(
             address=address,
@@ -609,9 +625,7 @@ def execute_device(
                 try:
                     if progress:
                         progress(f"EXITING CONFIG MODE {address}")
-                    _append_transcript(
-                        transcript, "=== exit configuration mode ===\n", connection.exit_config_mode()
-                    )
+                    record_output("=== exit configuration mode ===\n", connection.exit_config_mode())
                 except Exception:
                     pass
             try:
@@ -775,6 +789,16 @@ def _atomic_write(path: Path, content: str) -> None:
             temporary_path.unlink()
 
 
+def _append_combined_transcript(path: Path, transcript: str) -> None:
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output_file:
+        if os.fstat(output_file.fileno()).st_size:
+            output_file.write("\n")
+        output_file.write(transcript)
+        if transcript and not transcript.endswith("\n"):
+            output_file.write("\n")
+
+
 # Create a unique, private timestamped output directory.
 def create_run_directory(output_dir: Path, prefix: str = "run") -> Path:
 
@@ -855,6 +879,8 @@ def prepare_run(
     device_type = request.device_type.strip()
     if not device_type:
         raise ConfigurationError("device type is required")
+    if request.output_mode not in OUTPUT_MODES:
+        raise ConfigurationError("unsupported output mode")
     if request.inventory_text is not None:
         entries = tuple(parse_device_entries(request.inventory_text))
     elif request.inventory is not None:
@@ -906,15 +932,23 @@ def run_batch(
     cancellation_token: Optional[CancellationToken] = None,
     netmiko_module: Any = None,
     message_callback: Optional[Callable[[str], None]] = None,
+    batch_name: str = "",
 ) -> BatchResult:
 
     if not prepared.request.apply:
         raise ConfigurationError("run_batch requires a request with apply enabled")
     if prepared.settings is None:
         raise ConfigurationError("connection settings were not prepared")
+    if prepared.request.output_mode == OUTPUT_SINGLE_FILE and not batch_name.strip():
+        raise ConfigurationError("a batch name is required for a combined output file")
 
     token = cancellation_token or CancellationToken()
     run_directory = create_run_directory(prepared.request.output_dir)
+    combined_path = (
+        run_directory / f"{_safe_filename(batch_name)[:200]}.txt"
+        if prepared.request.output_mode == OUTPUT_SINGLE_FILE
+        else None
+    )
     total = len(prepared.entries)
     results: list[DeviceResult] = []
     stopped_after_failure = False
@@ -969,8 +1003,13 @@ def run_batch(
                 event_callback=progress_callback,
                 cancellation_token=token,
             )
-            transcript_path = run_directory / f"{_safe_filename(entry.address)}.txt"
-            _atomic_write(transcript_path, result.transcript)
+            transcript_path = (
+                combined_path or run_directory / f"{_safe_filename(entry.address)}.txt"
+            )
+            if combined_path is None:
+                _atomic_write(transcript_path, result.transcript)
+            else:
+                _append_combined_transcript(transcript_path, result.transcript)
             result.transcript_file = str(transcript_path)
 
         results.append(result)

@@ -10,6 +10,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 from uuid import uuid4
@@ -34,8 +35,14 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QDesktopServices,
+    QEnterEvent,
+    QFont,
+    QFontDatabase,
+    QFocusEvent,
     QPainter,
+    QPaintEvent,
     QPalette,
+    QPen,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -65,6 +72,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTimeEdit,
+    QToolButton,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -123,6 +131,8 @@ from run_commands import (
     ConfigurationError,
     DeviceResult,
     FailureCategory,
+    OUTPUT_PER_DEVICE,
+    OUTPUT_SINGLE_FILE,
     PreparedRun,
     ProgressEvent,
     RunRequest,
@@ -157,6 +167,18 @@ STOP_ON_FIRST_FAILURE_KEY = "run/stop_on_first_failure"
 SCHEDULE_TIMEOUT_CHOICES = (("30 minutes", 30), ("1 hour", 60), ("2 hours", 120))
 SCHEDULE_TIMEOUT_OPTIONS = tuple(minutes for _, minutes in SCHEDULE_TIMEOUT_CHOICES)
 DEFAULT_SCHEDULE_TIMEOUT_MINUTES = 60
+LIVE_OUTPUT_LIMIT = 2_000_000
+LIVE_OUTPUT_TRUNCATED = "[Earlier live output omitted; complete output is in saved files.]\n"
+LIVE_OUTPUT_MODE_KEY = "view/live_output_mode"
+LIVE_OUTPUT_BY_BATCH = "batch"
+LIVE_OUTPUT_BY_DEVICE = "device"
+LIVE_OUTPUT_FONT_PERCENT_KEY = "view/live_output_font_percent"
+LIVE_OUTPUT_FONT_BASE_VERSION_KEY = "view/live_output_font_base_version"
+LIVE_OUTPUT_FONT_BASE_VERSION = 2
+LIVE_OUTPUT_FONT_BASE_SCALE = 1.2
+LIVE_OUTPUT_FONT_MIN = 50
+LIVE_OUTPUT_FONT_MAX = 200
+LIVE_OUTPUT_FONT_STEP = 10
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -558,11 +580,13 @@ class BatchWorker(QObject):
         prepared: PreparedRun,
         cancellation_token: CancellationToken,
         operation: str = "run",
+        batch_name: str = "",
     ) -> None:
         super().__init__()
         self.prepared = prepared
         self.cancellation_token = cancellation_token
         self.operation = operation
+        self.batch_name = batch_name
 
     @Slot()
     def run(self) -> None:
@@ -578,6 +602,7 @@ class BatchWorker(QObject):
                     self.prepared,
                     progress_callback=self.event.emit,
                     cancellation_token=self.cancellation_token,
+                    batch_name=self.batch_name,
                 )
         except Exception as exc:  # The GUI boundary must surface all worker failures.
             self.failed.emit(f"{exc.__class__.__name__}: {exc}")
@@ -673,14 +698,65 @@ class ScheduleDialog(QDialog):
         self.accept()
 
 
+class ImmediateHelpButton(QToolButton):
+    """Draw a theme-aware circular help control with an immediate tooltip."""
+
+    def __init__(self, help_text: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setText("?")
+        tooltip_text = escape(help_text).replace("\n", "<br>")
+        self.setToolTip(f'<div style="font-size: 12pt;">{tooltip_text}</div>')
+        self.setFixedSize(22, 22)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        outline = (
+            palette.color(QPalette.ColorRole.Highlight)
+            if self.hasFocus()
+            else palette.color(QPalette.ColorRole.Mid)
+        )
+        painter.setPen(QPen(outline, 1))
+        painter.setBrush(palette.color(QPalette.ColorRole.Mid))
+        painter.drawEllipse(self.rect().adjusted(1, 1, -2, -2))
+        dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        painter.setPen(QColor("#ffffff" if dark else "#202124"))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.end()
+
+    def enterEvent(self, event: QEnterEvent) -> None:
+        super().enterEvent(event)
+        QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        super().focusInEvent(event)
+        QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self)
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        QToolTip.hideText()
+        super().focusOutEvent(event)
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            return True
+        return super().event(event)
+
+
 class PreferencesDialog(QDialog):
-    """Edit appearance and run defaults for future batches."""
+    """Edit appearance, Live Output display, and run defaults."""
 
     def __init__(
         self,
         theme_mode: str,
         timeout_minutes: int,
         stop_on_first_failure: bool,
+        live_output_mode: str,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -699,19 +775,44 @@ class PreferencesDialog(QDialog):
         self.timeout_combo = QComboBox()
         for label, minutes in SCHEDULE_TIMEOUT_CHOICES:
             self.timeout_combo.addItem(label, minutes)
-        form.addRow("Scheduled batch timeout", self.timeout_combo)
+        timeout_field = QWidget()
+        timeout_field_layout = QHBoxLayout(timeout_field)
+        timeout_field_layout.setContentsMargins(0, 0, 0, 0)
+        timeout_field_layout.setSpacing(4)
+        timeout_text = QLabel("Scheduled batch timeout")
+        timeout_text.setBuddy(self.timeout_combo)
+        timeout_field_layout.addWidget(self.timeout_combo, 1)
+        self.timeout_help_button = ImmediateHelpButton(
+            "A scheduled batch expires if it has not started within this time after its scheduled start."
+        )
+        self.timeout_help_button.setAccessibleName("Scheduled batch timeout help")
+        timeout_field_layout.addWidget(self.timeout_help_button)
+        form.addRow(timeout_text, timeout_field)
         self.failure_combo = QComboBox()
         self.failure_combo.addItem("Continue with remaining devices", False)
         self.failure_combo.addItem("Stop after first failure", True)
         form.addRow("When a device fails", self.failure_combo)
-        layout.addLayout(form)
-        self.set_values(theme_mode, timeout_minutes, stop_on_first_failure)
-        explanation = QLabel(
-            "Scheduled timeout: A batch expires if it has not started within this time "
-            "after its scheduled start. This applies to new and rescheduled batches."
+        self.live_output_mode_combo = QComboBox()
+        self.live_output_mode_combo.addItem("By batch", LIVE_OUTPUT_BY_BATCH)
+        self.live_output_mode_combo.addItem("By device", LIVE_OUTPUT_BY_DEVICE)
+        live_output_field = QWidget()
+        live_output_field_layout = QHBoxLayout(live_output_field)
+        live_output_field_layout.setContentsMargins(0, 0, 0, 0)
+        live_output_field_layout.setSpacing(4)
+        live_output_text = QLabel("Live Output")
+        live_output_text.setBuddy(self.live_output_mode_combo)
+        live_output_field_layout.addWidget(self.live_output_mode_combo, 1)
+        self.live_output_help_button = ImmediateHelpButton(
+            "By batch keeps output from all devices.\n"
+            "By device clears Live Output when the next device starts."
         )
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
+        self.live_output_help_button.setAccessibleName("Live Output help")
+        live_output_field_layout.addWidget(self.live_output_help_button)
+        form.addRow(live_output_text, live_output_field)
+        layout.addLayout(form)
+        self.set_values(
+            theme_mode, timeout_minutes, stop_on_first_failure, live_output_mode
+        )
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -720,7 +821,11 @@ class PreferencesDialog(QDialog):
         layout.addWidget(buttons)
 
     def set_values(
-        self, theme_mode: str, timeout_minutes: int, stop_on_first_failure: bool
+        self,
+        theme_mode: str,
+        timeout_minutes: int,
+        stop_on_first_failure: bool,
+        live_output_mode: str,
     ) -> None:
         self.theme_combo.setCurrentIndex(
             self.theme_combo.findData(normalize_theme_mode(theme_mode))
@@ -731,6 +836,9 @@ class PreferencesDialog(QDialog):
         self.failure_combo.setCurrentIndex(
             self.failure_combo.findData(stop_on_first_failure)
         )
+        self.live_output_mode_combo.setCurrentIndex(
+            self.live_output_mode_combo.findData(live_output_mode)
+        )
 
     def theme_mode(self) -> str:
         return str(self.theme_combo.currentData())
@@ -740,6 +848,9 @@ class PreferencesDialog(QDialog):
 
     def stop_on_first_failure(self) -> bool:
         return bool(self.failure_combo.currentData())
+
+    def live_output_mode(self) -> str:
+        return str(self.live_output_mode_combo.currentData())
 
 
 class IdleSleepInhibitor(QObject):
@@ -827,6 +938,48 @@ class MainWindow(QMainWindow):
         self._job_results: dict[str, BatchResult] = {}
         self._job_rows: dict[str, list[list[str]]] = {}
         self._job_progress: dict[str, tuple[int, int, str, str]] = {}
+        self._live_output_job_id: Optional[str] = None
+        self._live_output_batch_name = ""
+        self._live_output_device_address: Optional[str] = None
+        self._live_output_text = ""
+        live_output_mode = self.settings.value(
+            LIVE_OUTPUT_MODE_KEY, LIVE_OUTPUT_BY_BATCH, str
+        )
+        self._live_output_mode = (
+            live_output_mode
+            if live_output_mode in {LIVE_OUTPUT_BY_BATCH, LIVE_OUTPUT_BY_DEVICE}
+            else LIVE_OUTPUT_BY_BATCH
+        )
+        stored_font_percent = self.settings.value(LIVE_OUTPUT_FONT_PERCENT_KEY)
+        try:
+            font_percent = (
+                int(stored_font_percent) if stored_font_percent is not None else 100
+            )
+        except (TypeError, ValueError):
+            font_percent = 100
+        valid_font_percent = font_percent in range(
+            LIVE_OUTPUT_FONT_MIN, LIVE_OUTPUT_FONT_MAX + 1, LIVE_OUTPUT_FONT_STEP
+        )
+        if (
+            stored_font_percent is not None
+            and valid_font_percent
+            and self.settings.value(LIVE_OUTPUT_FONT_BASE_VERSION_KEY, 1, type=int)
+            < LIVE_OUTPUT_FONT_BASE_VERSION
+        ):
+            # Keep existing users near their previous visual size after rebasing 100%.
+            font_percent = round(
+                font_percent / LIVE_OUTPUT_FONT_BASE_SCALE / LIVE_OUTPUT_FONT_STEP
+            ) * LIVE_OUTPUT_FONT_STEP
+            font_percent = min(LIVE_OUTPUT_FONT_MAX, max(LIVE_OUTPUT_FONT_MIN, font_percent))
+            self.settings.setValue(LIVE_OUTPUT_FONT_PERCENT_KEY, font_percent)
+            self.settings.setValue(
+                LIVE_OUTPUT_FONT_BASE_VERSION_KEY, LIVE_OUTPUT_FONT_BASE_VERSION
+            )
+        self._live_output_font_percent = (
+            font_percent
+            if valid_font_percent
+            else 100
+        )
         self._selected_job_id: Optional[str] = None
         self._active_job_id: Optional[str] = None
         self._editing_job_id: Optional[str] = None
@@ -1015,6 +1168,9 @@ class MainWindow(QMainWindow):
         self.manage_profiles_button = QPushButton("Manage Profiles…")
         self.manage_profiles_button.clicked.connect(self.manage_profiles)
         self.output_edit, output_row = self._path_row("Choose output folder…", self._choose_output)
+        self.output_mode_combo = QComboBox()
+        self.output_mode_combo.addItem("One file per device", OUTPUT_PER_DEVICE)
+        self.output_mode_combo.addItem("One file per batch", OUTPUT_SINGLE_FILE)
 
         self.device_type_combo = QComboBox()
         self.device_type_combo.setEditable(True)
@@ -1041,6 +1197,10 @@ class MainWindow(QMainWindow):
         command_inputs_layout.addWidget(self.device_type_combo, 3, 1)
         command_inputs_layout.addWidget(output_label, 8, 0)
         command_inputs_layout.addWidget(output_row, 8, 1)
+        output_mode_label = QLabel("Output files")
+        output_mode_label.setBuddy(self.output_mode_combo)
+        command_inputs_layout.addWidget(output_mode_label, 9, 0)
+        command_inputs_layout.addWidget(self.output_mode_combo, 9, 1)
 
         form.addRow(self.command_inputs_container)
 
@@ -1177,6 +1337,52 @@ class MainWindow(QMainWindow):
 
         self.results_tabs.addTab(queue_tab, "Queue")
         self.results_tabs.addTab(device_results_tab, "Device Results")
+        live_output_tab = QWidget()
+        live_output_layout = QVBoxLayout(live_output_tab)
+        self.live_output_batch_label = QLabel("No live batch has run in this session")
+        live_output_layout.addWidget(self.live_output_batch_label)
+        warning = QLabel("Live output may contain passwords or other sensitive text.")
+        warning.setWordWrap(True)
+        output_controls = QHBoxLayout()
+        output_controls.addWidget(warning, 1)
+        output_controls.addStretch()
+        output_controls.addWidget(QLabel("Text size"))
+        self.live_output_smaller_button = QToolButton()
+        self.live_output_smaller_button.setText("-")
+        self.live_output_smaller_button.setAccessibleName("Decrease live output text size")
+        self.live_output_smaller_button.setToolTip("Decrease live output text size")
+        self.live_output_smaller_button.setFixedWidth(28)
+        self.live_output_smaller_button.clicked.connect(
+            lambda: self._change_live_output_font_size(-LIVE_OUTPUT_FONT_STEP)
+        )
+        output_controls.addWidget(self.live_output_smaller_button)
+        self.live_output_font_percent_label = QLabel()
+        self.live_output_font_percent_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_output_font_percent_label.setMinimumWidth(44)
+        output_controls.addWidget(self.live_output_font_percent_label)
+        self.live_output_larger_button = QToolButton()
+        self.live_output_larger_button.setText("+")
+        self.live_output_larger_button.setAccessibleName("Increase live output text size")
+        self.live_output_larger_button.setToolTip("Increase live output text size")
+        self.live_output_larger_button.setFixedWidth(28)
+        self.live_output_larger_button.clicked.connect(
+            lambda: self._change_live_output_font_size(LIVE_OUTPUT_FONT_STEP)
+        )
+        output_controls.addWidget(self.live_output_larger_button)
+        live_output_layout.addLayout(output_controls)
+        self.live_output_edit = QPlainTextEdit()
+        self.live_output_edit.setReadOnly(True)
+        self.live_output_edit.setUndoRedoEnabled(False)
+        self.live_output_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._live_output_base_font = QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont
+        )
+        self._apply_live_output_font_size()
+        self.live_output_edit.setPlaceholderText(
+            "Commands and switch replies will appear here while a batch runs."
+        )
+        live_output_layout.addWidget(self.live_output_edit, 1)
+        self.results_tabs.addTab(live_output_tab, "Live Output")
         self.results_tabs.currentChanged.connect(self._results_tab_changed)
         results_layout.addWidget(self.results_tabs, 1)
 
@@ -1242,6 +1448,7 @@ class MainWindow(QMainWindow):
                 self._theme_mode,
                 self._scheduled_timeout_minutes(),
                 self._stop_on_first_failure(),
+                self._live_output_mode,
                 self,
             )
             self.preferences_dialog.accepted.connect(self._save_preferences)
@@ -1249,6 +1456,7 @@ class MainWindow(QMainWindow):
             self._theme_mode,
             self._scheduled_timeout_minutes(),
             self._stop_on_first_failure(),
+            self._live_output_mode,
         )
         self.preferences_dialog.show()
         self.preferences_dialog.raise_()
@@ -1265,6 +1473,16 @@ class MainWindow(QMainWindow):
             STOP_ON_FIRST_FAILURE_KEY,
             self.preferences_dialog.stop_on_first_failure(),
         )
+        mode = self.preferences_dialog.live_output_mode()
+        self.settings.setValue(LIVE_OUTPUT_MODE_KEY, mode)
+        if mode != self._live_output_mode:
+            self._live_output_mode = mode
+            if mode == LIVE_OUTPUT_BY_BATCH:
+                self.live_output_batch_label.setText(
+                    self._live_output_batch_name or "No live batch has run in this session"
+                )
+            else:
+                self._live_output_device_address = None
         self._select_theme(self.preferences_dialog.theme_mode())
 
     @Slot(str)
@@ -1930,6 +2148,7 @@ class MainWindow(QMainWindow):
         self.username_edit.textChanged.connect(self._credentials_edited)
         self.password_edit.textChanged.connect(self._credentials_edited)
         self.output_edit.textChanged.connect(self.invalidate_validation)
+        self.output_mode_combo.currentIndexChanged.connect(self.invalidate_validation)
         self.inventory_text_edit.textChanged.connect(self.invalidate_validation)
         self.inventory_text_edit.textChanged.connect(self._update_clear_devices_button)
         self.exec_commands_edit.textChanged.connect(self.invalidate_validation)
@@ -2154,6 +2373,7 @@ class MainWindow(QMainWindow):
                 self.config_commands_edit.toPlainText() if include_commands else None
             ),
             stop_on_first_failure=self._stop_on_first_failure(),
+            output_mode=str(self.output_mode_combo.currentData()),
         )
 
     def _credential_environment(self) -> dict[str, str]:
@@ -2524,6 +2744,7 @@ class MainWindow(QMainWindow):
         self.queue_controller.mark_running(job.job_id)
         self._start_audit_record(job, payload, prepared)
         self._active_job_id = job.job_id
+        self._begin_live_output(job.job_id, job.name)
         self._selected_job_id = job.job_id
         self._refresh_queue_table(select_job_id=job.job_id)
         self._show_job_results(job.job_id)
@@ -2633,7 +2854,11 @@ class MainWindow(QMainWindow):
             self._batch_result = None
         self._token = CancellationToken()
         self._thread = QThread(self)
-        self._worker = BatchWorker(prepared, self._token, operation=operation)
+        job = self.queue_controller.job(job_id) if job_id else None
+        self._worker = BatchWorker(
+            prepared, self._token, operation=operation,
+            batch_name=job.name if job else "",
+        )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.event.connect(self.handle_progress)
@@ -2697,18 +2922,102 @@ class MainWindow(QMainWindow):
             self._set_cell(row, 5, event.transcript_file)
             self.progress_bar.setValue(event.index)
 
+    def _begin_live_output(self, job_id: str, batch_name: str) -> None:
+        self._live_output_job_id = job_id
+        self._live_output_batch_name = batch_name
+        self._live_output_device_address = None
+        self._live_output_text = ""
+        self.live_output_batch_label.setText(batch_name)
+        self.live_output_edit.clear()
+
+    def _focus_live_output_device(self, address: str) -> None:
+        if (
+            self._live_output_mode != LIVE_OUTPUT_BY_DEVICE
+            or not address
+            or self._live_output_device_address == address
+        ):
+            return
+        self._live_output_device_address = address
+        self._live_output_text = ""
+        self.live_output_edit.clear()
+        self.live_output_batch_label.setText(
+            f"{self._live_output_batch_name} — {address}"
+        )
+
+    def _apply_live_output_font_size(self) -> None:
+        font = QFont(self._live_output_base_font)
+        scale = LIVE_OUTPUT_FONT_BASE_SCALE * self._live_output_font_percent / 100
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * scale)
+        else:
+            font.setPixelSize(max(1, round(font.pixelSize() * scale)))
+        self.live_output_edit.setFont(font)
+        self.live_output_font_percent_label.setText(f"{self._live_output_font_percent}%")
+        self.live_output_smaller_button.setEnabled(
+            self._live_output_font_percent > LIVE_OUTPUT_FONT_MIN
+        )
+        self.live_output_larger_button.setEnabled(
+            self._live_output_font_percent < LIVE_OUTPUT_FONT_MAX
+        )
+
+    def _change_live_output_font_size(self, amount: int) -> None:
+        percent = min(
+            LIVE_OUTPUT_FONT_MAX,
+            max(LIVE_OUTPUT_FONT_MIN, self._live_output_font_percent + amount),
+        )
+        if percent == self._live_output_font_percent:
+            return
+        self._live_output_font_percent = percent
+        self._apply_live_output_font_size()
+        self.settings.setValue(LIVE_OUTPUT_FONT_PERCENT_KEY, percent)
+        self.settings.setValue(
+            LIVE_OUTPUT_FONT_BASE_VERSION_KEY, LIVE_OUTPUT_FONT_BASE_VERSION
+        )
+
+    def _append_live_output(self, text: str) -> None:
+        if not text:
+            return
+        scrollbar = self.live_output_edit.verticalScrollBar()
+        follow = scrollbar.value() >= scrollbar.maximum() - 2
+        previous_position = scrollbar.value()
+        updated = self._live_output_text + text
+        if len(updated) > LIVE_OUTPUT_LIMIT:
+            # Leave room so each subsequent small chunk does not rebuild the view.
+            retained = max(1, int(LIVE_OUTPUT_LIMIT * 0.9))
+            self._live_output_text = updated[-retained:]
+            self.live_output_edit.setPlainText(
+                LIVE_OUTPUT_TRUNCATED + self._live_output_text
+            )
+        else:
+            self._live_output_text = updated
+            cursor = self.live_output_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(text)
+        scrollbar.setValue(scrollbar.maximum() if follow else previous_position)
+
     def _handle_job_progress(self, job_id: str, event: ProgressEvent) -> None:
+        if self._live_output_job_id == job_id and event.address:
+            self._focus_live_output_device(event.address)
+        if event.kind == "output_chunk":
+            if self._live_output_job_id == job_id:
+                self._append_live_output(event.transcript_chunk)
+            return
         value, maximum, status_text, totals = self._job_progress.get(
             job_id, (0, max(1, event.total), "Queued", "")
         )
         if event.kind == "run_started":
+            if self._live_output_job_id != job_id:
+                job = self.queue_controller.job(job_id)
+                self._begin_live_output(job_id, job.name if job else "Batch")
             value, maximum, status_text = 0, max(1, event.total), "Running"
         elif event.kind == "run_finished":
             status_text, totals = event.message, event.message
+            self._append_live_output(f"\nBatch finished: {event.message}\n")
         elif event.kind == "device_started":
             self._set_job_cell(job_id, event.address, 1, "Starting")
         elif event.kind == "device_status":
             self._set_job_cell(job_id, event.address, 1, event.status.title())
+            self._append_live_output(f"[{event.address}] {event.status.title()}\n")
             if event.section:
                 self._set_job_cell(job_id, event.address, 3, event.section)
         elif event.kind == "command_started":
@@ -2739,6 +3048,10 @@ class MainWindow(QMainWindow):
                 self._set_job_cell(job_id, event.address, 3, event.section)
             self._set_job_cell(job_id, event.address, 4, event.message or shown_status)
             self._set_job_cell(job_id, event.address, 5, event.transcript_file)
+            outcome = f"\n[{event.address}] {event.status.upper()}"
+            if not event.transcript_file and event.message:
+                outcome += f": {event.message}"
+            self._append_live_output(outcome + "\n\n")
             value = event.index
         self._job_progress[job_id] = (value, maximum, status_text, totals)
         if self._selected_job_id == job_id:
@@ -2815,6 +3128,8 @@ class MainWindow(QMainWindow):
     def _run_failed(self, message: str) -> None:
         if self._operation == "run" and self._active_job_id:
             job_id = self._active_job_id
+            if self._live_output_job_id == job_id:
+                self._append_live_output(f"\nBatch failed: {message}\n")
             safe_message = self._safe_history_message(job_id, message)
             self._finalize_audit_record(job_id, "failed", safe_message)
             warning = self.queue_controller.mark_terminal(job_id, "failed", message)
@@ -3017,6 +3332,9 @@ class MainWindow(QMainWindow):
             self.exec_commands_edit.setPlainText(payload.exec_commands_text)
             self.config_commands_edit.setPlainText(payload.config_commands_text)
             self.output_edit.setText(payload.output_dir)
+            self.output_mode_combo.setCurrentIndex(
+                self.output_mode_combo.findData(payload.output_mode)
+            )
         finally:
             self._loading_settings = False
         self._credential_file = None
@@ -3245,6 +3563,9 @@ class MainWindow(QMainWindow):
             self.config_commands_edit.setPlainText(config_text)
             self.device_type_combo.setCurrentText(device_type)
             self.output_edit.setText(str(output_dir))
+            self.output_mode_combo.setCurrentIndex(
+                self.output_mode_combo.findData(OUTPUT_PER_DEVICE)
+            )
         finally:
             self._loading_settings = False
 

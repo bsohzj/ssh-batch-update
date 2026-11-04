@@ -75,12 +75,17 @@ class BatchQueueTests(unittest.TestCase):
         self.assertEqual(len(restored.commands), 2)
         self.assertEqual(restored_payload.profile_label, "Operations")
         self.assertFalse(restored.request.stop_on_first_failure)
+        self.assertEqual(restored.request.output_mode, runner.OUTPUT_PER_DEVICE)
 
     def test_payload_round_trip_preserves_stop_on_first_failure(self):
         prepared = self.prepared()
         prepared = replace(
             prepared,
-            request=replace(prepared.request, stop_on_first_failure=True),
+            request=replace(
+                prepared.request,
+                stop_on_first_failure=True,
+                output_mode=runner.OUTPUT_SINGLE_FILE,
+            ),
         )
         payload = batch_queue.BatchPayload.from_prepared(prepared)
 
@@ -88,6 +93,7 @@ class BatchQueueTests(unittest.TestCase):
 
         self.assertTrue(payload.stop_on_first_failure)
         self.assertTrue(restored.request.stop_on_first_failure)
+        self.assertEqual(restored.request.output_mode, runner.OUTPUT_SINGLE_FILE)
 
     def test_version_one_payload_remains_readable_with_legacy_profile(self):
         payload = batch_queue.BatchPayload.from_prepared(self.prepared())
@@ -100,6 +106,7 @@ class BatchQueueTests(unittest.TestCase):
         self.assertEqual(restored.profile_label, "Unknown (legacy)")
         self.assertEqual(restored.username, "queue-user")
         self.assertFalse(restored.stop_on_first_failure)
+        self.assertEqual(restored.output_mode, runner.OUTPUT_PER_DEVICE)
 
     def test_version_two_payload_keeps_profile_and_defaults_to_continue(self):
         data = json.loads(batch_queue.BatchPayload.from_prepared(self.prepared(), "Ops").to_json())
@@ -110,6 +117,25 @@ class BatchQueueTests(unittest.TestCase):
 
         self.assertEqual(restored.profile_label, "Ops")
         self.assertFalse(restored.stop_on_first_failure)
+        self.assertEqual(restored.output_mode, runner.OUTPUT_PER_DEVICE)
+
+    def test_version_three_payload_defaults_to_per_device_output(self):
+        data = json.loads(batch_queue.BatchPayload.from_prepared(self.prepared()).to_json())
+        data["version"] = 3
+        data.pop("output_mode")
+        data["stop_on_first_failure"] = True
+
+        restored = batch_queue.BatchPayload.from_json(json.dumps(data))
+
+        self.assertTrue(restored.stop_on_first_failure)
+        self.assertEqual(restored.output_mode, runner.OUTPUT_PER_DEVICE)
+
+    def test_invalid_output_mode_payload_is_rejected(self):
+        data = json.loads(batch_queue.BatchPayload.from_prepared(self.prepared()).to_json())
+        data["output_mode"] = "unknown"
+
+        with self.assertRaisesRegex(batch_queue.QueueStorageError, "output_mode"):
+            batch_queue.BatchPayload.from_json(json.dumps(data))
 
     def test_settings_metadata_contains_no_payload_or_secrets(self):
         job = self.add()
