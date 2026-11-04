@@ -17,7 +17,7 @@ from run_commands import PreparedRun, RunRequest, prepare_run
 KEYCHAIN_SERVICE = "com.sg4291.sshbatchupdate.queue"
 QUEUE_GROUP = "batch_queue/jobs"
 QUEUE_ORDER_KEY = "batch_queue/order"
-PAYLOAD_VERSION = 2
+PAYLOAD_VERSION = 3
 EDITABLE_STATUSES = {"ready", "scheduled", "blocked", "interrupted"}
 TERMINAL_STATUSES = {
     "succeeded",
@@ -116,6 +116,7 @@ class BatchPayload:
     timeout: int
     failure_patterns: tuple[str, ...] = ()
     profile_label: str = "Manual"
+    stop_on_first_failure: bool = False
 
     @classmethod
     def from_prepared(
@@ -140,6 +141,7 @@ class BatchPayload:
             timeout=settings.timeout,
             failure_patterns=tuple(request.failure_patterns),
             profile_label=profile_label or "Manual",
+            stop_on_first_failure=request.stop_on_first_failure,
         )
 
     def to_json(self) -> str:
@@ -158,6 +160,7 @@ class BatchPayload:
                 "timeout": self.timeout,
                 "failure_patterns": list(self.failure_patterns),
                 "profile_label": self.profile_label,
+                "stop_on_first_failure": self.stop_on_first_failure,
             },
             separators=(",", ":"),
         )
@@ -167,8 +170,11 @@ class BatchPayload:
         try:
             data = json.loads(value)
             version = int(data.get("version", 0))
-            if version not in {1, PAYLOAD_VERSION}:
+            if version not in {1, 2, PAYLOAD_VERSION}:
                 raise ValueError("unsupported payload version")
+            stop_on_first_failure = data.get("stop_on_first_failure", False)
+            if not isinstance(stop_on_first_failure, bool):
+                raise ValueError("invalid stop_on_first_failure value")
             return cls(
                 inventory_text=str(data["inventory_text"]),
                 exec_commands_text=str(data["exec_commands_text"]),
@@ -185,9 +191,10 @@ class BatchPayload:
                 failure_patterns=tuple(str(item) for item in data.get("failure_patterns", [])),
                 profile_label=(
                     str(data.get("profile_label") or "Manual")
-                    if version == PAYLOAD_VERSION
+                    if version >= 2
                     else "Unknown (legacy)"
                 ),
+                stop_on_first_failure=stop_on_first_failure,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise QueueStorageError(f"The stored batch payload is invalid: {exc}") from exc
@@ -204,6 +211,7 @@ class BatchPayload:
             inventory_text=self.inventory_text,
             exec_commands_text=self.exec_commands_text,
             config_commands_text=self.config_commands_text,
+            stop_on_first_failure=self.stop_on_first_failure,
         )
         return prepare_run(
             request,

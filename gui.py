@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -153,6 +153,7 @@ HISTORY_TREND_DURATION = "duration"
 HISTORY_BREAKDOWN_STATUS = "status"
 HISTORY_BREAKDOWN_FAILURES = "failures"
 SCHEDULE_TIMEOUT_KEY = "schedule/timeout_minutes"
+STOP_ON_FIRST_FAILURE_KEY = "run/stop_on_first_failure"
 SCHEDULE_TIMEOUT_CHOICES = (("30 minutes", 30), ("1 hour", 60), ("2 hours", 120))
 SCHEDULE_TIMEOUT_OPTIONS = tuple(minutes for _, minutes in SCHEDULE_TIMEOUT_CHOICES)
 DEFAULT_SCHEDULE_TIMEOUT_MINUTES = 60
@@ -673,10 +674,14 @@ class ScheduleDialog(QDialog):
 
 
 class PreferencesDialog(QDialog):
-    """Edit appearance and the start timeout for future schedules."""
+    """Edit appearance and run defaults for future batches."""
 
     def __init__(
-        self, theme_mode: str, timeout_minutes: int, parent: Optional[QWidget] = None
+        self,
+        theme_mode: str,
+        timeout_minutes: int,
+        stop_on_first_failure: bool,
+        parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Preferences")
@@ -695,10 +700,14 @@ class PreferencesDialog(QDialog):
         for label, minutes in SCHEDULE_TIMEOUT_CHOICES:
             self.timeout_combo.addItem(label, minutes)
         form.addRow("Scheduled batch timeout", self.timeout_combo)
+        self.failure_combo = QComboBox()
+        self.failure_combo.addItem("Continue with remaining devices", False)
+        self.failure_combo.addItem("Stop after first failure", True)
+        form.addRow("When a device fails", self.failure_combo)
         layout.addLayout(form)
-        self.set_values(theme_mode, timeout_minutes)
+        self.set_values(theme_mode, timeout_minutes, stop_on_first_failure)
         explanation = QLabel(
-            "A scheduled batch expires if it has not started within this time "
+            "Scheduled timeout: A batch expires if it has not started within this time "
             "after its scheduled start. This applies to new and rescheduled batches."
         )
         explanation.setWordWrap(True)
@@ -710,12 +719,17 @@ class PreferencesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def set_values(self, theme_mode: str, timeout_minutes: int) -> None:
+    def set_values(
+        self, theme_mode: str, timeout_minutes: int, stop_on_first_failure: bool
+    ) -> None:
         self.theme_combo.setCurrentIndex(
             self.theme_combo.findData(normalize_theme_mode(theme_mode))
         )
         self.timeout_combo.setCurrentIndex(
             self.timeout_combo.findData(timeout_minutes)
+        )
+        self.failure_combo.setCurrentIndex(
+            self.failure_combo.findData(stop_on_first_failure)
         )
 
     def theme_mode(self) -> str:
@@ -723,6 +737,9 @@ class PreferencesDialog(QDialog):
 
     def timeout_minutes(self) -> int:
         return int(self.timeout_combo.currentData())
+
+    def stop_on_first_failure(self) -> bool:
+        return bool(self.failure_combo.currentData())
 
 
 class IdleSleepInhibitor(QObject):
@@ -1089,7 +1106,7 @@ class MainWindow(QMainWindow):
         self.edit_batch_button = QPushButton("Edit Batch")
         self.reschedule_button = QPushButton("Reschedule…")
         self.retry_button = QPushButton("Retry")
-        self.retry_failed_button = QPushButton("Retry Failed Devices…")
+        self.retry_failed_button = QPushButton("Retry Failed/Skipped Devices…")
         self.remove_batch_button = QPushButton("Remove")
         self.clear_completed_button = QPushButton("Clear Completed")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
@@ -1215,15 +1232,23 @@ class MainWindow(QMainWindow):
             else DEFAULT_SCHEDULE_TIMEOUT_MINUTES
         )
 
+    def _stop_on_first_failure(self) -> bool:
+        return self.settings.value(STOP_ON_FIRST_FAILURE_KEY, False, type=bool)
+
     @Slot()
     def _open_preferences(self) -> None:
         if self.preferences_dialog is None:
             self.preferences_dialog = PreferencesDialog(
-                self._theme_mode, self._scheduled_timeout_minutes(), self
+                self._theme_mode,
+                self._scheduled_timeout_minutes(),
+                self._stop_on_first_failure(),
+                self,
             )
             self.preferences_dialog.accepted.connect(self._save_preferences)
         self.preferences_dialog.set_values(
-            self._theme_mode, self._scheduled_timeout_minutes()
+            self._theme_mode,
+            self._scheduled_timeout_minutes(),
+            self._stop_on_first_failure(),
         )
         self.preferences_dialog.show()
         self.preferences_dialog.raise_()
@@ -1235,6 +1260,10 @@ class MainWindow(QMainWindow):
             return
         self.settings.setValue(
             SCHEDULE_TIMEOUT_KEY, self.preferences_dialog.timeout_minutes()
+        )
+        self.settings.setValue(
+            STOP_ON_FIRST_FAILURE_KEY,
+            self.preferences_dialog.stop_on_first_failure(),
         )
         self._select_theme(self.preferences_dialog.theme_mode())
 
@@ -1249,6 +1278,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("appearance/theme", self._theme_mode)
         self.settings.sync()
         self._update_destructive_button_styles()
+        self._refresh_failed_status_colors()
         self._refresh_results_attention_color()
         if self._history_ui_built and hasattr(self, "history_table"):
             self._refresh_history()
@@ -2123,6 +2153,7 @@ class MainWindow(QMainWindow):
             config_commands_text=(
                 self.config_commands_edit.toPlainText() if include_commands else None
             ),
+            stop_on_first_failure=self._stop_on_first_failure(),
         )
 
     def _credential_environment(self) -> dict[str, str]:
@@ -2282,10 +2313,29 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.device_table.setItem(row, column, item)
         item.setText(value)
-        if column == 4:
+        if column == 1:
+            self._style_device_status(item)
+        elif column == 4:
             item.setToolTip("Double-click to view the full result" if value else "")
         elif column == 5:
             item.setToolTip("Double-click to open this output file" if value else "")
+
+    def _style_device_status(self, item: QTableWidgetItem) -> None:
+        if item.text().casefold() == "failed":
+            app = QApplication.instance()
+            palette = app.palette() if app is not None else self.palette()
+            dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+            item.setForeground(QBrush(QColor("#ff6b6b" if dark else "#c62828")))
+        else:
+            item.setData(Qt.ItemDataRole.ForegroundRole, None)
+
+    def _refresh_failed_status_colors(self) -> None:
+        if not hasattr(self, "device_table"):
+            return
+        for row in range(self.device_table.rowCount()):
+            item = self.device_table.item(row, 1)
+            if item is not None and item.text().casefold() == "failed":
+                self._style_device_status(item)
 
     @Slot(int, int)
     def handle_table_double_click(self, row: int, column: int) -> None:
@@ -2892,7 +2942,7 @@ class MainWindow(QMainWindow):
         self.retry_button.setEnabled(bool(job and job.status in {"blocked", "interrupted"}))
         result = self._job_results.get(job.job_id) if job else None
         self.retry_failed_button.setEnabled(
-            bool(result and any(item.status == "failed" for item in result.results))
+            bool(result and any(item.status in {"failed", "skipped"} for item in result.results))
         )
         self.remove_batch_button.setEnabled(bool(job and job.status != "running"))
         self.clear_completed_button.setEnabled(
@@ -2998,20 +3048,29 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Apply:
             return
         try:
-            payload = BatchPayload.from_prepared(
+            original = self.queue_controller.payload(job_id)
+            prepared = replace(
                 self._prepared,
+                request=replace(
+                    self._prepared.request,
+                    stop_on_first_failure=original.stop_on_first_failure,
+                ),
+            )
+            payload = BatchPayload.from_prepared(
+                prepared,
                 self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
             )
             self.queue_controller.replace_payload(
                 job_id,
                 payload,
-                self._prepared,
+                prepared,
             )
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not save batch", str(exc))
             return
-        self._job_prepared[job_id] = self._prepared
-        self._initialize_job_rows(job_id, self._prepared)
+        self._prepared = prepared
+        self._job_prepared[job_id] = prepared
+        self._initialize_job_rows(job_id, prepared)
         self._finish_batch_edit()
         self._refresh_queue_table(select_job_id=job_id)
         self._show_job_results(job_id)
@@ -3136,12 +3195,14 @@ class MainWindow(QMainWindow):
         commands: Sequence[Command],
         results: Sequence[DeviceResult],
     ) -> None:
-        failed = tuple(result for result in results if result.status == "failed")
-        if not failed:
+        unfinished = tuple(
+            result for result in results if result.status in {"failed", "skipped"}
+        )
+        if not unfinished:
             QMessageBox.critical(
                 self,
                 "Retry unavailable",
-                "This batch has no failed devices to retry.",
+                "This batch has no failed or skipped devices to retry.",
             )
             return
         has_form_content = any(
@@ -3178,7 +3239,7 @@ class MainWindow(QMainWindow):
         self._loading_settings = True
         try:
             self.inventory_text_edit.setPlainText(
-                "\n".join(result.address for result in failed)
+                "\n".join(result.address for result in unfinished)
             )
             self.exec_commands_edit.setPlainText(exec_text)
             self.config_commands_edit.setPlainText(config_text)
@@ -3200,8 +3261,12 @@ class MainWindow(QMainWindow):
         self._selected_job_id = None
         self._prepared = None
         self._set_validated(False)
+        retry_label = (
+            "failed or skipped" if any(item.status == "skipped" for item in unfinished)
+            else "failed"
+        )
         self.validation_label.setText(
-            f"Retry draft created for {len(failed)} failed device(s). "
+            f"Retry draft created for {len(unfinished)} {retry_label} device(s). "
             "Review and validate before running."
         )
         self.main_tabs.setCurrentWidget(self.ssh_tab)
@@ -3899,7 +3964,7 @@ class MainWindow(QMainWindow):
         actions = QGridLayout()
         self.history_results_button = QPushButton("View Device Results")
         self.history_commands_button = QPushButton("View Commands")
-        self.history_retry_failed_button = QPushButton("Retry Failed Devices…")
+        self.history_retry_failed_button = QPushButton("Retry Failed/Skipped Devices…")
         self.history_output_button = QPushButton("Open Output Folder")
         self.history_summary_button = QPushButton("Open Summary")
         self.history_remove_button = QPushButton("Remove from History")
@@ -4049,7 +4114,7 @@ class MainWindow(QMainWindow):
             result_devices = (
                 record.success_count + record.failure_count + record.cancelled_count
             )
-            devices = result_devices or record.valid_devices + record.invalid_devices
+            devices = max(result_devices, record.valid_devices + record.invalid_devices)
             result_text = record.result_text
             if record.summary_path and not Path(record.summary_path).is_file():
                 result_text = (result_text + " — Output unavailable").strip(" —")
@@ -4506,6 +4571,7 @@ class MainWindow(QMainWindow):
         }:
             if hasattr(self, "cancel_button"):
                 self._update_destructive_button_styles()
+                self._refresh_failed_status_colors()
             if hasattr(self, "results_attention_timer"):
                 self._refresh_results_attention_color()
             if self._history_ui_built and hasattr(self, "history_table"):

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -73,6 +74,20 @@ class BatchQueueTests(unittest.TestCase):
         self.assertEqual(restored.settings.timeout, 30)
         self.assertEqual(len(restored.commands), 2)
         self.assertEqual(restored_payload.profile_label, "Operations")
+        self.assertFalse(restored.request.stop_on_first_failure)
+
+    def test_payload_round_trip_preserves_stop_on_first_failure(self):
+        prepared = self.prepared()
+        prepared = replace(
+            prepared,
+            request=replace(prepared.request, stop_on_first_failure=True),
+        )
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+
+        restored = batch_queue.BatchPayload.from_json(payload.to_json()).prepare()
+
+        self.assertTrue(payload.stop_on_first_failure)
+        self.assertTrue(restored.request.stop_on_first_failure)
 
     def test_version_one_payload_remains_readable_with_legacy_profile(self):
         payload = batch_queue.BatchPayload.from_prepared(self.prepared())
@@ -84,6 +99,17 @@ class BatchQueueTests(unittest.TestCase):
 
         self.assertEqual(restored.profile_label, "Unknown (legacy)")
         self.assertEqual(restored.username, "queue-user")
+        self.assertFalse(restored.stop_on_first_failure)
+
+    def test_version_two_payload_keeps_profile_and_defaults_to_continue(self):
+        data = json.loads(batch_queue.BatchPayload.from_prepared(self.prepared(), "Ops").to_json())
+        data["version"] = 2
+        data.pop("stop_on_first_failure")
+
+        restored = batch_queue.BatchPayload.from_json(json.dumps(data))
+
+        self.assertEqual(restored.profile_label, "Ops")
+        self.assertFalse(restored.stop_on_first_failure)
 
     def test_settings_metadata_contains_no_payload_or_secrets(self):
         job = self.add()

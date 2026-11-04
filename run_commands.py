@@ -91,6 +91,7 @@ class RunRequest:
     inventory_text: Optional[str] = None
     exec_commands_text: Optional[str] = None
     config_commands_text: Optional[str] = None
+    stop_on_first_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,11 @@ class BatchResult:
 
     @property
     def failures(self) -> int:
-        return len(self.results) - self.successes - self.cancelled
+        return sum(result.status == "failed" for result in self.results)
+
+    @property
+    def skipped(self) -> int:
+        return sum(result.status == "skipped" for result in self.results)
 
     @property
     def failure_counts(self) -> dict[FailureCategory, int]:
@@ -432,10 +437,11 @@ def format_batch_summary(result: BatchResult, success_word: str = "succeeded") -
             if category in counts
         )
         failure_text += f" ({details})"
-    return (
+    summary = (
         f"{result.successes} {success_word}, {failure_text}, "
         f"{result.cancelled} cancelled"
     )
+    return f"{summary}, {result.skipped} skipped" if result.skipped else summary
 
 
 def _redact_secrets(value: Any, settings: Settings) -> str:
@@ -909,17 +915,14 @@ def run_batch(
 
     token = cancellation_token or CancellationToken()
     run_directory = create_run_directory(prepared.request.output_dir)
-    valid_entries = prepared.valid_entries
-    if valid_entries and netmiko_module is None:
-        netmiko_module = _load_netmiko()
-
     total = len(prepared.entries)
     results: list[DeviceResult] = []
+    stopped_after_failure = False
     if progress_callback:
         progress_callback(ProgressEvent("run_started", total=total, status="running"))
 
     for index, entry in enumerate(prepared.entries, 1):
-        if progress_callback:
+        if progress_callback and not stopped_after_failure:
             progress_callback(
                 ProgressEvent(
                     "device_started",
@@ -937,6 +940,13 @@ def run_batch(
                 "",
                 error="cancelled before device started",
             )
+        elif stopped_after_failure:
+            result = DeviceResult(
+                entry.address,
+                "skipped",
+                "",
+                error="not run because the batch stopped after the first failure",
+            )
         elif entry.error:
             result = DeviceResult(
                 entry.address,
@@ -947,6 +957,8 @@ def run_batch(
                 failure_category=FailureCategory.INPUT_VALIDATION,
             )
         else:
+            if netmiko_module is None:
+                netmiko_module = _load_netmiko()
             result = execute_device(
                 entry.address,
                 prepared.settings,
@@ -962,6 +974,8 @@ def run_batch(
             result.transcript_file = str(transcript_path)
 
         results.append(result)
+        if result.status == "failed" and prepared.request.stop_on_first_failure:
+            stopped_after_failure = True
         if progress_callback:
             progress_callback(
                 ProgressEvent(
@@ -1102,6 +1116,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("command_file", type=Path, help="ordered [exec]/[config] command file")
     parser.add_argument("--device-type", required=True, help="Netmiko device type, e.g. cisco_ios or huawei")
     parser.add_argument("--apply", action="store_true", help="connect and run commands (otherwise dry-run)")
+    parser.add_argument(
+        "--stop-on-first-failure", action="store_true",
+        help="skip remaining devices after the first device fails",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument(
@@ -1123,6 +1141,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         env_file=args.env_file,
         failure_patterns=tuple(args.failure_pattern),
         apply=args.apply,
+        stop_on_first_failure=args.stop_on_first_failure,
     )
     try:
         prepared = prepare_run(request, require_credentials=args.apply)
@@ -1151,6 +1170,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print(f"SUCCESS {event.address} -> {event.transcript_file}")
             elif event.status == "cancelled":
                 print(f"CANCELLED {event.address}: {event.message}", file=sys.stderr)
+            elif event.status == "skipped":
+                print(f"SKIPPED {event.address}: {event.message}", file=sys.stderr)
             else:
                 category = failure_category_label(event.failure_category)
                 prefix = f"FAILED  {event.address} [{category}]" if category else f"FAILED  {event.address}"
@@ -1168,7 +1189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print(f"Completed: {format_batch_summary(batch_result)}")
     print(f"Summary: {batch_result.summary_path}")
-    return 0 if batch_result.failures == 0 and batch_result.cancelled == 0 else 1
+    return 0 if not (batch_result.failures or batch_result.cancelled or batch_result.skipped) else 1
 
 
 if __name__ == "__main__":

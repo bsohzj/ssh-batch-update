@@ -75,14 +75,20 @@ The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
 earlier ready work. Use **Schedule Run** to select a future local date and time.
-Use **Settings → Preferences…** in the macOS menu bar to choose the theme and
-set the scheduled batch timeout to 30 minutes, 1 hour, or 2 hours (1 hour by
-default). The timeout starts at the scheduled time and is saved with each new
-or rescheduled batch. A batch may
-begin at its expiry time, but it becomes **Expired** if it has not started after
+Use **Settings → Preferences…** in the macOS menu bar to choose the theme,
+set the scheduled batch timeout, and choose what happens after a device fails.
+The timeout is 30 minutes, 1 hour, or 2 hours (1 hour by default). It starts
+at the scheduled time and is saved with each new or rescheduled batch. A batch
+may begin at its expiry time, but it becomes **Expired** if it has not started after
 that time. Changing the setting does not change already queued deadlines, and
 expiry never stops work that is already running. Future jobs do not block ready
 jobs, and batches scheduled for the same time run in visible queue order.
+
+By default, a failed device does not stop the other devices in its batch.
+Choose **Stop after first failure** to leave all remaining devices unrun; they
+appear as **Skipped** in Device Results and `summary.csv`. This choice is saved
+with each new batch, so changing Preferences does not affect queued work.
+It does not stop later batches in the queue.
 
 The **Queue** tab shows order, batch name, device and command counts, schedule,
 expiry time, status, and result. Pending jobs can be moved, edited,
@@ -98,9 +104,9 @@ open its per-device results. **Pause Queue** stops new batches from starting;
 pauses the queue. A batch with device failures does not prevent the next ready
 batch from starting.
 
-For a completed batch with device failures, **Retry Failed Devices…** creates an
-editable SSH-form draft containing only failed devices and the original
-commands. Successful and cancelled devices are excluded. The app reloads the
+For a completed batch with device failures, **Retry Failed/Skipped Devices…**
+creates an editable SSH-form draft containing failed and skipped devices and
+the original commands. Successful and cancelled devices are excluded. The app reloads the
 original named profile when it still exists; otherwise it clears credentials
 and selects Manual. Review and validate the draft before submitting it as a new
 batch. No retry is queued or executed automatically.
@@ -148,8 +154,8 @@ pagination. Legacy failures without stored categories appear as
 source, device type, and credential-profile label.
 Selecting a record can load its `summary.csv` into **Device Results**, open its
 output or summary, or show its encrypted command snapshot after a sensitive
-content warning. **Retry Failed Devices…** can also create a failed-only draft
-from a historical summary and encrypted command snapshot; credentials are
+content warning. **Retry Failed/Skipped Devices…** can also create a draft for
+failed and skipped devices from a historical summary and encrypted command snapshot; credentials are
 reloaded from an existing named profile rather than History.
 
 Audit metadata is stored in an owner-private SQLite database at the app's
@@ -290,8 +296,9 @@ python3 run_commands.py devices.txt commands.txt --device-type huawei --apply \
 Each apply run creates an owner-only timestamped directory under `outputs/`
 (or `--output-dir`) containing one exact device transcript and `summary.csv`.
 The runner stops only the affected device after a command error and continues
-with remaining devices. It does not roll back partial configurations. While it
-runs, the console shows the current device, section, source line, and command.
+with remaining devices by default. Add `--stop-on-first-failure` to skip later
+devices after any device failure. It does not roll back partial configurations.
+While it runs, the console shows the current device, section, source line, and command.
 Those progress messages include literal command-file passwords, so do not share
 or redirect that output where others can read it.
 

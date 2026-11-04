@@ -1945,6 +1945,54 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertEqual(reloaded.value(gui.SCHEDULE_TIMEOUT_KEY, type=int), 120)
 
+    def test_failure_policy_is_saved_only_after_save_and_snapshotted(self):
+        self.assertFalse(self.window._stop_on_first_failure())
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertEqual(
+            [dialog.failure_combo.itemData(i) for i in range(dialog.failure_combo.count())],
+            [False, True],
+        )
+        dialog.failure_combo.setCurrentIndex(dialog.failure_combo.findData(True))
+        dialog.reject()
+        self.assertIsNone(self.settings.value(gui.STOP_ON_FIRST_FAILURE_KEY))
+
+        self.window.preferences_action.trigger()
+        self.assertFalse(dialog.stop_on_first_failure())
+        dialog.failure_combo.setCurrentIndex(dialog.failure_combo.findData(True))
+        dialog.accept()
+        self.assertTrue(self.window._stop_on_first_failure())
+        reloaded = QSettings(str(self.base / "settings.ini"), QSettings.Format.IniFormat)
+        self.assertTrue(reloaded.value(gui.STOP_ON_FIRST_FAILURE_KEY, type=bool))
+
+        self.populate_valid_inputs()
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Apply,
+        ):
+            self.window.start_run()
+        job_id = self.window.queue_controller.jobs[0].job_id
+        self.assertTrue(self.window.queue_controller.payload(job_id).stop_on_first_failure)
+        self.assertTrue(self.window._job_prepared[job_id].request.stop_on_first_failure)
+
+        self.window.preferences_action.trigger()
+        dialog.failure_combo.setCurrentIndex(dialog.failure_combo.findData(False))
+        dialog.accept()
+        self.assertFalse(self.window._stop_on_first_failure())
+        self.assertTrue(self.window.queue_controller.payload(job_id).stop_on_first_failure)
+
+        with patch.object(
+            gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
+        ):
+            self.window.edit_selected_batch()
+        with patch.object(
+            gui.QMessageBox, "warning", return_value=QMessageBox.StandardButton.Apply
+        ):
+            self.window.save_batch_edit()
+        self.assertTrue(self.window.queue_controller.payload(job_id).stop_on_first_failure)
+        self.assertTrue(self.window._job_prepared[job_id].request.stop_on_first_failure)
+
     def test_scheduling_and_rescheduling_snapshot_settings_timeout(self):
         self.populate_valid_inputs()
         self.window.preferences_action.trigger()
@@ -2259,7 +2307,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertNotIn(job.job_id, self.secret_store.values)
         self.assertEqual(self.window._job_results[job.job_id].summary_path, summary)
 
-    def test_retry_failed_queue_batch_creates_unvalidated_failed_only_draft(self):
+    def test_retry_failed_queue_batch_includes_skipped_devices(self):
         prepared = runner.prepare_run(
             self._valid_request("huawei", "192.0.2.1\nbad-address\n192.0.2.2"),
             require_credentials=True,
@@ -2281,9 +2329,8 @@ class MainWindowTests(unittest.TestCase):
                 ),
                 runner.DeviceResult(
                     "192.0.2.2",
-                    "failed",
+                    "skipped",
                     "",
-                    failure_category=runner.FailureCategory.CONNECTIVITY,
                 ),
                 runner.DeviceResult("192.0.2.3", "cancelled", ""),
             ),
@@ -2311,6 +2358,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.run_button.isEnabled())
         self.assertEqual(len(self.window.queue_controller.jobs), 1)
         self.assertIn("Review and validate", self.window.validation_label.text())
+        self.assertIn("failed or skipped", self.window.validation_label.text())
 
     def test_retry_draft_cancel_preserves_current_form(self):
         self.populate_valid_inputs()
@@ -2490,6 +2538,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNotNone(self.history_store.get(job.job_id))
 
     def test_history_device_results_load_from_summary_on_demand(self):
+        self.select_theme(gui.THEME_LIGHT)
         run_directory = self.base / "outputs" / "run_results"
         run_directory.mkdir(parents=True)
         transcript = run_directory / "192.0.2.5.txt"
@@ -2525,6 +2574,11 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window._results_attention_pending)
         self.assertEqual(self.window.device_table.rowCount(), 1)
         self.assertEqual(self.window.device_table.item(0, 0).text(), "192.0.2.5")
+        self.assertEqual(self.window.device_table.item(0, 1).text(), "Failed")
+        self.assertEqual(
+            self.window.device_table.item(0, 1).foreground().color(),
+            QColor("#c62828"),
+        )
         self.assertEqual(self.window.device_table.item(0, 2).text(), "Command Rejected")
         self.assertEqual(self.window.device_table.item(0, 3).text(), "config / 2")
         self.assertEqual(
@@ -3150,6 +3204,34 @@ class MainWindowTests(unittest.TestCase):
         row = self.window._rows["192.0.2.1"]
         self.assertEqual(self.window.device_table.item(row, 1).text(), "Running")
         self.assertEqual(self.window.device_table.item(row, 3).text(), "exec / 2")
+
+    def test_failed_device_status_is_red_and_updates_with_theme(self):
+        self.select_theme(gui.THEME_LIGHT)
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        row = self.window._rows["192.0.2.1"]
+        status_item = self.window.device_table.item(row, 1)
+        self.assertIsNone(status_item.data(Qt.ItemDataRole.ForegroundRole))
+
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_finished",
+                address="192.0.2.1",
+                index=1,
+                total=1,
+                status="failed",
+                message="Connection failed",
+            )
+        )
+        self.assertEqual(status_item.text(), "Failed")
+        self.assertEqual(status_item.foreground().color(), QColor("#c62828"))
+
+        self.select_theme(gui.THEME_DARK)
+        self.app.processEvents()
+        self.assertEqual(status_item.foreground().color(), QColor("#ff6b6b"))
+
+        self.window._set_cell(row, 1, "Succeeded")
+        self.assertIsNone(status_item.data(Qt.ItemDataRole.ForegroundRole))
 
     def test_cancel_requests_cooperative_stop(self):
         self.assertEqual(self.window.cancel_button.text(), "Stop Run")

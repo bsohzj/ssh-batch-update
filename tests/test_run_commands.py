@@ -618,6 +618,68 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertNotIn("ssh-secret", failed_transcript)
         self.assertTrue(success_transcript_exists)
 
+    def test_stop_on_first_failure_skips_remaining_devices_and_writes_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            request = runner.RunRequest(
+                inventory=None,
+                command_file=None,
+                device_type="cisco_ios",
+                output_dir=base / "outputs",
+                env_file=None,
+                apply=True,
+                inventory_text="192.0.2.10\n192.0.2.11\n192.0.2.12",
+                exec_commands_text="show version",
+                stop_on_first_failure=True,
+            )
+            prepared = runner.prepare_run(
+                request,
+                require_credentials=True,
+                environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+            )
+            netmiko = types.SimpleNamespace(
+                ConnectHandler=Mock(side_effect=OSError("connection refused"))
+            )
+            events = []
+            result = runner.run_batch(
+                prepared, progress_callback=events.append, netmiko_module=netmiko
+            )
+            with result.summary_path.open(encoding="utf-8", newline="") as summary:
+                rows = list(csv.DictReader(summary))
+
+        self.assertEqual(netmiko.ConnectHandler.call_count, 1)
+        self.assertEqual([item.status for item in result.results], ["failed", "skipped", "skipped"])
+        self.assertEqual([row["status"] for row in rows], ["failed", "skipped", "skipped"])
+        self.assertEqual([event.address for event in events if event.kind == "device_started"], ["192.0.2.10"])
+        self.assertEqual([event.status for event in events if event.kind == "device_finished"], ["failed", "skipped", "skipped"])
+        self.assertEqual(result.failures, 1)
+        self.assertEqual(result.skipped, 2)
+        self.assertIn("2 skipped", runner.format_batch_summary(result))
+
+    def test_stop_on_first_input_failure_does_not_connect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            request = runner.RunRequest(
+                inventory=None,
+                command_file=None,
+                device_type="huawei",
+                output_dir=Path(directory) / "outputs",
+                env_file=None,
+                apply=True,
+                inventory_text="bad-address\n192.0.2.11",
+                exec_commands_text="show version",
+                stop_on_first_failure=True,
+            )
+            prepared = runner.prepare_run(
+                request,
+                require_credentials=True,
+                environment={"SSH_USERNAME": "admin", "SSH_PASSWORD": "secret"},
+            )
+            netmiko = types.SimpleNamespace(ConnectHandler=Mock())
+            result = runner.run_batch(prepared, netmiko_module=netmiko)
+
+        self.assertEqual([item.status for item in result.results], ["failed", "skipped"])
+        netmiko.ConnectHandler.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
