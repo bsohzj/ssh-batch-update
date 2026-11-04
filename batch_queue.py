@@ -364,11 +364,11 @@ class QueueController:
         latest_start = _as_utc(latest_start_utc) if latest_start_utc else None
         if scheduled is not None:
             if latest_start is None:
-                raise QueueStorageError("A scheduled batch requires a latest-start time.")
+                raise QueueStorageError("A scheduled batch requires an expiry time.")
             if latest_start <= scheduled:
-                raise QueueStorageError("Latest start must be later than the scheduled time.")
+                raise QueueStorageError("Expiry must be later than the scheduled time.")
         elif latest_start is not None:
-            raise QueueStorageError("A Run Live batch cannot have a latest-start time.")
+            raise QueueStorageError("A Run Live batch cannot have an expiry time.")
         job_id = uuid4().hex
         job = QueuedBatch(
             job_id=job_id,
@@ -441,7 +441,7 @@ class QueueController:
                 job = replace(
                     job,
                     status="expired",
-                    result=f"Not started: latest start passed at {local_deadline}",
+                    result=f"Not started: scheduled batch timeout reached at {local_deadline}",
                 )
                 try:
                     self.secret_store.delete(job.job_id)
@@ -517,7 +517,7 @@ class QueueController:
         scheduled = _as_utc(scheduled_utc)
         latest_start = _as_utc(latest_start_utc)
         if latest_start <= scheduled:
-            raise QueueStorageError("Latest start must be later than the scheduled time.")
+            raise QueueStorageError("Expiry must be later than the scheduled time.")
         now = _as_utc(self.clock())
         updated = replace(
             job,

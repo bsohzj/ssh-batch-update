@@ -208,7 +208,7 @@ class BatchQueueTests(unittest.TestCase):
         payload = batch_queue.BatchPayload.from_prepared(prepared)
         scheduled = self.now + timedelta(hours=1)
 
-        with self.assertRaisesRegex(batch_queue.QueueStorageError, "latest-start"):
+        with self.assertRaisesRegex(batch_queue.QueueStorageError, "expiry"):
             self.controller.add(payload, prepared, scheduled)
         with self.assertRaisesRegex(batch_queue.QueueStorageError, "later"):
             self.controller.add(payload, prepared, scheduled, scheduled)

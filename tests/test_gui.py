@@ -66,6 +66,12 @@ class MainWindowTests(unittest.TestCase):
         self.window.output_edit.setText(str(self.base / "outputs"))
         self.window.device_type_combo.setCurrentText("cisco_ios")
 
+    def select_theme(self, mode):
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData(mode))
+        dialog.accept()
+
     def add_history_record(
         self,
         job_id="history-job",
@@ -246,6 +252,9 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.queue_table.columnCount(), 9)
         self.assertEqual(self.window.device_table.columnCount(), 6)
         self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
+        self.assertFalse(hasattr(self.window, "top_toolbar"))
+        self.assertEqual(self.window.queue_table.horizontalHeaderItem(5).text(), "Run")
+        self.assertEqual(self.window.queue_table.horizontalHeaderItem(6).text(), "Expires")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
         self.assertFalse(hasattr(self.window, "queue_button"))
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
@@ -320,26 +329,31 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(len({editor.geometry().left() for editor in editors}), 1)
             self.assertEqual(len({editor.geometry().right() for editor in editors}), 1)
 
-    def test_theme_menu_defaults_to_system_and_actions_are_exclusive(self):
-        self.assertEqual(self.window.view_menu.title().replace("&", ""), "View")
-        self.assertEqual(self.window.theme_menu.title().replace("&", ""), "Theme")
-        self.assertTrue(self.window.theme_action_group.isExclusive())
-        self.assertTrue(self.window.theme_system_action.isChecked())
-        self.assertFalse(self.window.theme_light_action.isChecked())
-        self.assertFalse(self.window.theme_dark_action.isChecked())
+    def test_settings_menu_opens_preferences_and_saves_theme(self):
+        self.assertEqual(self.window.settings_menu.title().replace("&", ""), "Settings")
+        self.assertEqual(self.window.settings_menu.actions(), [self.window.preferences_action])
+        self.assertEqual(self.window.preferences_action.text(), "Preferences…")
+        self.assertEqual(self.window.preferences_action.menuRole(), gui.QAction.MenuRole.NoRole)
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.windowTitle(), "Preferences")
+        self.assertEqual(
+            [dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())],
+            [gui.THEME_SYSTEM, gui.THEME_LIGHT, gui.THEME_DARK],
+        )
+        self.assertEqual(dialog.theme_mode(), gui.THEME_SYSTEM)
+        dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData(gui.THEME_DARK))
+        dialog.accept()
 
-        self.window.theme_dark_action.trigger()
-
-        self.assertFalse(self.window.theme_system_action.isChecked())
-        self.assertFalse(self.window.theme_light_action.isChecked())
-        self.assertTrue(self.window.theme_dark_action.isChecked())
+        self.assertEqual(self.window._theme_mode, gui.THEME_DARK)
         self.assertEqual(self.settings.value("appearance/theme"), "dark")
         self.settings.beginGroup("appearance")
         self.assertEqual(self.settings.childKeys(), ["theme"])
         self.settings.endGroup()
 
     def test_runtime_theme_is_application_wide_and_system_restores_native_palette(self):
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         app_palette = self.app.palette()
@@ -355,20 +369,19 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertGreater(self.app.palette().resolveMask(), 0)
 
-        self.window.theme_light_action.trigger()
+        self.select_theme(gui.THEME_LIGHT)
         self.app.processEvents()
 
-        self.assertTrue(self.window.theme_light_action.isChecked())
+        self.assertEqual(self.window._theme_mode, gui.THEME_LIGHT)
         self.assertEqual(
             self.app.palette().color(QPalette.ColorRole.Window), QColor("#f5f5f5")
         )
         self.assertEqual(self.settings.value("appearance/theme"), "light")
 
-        self.window.theme_system_action.trigger()
+        self.select_theme(gui.THEME_SYSTEM)
         self.app.processEvents()
 
         self.assertEqual(self.window._theme_mode, gui.THEME_SYSTEM)
-        self.assertTrue(self.window.theme_system_action.isChecked())
         self.assertEqual(self.settings.value("appearance/theme"), "system")
         self.assertEqual(self.app.palette().resolveMask(), 0)
 
@@ -387,14 +400,14 @@ class MainWindowTests(unittest.TestCase):
             "_repolish_application_widgets",
             wraps=gui._repolish_application_widgets,
         ) as repolish:
-            self.window.theme_dark_action.trigger()
+            self.select_theme(gui.THEME_DARK)
             self.app.processEvents()
 
             self.assertGreaterEqual(repolish.call_count, 2)
             for widget, role in widgets_and_roles:
                 self.assertEqual(widget.palette().color(role), QColor("#f1f3f4"))
 
-            self.window.theme_light_action.trigger()
+            self.select_theme(gui.THEME_LIGHT)
             self.app.processEvents()
 
             self.assertGreaterEqual(repolish.call_count, 4)
@@ -402,7 +415,7 @@ class MainWindowTests(unittest.TestCase):
                 self.assertEqual(widget.palette().color(role), QColor("#202124"))
 
     def test_stored_theme_is_applied_when_a_window_is_reopened(self):
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.settings.sync()
         self.window.close()
         self.app.processEvents()
@@ -419,7 +432,6 @@ class MainWindowTests(unittest.TestCase):
         )
 
         self.assertEqual(self.window._theme_mode, gui.THEME_DARK)
-        self.assertTrue(self.window.theme_dark_action.isChecked())
         self.assertEqual(
             self.app.palette().color(QPalette.ColorRole.Window), QColor("#202124")
         )
@@ -427,7 +439,7 @@ class MainWindowTests(unittest.TestCase):
     def test_theme_switch_preserves_lazy_history_and_styles_it_when_created(self):
         self.assertFalse(self.window._history_ui_built)
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
 
         self.assertFalse(self.window._history_ui_built)
         self.add_history_record("lazy-dark")
@@ -448,7 +460,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertIn("#c62828", self.window.history_clear_button.styleSheet())
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         line_chart = self.window.history_line_view.chart()
@@ -829,7 +841,7 @@ class MainWindowTests(unittest.TestCase):
     def test_config_converter_switches_with_application_theme(self):
         self.window._ensure_converter_ui()
 
-        self.window.theme_light_action.trigger()
+        self.select_theme(gui.THEME_LIGHT)
         self.app.processEvents()
         self.assertEqual(
             self.window.converter_source_edit.palette().color(QPalette.ColorRole.Base),
@@ -840,7 +852,7 @@ class MainWindowTests(unittest.TestCase):
             QColor("#202124"),
         )
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         self.assertEqual(
             self.window.converter_source_edit.palette().color(QPalette.ColorRole.Base),
@@ -1218,7 +1230,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertFalse(button.isCheckable())
             self.assertFalse(button.isChecked())
 
-        self.window.theme_light_action.trigger()
+        self.select_theme(gui.THEME_LIGHT)
         self.app.processEvents()
         self.assertEqual(
             self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
@@ -1238,7 +1250,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window._dictionary_additional_info_expanded)
         assert_matches_copy_button()
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         self.assertEqual(
@@ -1409,7 +1421,7 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertIsNone(self.settings.value("history/trend"))
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         self.assertEqual(
             self.window.history_trend_combo.currentData(),
@@ -1565,7 +1577,7 @@ class MainWindowTests(unittest.TestCase):
             "Command Rejected: 1 device (100.0%)",
         )
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         self.assertEqual(
             self.window.history_breakdown_combo.currentData(),
@@ -1662,7 +1674,7 @@ class MainWindowTests(unittest.TestCase):
             filtered_series.clicked.emit(QPointF(0, 1))
             self.assertEqual(show.call_args.args[1].splitlines()[1], "Succeeded: 1 device")
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         themed_series = self.window.history_line_view.chart().series()[1]
         self.assertIsNot(themed_series, filtered_series)
@@ -1871,23 +1883,23 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("[redacted]", result)
         self.assertIn("[device]", result)
 
-    def test_schedule_dialog_displays_separate_date_and_time_fields(self):
-        dialog = gui.ScheduleDialog()
+    def test_schedule_dialog_uses_configured_timeout_without_deadline_fields(self):
+        dialog = gui.ScheduleDialog(timeout_minutes=30)
         dialog.show()
         self.app.processEvents()
 
         self.assertTrue(dialog.date_edit.isVisible())
         self.assertTrue(dialog.time_edit.isVisible())
-        self.assertTrue(dialog.latest_date_edit.isVisible())
-        self.assertTrue(dialog.latest_time_edit.isVisible())
+        self.assertFalse(hasattr(dialog, "latest_date_edit"))
+        self.assertFalse(hasattr(dialog, "latest_time_edit"))
         self.assertTrue(dialog.date_edit.calendarPopup())
         self.assertEqual(dialog.date_edit.displayFormat(), "ddd, d MMM yyyy")
         self.assertEqual(dialog.time_edit.displayFormat(), "h:mm AP")
         self.assertTrue(dialog.preview_label.text().startswith("Scheduled for "))
-        self.assertIn("Must start by", dialog.preview_label.text())
+        self.assertIn("Expires if not started by", dialog.preview_label.text())
         self.assertEqual(
             int((dialog.latest_start_utc() - dialog.selected_utc()).total_seconds()),
-            3600,
+            1800,
         )
 
         dialog.date_edit.setDate(dialog.date_edit.date().addDays(1))
@@ -1898,10 +1910,84 @@ class MainWindowTests(unittest.TestCase):
         self.assertGreater(dialog.selected_utc(), datetime.now(timezone.utc))
         self.assertEqual(
             int((dialog.latest_start_utc() - dialog.selected_utc()).total_seconds()),
-            3600,
+            1800,
         )
 
         dialog.close()
+
+    def test_settings_timeout_is_saved_only_after_save(self):
+        self.assertEqual(self.window._scheduled_timeout_minutes(), 60)
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(
+            [dialog.timeout_combo.itemData(i) for i in range(dialog.timeout_combo.count())],
+            [30, 60, 120],
+        )
+
+        dialog.timeout_combo.setCurrentIndex(dialog.timeout_combo.findData(30))
+        dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData(gui.THEME_DARK))
+        dialog.reject()
+        self.assertIsNone(self.settings.value(gui.SCHEDULE_TIMEOUT_KEY))
+        self.assertIsNone(self.settings.value("appearance/theme"))
+        self.assertEqual(self.window._theme_mode, gui.THEME_SYSTEM)
+
+        self.window.preferences_action.trigger()
+        self.assertEqual(dialog.timeout_minutes(), 60)
+        self.assertEqual(dialog.theme_mode(), gui.THEME_SYSTEM)
+        dialog.timeout_combo.setCurrentIndex(dialog.timeout_combo.findData(120))
+        dialog.accept()
+        self.assertEqual(self.settings.value(gui.SCHEDULE_TIMEOUT_KEY), 120)
+        self.assertEqual(self.window._scheduled_timeout_minutes(), 120)
+        reloaded = QSettings(
+            str(self.base / "settings.ini"), QSettings.Format.IniFormat
+        )
+        self.assertEqual(reloaded.value(gui.SCHEDULE_TIMEOUT_KEY, type=int), 120)
+
+    def test_scheduling_and_rescheduling_snapshot_settings_timeout(self):
+        self.populate_valid_inputs()
+        self.window.preferences_action.trigger()
+        settings_dialog = self.window.preferences_dialog
+        settings_dialog.timeout_combo.setCurrentIndex(
+            settings_dialog.timeout_combo.findData(30)
+        )
+        settings_dialog.accept()
+
+        with patch.object(
+            gui.ScheduleDialog, "exec", return_value=QDialog.DialogCode.Accepted
+        ), patch.object(
+            gui.QMessageBox, "warning", return_value=QMessageBox.StandardButton.Apply
+        ):
+            self.window.schedule_batch()
+
+        job = self.window.queue_controller.jobs[0]
+        self.assertEqual(job.latest_start_utc - job.scheduled_utc, timedelta(minutes=30))
+        self.assertEqual(
+            self.window.queue_table.item(0, 6).text(),
+            job.latest_start_utc.astimezone().strftime("%Y-%m-%d %H:%M"),
+        )
+
+        self.window.preferences_action.trigger()
+        settings_dialog.timeout_combo.setCurrentIndex(
+            settings_dialog.timeout_combo.findData(120)
+        )
+        settings_dialog.accept()
+        self.assertEqual(
+            self.window.queue_controller.job(job.job_id).latest_start_utc,
+            job.latest_start_utc,
+        )
+
+        with patch.object(
+            gui.ScheduleDialog, "exec", return_value=QDialog.DialogCode.Accepted
+        ):
+            self.window.reschedule_selected_batch()
+
+        rescheduled = self.window.queue_controller.job(job.job_id)
+        self.assertEqual(
+            rescheduled.latest_start_utc - rescheduled.scheduled_utc,
+            timedelta(hours=2),
+        )
 
     def test_queue_submission_snapshots_sensitive_inputs_outside_qsettings(self):
         self.populate_valid_inputs()
@@ -2073,8 +2159,9 @@ class MainWindowTests(unittest.TestCase):
 
     def test_theme_change_updates_active_results_attention_color(self):
         self.window._request_results_attention()
+        self.window.results_attention_timer.stop()
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         highlight = QColor("#0a84ff")

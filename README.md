@@ -74,15 +74,18 @@ permissions, and never commit them to Git.
 The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
-earlier ready work. Use **Schedule Run** to select a future local date from the
-calendar, a time, and a required latest-start deadline. New schedules default
-to a one-hour start window. A batch may begin at the deadline, but it becomes
-**Expired** if it has not started after that time. Expiry never stops work that
-is already running. Future jobs do not block ready jobs, and batches scheduled
-for the same time run in visible queue order.
+earlier ready work. Use **Schedule Run** to select a future local date and time.
+Use **Settings → Preferences…** in the macOS menu bar to choose the theme and
+set the scheduled batch timeout to 30 minutes, 1 hour, or 2 hours (1 hour by
+default). The timeout starts at the scheduled time and is saved with each new
+or rescheduled batch. A batch may
+begin at its expiry time, but it becomes **Expired** if it has not started after
+that time. Changing the setting does not change already queued deadlines, and
+expiry never stops work that is already running. Future jobs do not block ready
+jobs, and batches scheduled for the same time run in visible queue order.
 
 The **Queue** tab shows order, batch name, device and command counts, schedule,
-latest start, status, and result. Pending jobs can be moved, edited,
+expiry time, status, and result. Pending jobs can be moved, edited,
 rescheduled, retried, or removed. Cancelled, completed, and expired Queue
 entries can also be removed; removing an entry never deletes its transcripts,
 summary, or output directory. **Clear Completed** removes all successful,
@@ -104,14 +107,14 @@ batch. No retry is queued or executed automatically.
 
 Queued device addresses, commands, output settings, and credentials are stored
 as a complete macOS Keychain payload. Ordinary application settings contain
-only an opaque job ID, batch name, ordering, schedule window, friendly profile
-label, device type, and counts. The Keychain payload is deleted when the batch
-completes, is cancelled, expires, or is removed. A
+only an opaque job ID, batch name, ordering, schedule window, timeout setting,
+friendly profile label, device type, and counts. The Keychain payload is deleted
+when the batch completes, is cancelled, expires, or is removed. A
 profile is snapshotted when submitted, so later changes to its `.env` do not
 change the queued batch.
 
 Queued work is restored after reopening, but the queue starts paused. A new
-schedule restored after its latest-start deadline becomes **Expired** and its
+schedule restored after its expiry time becomes **Expired** and its
 Keychain payload is deleted. Older saved schedules that predate deadlines keep
 their legacy no-expiry behavior. A batch that
 was running when the app stopped becomes **Interrupted** and must be retried

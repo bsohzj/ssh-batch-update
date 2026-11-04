@@ -29,7 +29,6 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
-    QActionGroup,
     QBrush,
     QCloseEvent,
     QColor,
@@ -153,6 +152,10 @@ HISTORY_TREND_DEVICES = "devices"
 HISTORY_TREND_DURATION = "duration"
 HISTORY_BREAKDOWN_STATUS = "status"
 HISTORY_BREAKDOWN_FAILURES = "failures"
+SCHEDULE_TIMEOUT_KEY = "schedule/timeout_minutes"
+SCHEDULE_TIMEOUT_CHOICES = (("30 minutes", 30), ("1 hour", 60), ("2 hours", 120))
+SCHEDULE_TIMEOUT_OPTIONS = tuple(minutes for _, minutes in SCHEDULE_TIMEOUT_CHOICES)
+DEFAULT_SCHEDULE_TIMEOUT_MINUTES = 60
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -582,19 +585,22 @@ class BatchWorker(QObject):
 
 
 class ScheduleDialog(QDialog):
-    """Select a scheduled start and required latest-start deadline."""
+    """Select a start time and preview its configured expiry."""
 
     def __init__(
         self,
         initial_utc: Optional[datetime] = None,
-        initial_latest_start_utc: Optional[datetime] = None,
+        timeout_minutes: int = DEFAULT_SCHEDULE_TIMEOUT_MINUTES,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        if timeout_minutes not in SCHEDULE_TIMEOUT_OPTIONS:
+            raise ValueError("Unsupported scheduled batch timeout.")
+        self.timeout_minutes = timeout_minutes
         self.setWindowTitle("Schedule Run")
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Run this batch during this start window:"))
+        layout.addWidget(QLabel("Choose when this batch should start:"))
 
         minimum = QDateTime.currentDateTime().addSecs(60)
         if initial_utc is not None:
@@ -606,17 +612,6 @@ class ScheduleDialog(QDialog):
             selected = selected.addSecs(60 - selected.time().second())
         selected.setTime(selected.time().addMSecs(-selected.time().msec()))
 
-        window_seconds = 3600
-        if initial_utc is not None and initial_latest_start_utc is not None:
-            window_seconds = max(
-                60,
-                int((initial_latest_start_utc - initial_utc).total_seconds()),
-            )
-        latest = selected.addSecs(window_seconds)
-        self._latest_manually_edited = False
-        self._updating_schedule = False
-        self._last_start_local = selected
-
         fields = QFormLayout()
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
@@ -626,26 +621,14 @@ class ScheduleDialog(QDialog):
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("h:mm AP")
         self.time_edit.setTime(selected.time())
-        self.latest_date_edit = QDateEdit()
-        self.latest_date_edit.setCalendarPopup(True)
-        self.latest_date_edit.setDisplayFormat("ddd, d MMM yyyy")
-        self.latest_date_edit.setMinimumDate(QDateTime.currentDateTime().date())
-        self.latest_date_edit.setDate(latest.date())
-        self.latest_time_edit = QTimeEdit()
-        self.latest_time_edit.setDisplayFormat("h:mm AP")
-        self.latest_time_edit.setTime(latest.time())
         fields.addRow("Date", self.date_edit)
         fields.addRow("Time", self.time_edit)
-        fields.addRow("Latest start date", self.latest_date_edit)
-        fields.addRow("Latest start time", self.latest_time_edit)
         layout.addLayout(fields)
 
         self.preview_label = QLabel()
         self.preview_label.setWordWrap(True)
-        self.date_edit.dateChanged.connect(self._start_changed)
-        self.time_edit.timeChanged.connect(self._start_changed)
-        self.latest_date_edit.dateChanged.connect(self._latest_changed)
-        self.latest_time_edit.timeChanged.connect(self._latest_changed)
+        self.date_edit.dateChanged.connect(self._update_preview)
+        self.time_edit.timeChanged.connect(self._update_preview)
         layout.addWidget(self.preview_label)
         self._update_preview()
 
@@ -660,39 +643,17 @@ class ScheduleDialog(QDialog):
     def _selected_local(self) -> QDateTime:
         return QDateTime(self.date_edit.date(), self.time_edit.time())
 
-    def _latest_local(self) -> QDateTime:
-        return QDateTime(self.latest_date_edit.date(), self.latest_time_edit.time())
-
-    @Slot()
-    def _start_changed(self) -> None:
-        selected = self._selected_local()
-        if not self._latest_manually_edited:
-            delta = self._last_start_local.secsTo(selected)
-            self._updating_schedule = True
-            try:
-                shifted = self._latest_local().addSecs(delta)
-                self.latest_date_edit.setDate(shifted.date())
-                self.latest_time_edit.setTime(shifted.time())
-            finally:
-                self._updating_schedule = False
-        self._last_start_local = selected
-        self._update_preview()
-
-    @Slot()
-    def _latest_changed(self) -> None:
-        if not self._updating_schedule:
-            self._latest_manually_edited = True
-        self._update_preview()
-
     @Slot()
     def _update_preview(self) -> None:
         display = self._selected_local().toString(
             "dddd, d MMMM yyyy 'at' h:mm AP"
         )
-        latest = self._latest_local().toString(
+        latest = self._selected_local().addSecs(self.timeout_minutes * 60).toString(
             "dddd, d MMMM yyyy 'at' h:mm AP"
         )
-        self.preview_label.setText(f"Scheduled for {display}\nMust start by {latest}")
+        self.preview_label.setText(
+            f"Scheduled for {display}\nExpires if not started by {latest}"
+        )
 
     def selected_utc(self) -> datetime:
         local = self._selected_local().toPython().replace(second=0, microsecond=0)
@@ -701,24 +662,67 @@ class ScheduleDialog(QDialog):
         return local.astimezone(timezone.utc)
 
     def latest_start_utc(self) -> datetime:
-        local = self._latest_local().toPython().replace(second=0, microsecond=0)
-        if local.tzinfo is None:
-            local = local.astimezone()
-        return local.astimezone(timezone.utc)
+        return self.selected_utc() + timedelta(minutes=self.timeout_minutes)
 
     @Slot()
     def _accept_if_future(self) -> None:
         if self.selected_utc() <= datetime.now(timezone.utc):
             QMessageBox.critical(self, "Invalid schedule", "Choose a future date and time.")
             return
-        if self.latest_start_utc() <= self.selected_utc():
-            QMessageBox.critical(
-                self,
-                "Invalid schedule",
-                "Latest start must be later than the scheduled time.",
-            )
-            return
         self.accept()
+
+
+class PreferencesDialog(QDialog):
+    """Edit appearance and the start timeout for future schedules."""
+
+    def __init__(
+        self, theme_mode: str, timeout_minutes: int, parent: Optional[QWidget] = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(390)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.theme_combo = QComboBox()
+        for label, mode in (
+            ("System", THEME_SYSTEM),
+            ("Light", THEME_LIGHT),
+            ("Dark", THEME_DARK),
+        ):
+            self.theme_combo.addItem(label, mode)
+        form.addRow("Theme", self.theme_combo)
+        self.timeout_combo = QComboBox()
+        for label, minutes in SCHEDULE_TIMEOUT_CHOICES:
+            self.timeout_combo.addItem(label, minutes)
+        form.addRow("Scheduled batch timeout", self.timeout_combo)
+        layout.addLayout(form)
+        self.set_values(theme_mode, timeout_minutes)
+        explanation = QLabel(
+            "A scheduled batch expires if it has not started within this time "
+            "after its scheduled start. This applies to new and rescheduled batches."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def set_values(self, theme_mode: str, timeout_minutes: int) -> None:
+        self.theme_combo.setCurrentIndex(
+            self.theme_combo.findData(normalize_theme_mode(theme_mode))
+        )
+        self.timeout_combo.setCurrentIndex(
+            self.timeout_combo.findData(timeout_minutes)
+        )
+
+    def theme_mode(self) -> str:
+        return str(self.theme_combo.currentData())
+
+    def timeout_minutes(self) -> int:
+        return int(self.timeout_combo.currentData())
 
 
 class IdleSleepInhibitor(QObject):
@@ -827,6 +831,7 @@ class MainWindow(QMainWindow):
         self._history_ui_built = False
         self._dictionary_ui_built = False
         self.dictionary_dialog: Optional[QDialog] = None
+        self.preferences_dialog: Optional[PreferencesDialog] = None
         self._converter_ui_built = False
         self.converter_dialog: Optional[QDialog] = None
         self._converter_result: Optional[ConversionResult] = None
@@ -1061,7 +1066,7 @@ class MainWindow(QMainWindow):
         self.queue_table.setHorizontalHeaderLabels(
             [
                 "Order", "Batch", "Device Type", "Devices", "Commands",
-                "Run At", "Latest Start", "Status", "Result",
+                "Run", "Expires", "Status", "Result",
             ]
         )
         self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1190,36 +1195,51 @@ class MainWindow(QMainWindow):
         self._update_destructive_button_styles()
 
     def _build_menu(self) -> None:
-        self.view_menu = self.menuBar().addMenu("&View")
-        self.theme_menu = self.view_menu.addMenu("&Theme")
-        self.theme_action_group = QActionGroup(self)
-        self.theme_action_group.setExclusive(True)
-        self.theme_actions: dict[str, QAction] = {}
-        for mode, label in (
-            (THEME_SYSTEM, "System"),
-            (THEME_LIGHT, "Light"),
-            (THEME_DARK, "Dark"),
-        ):
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setData(mode)
-            action.setChecked(mode == self._theme_mode)
-            action.triggered.connect(
-                lambda checked=False, selected=mode: self._select_theme(
-                    selected, checked
-                )
-            )
-            self.theme_action_group.addAction(action)
-            self.theme_menu.addAction(action)
-            self.theme_actions[mode] = action
-        self.theme_system_action = self.theme_actions[THEME_SYSTEM]
-        self.theme_light_action = self.theme_actions[THEME_LIGHT]
-        self.theme_dark_action = self.theme_actions[THEME_DARK]
+        self.settings_menu = self.menuBar().addMenu("&Settings")
+        self.preferences_action = QAction("Preferences…", self)
+        self.preferences_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.preferences_action.triggered.connect(self._open_preferences)
+        self.settings_menu.addAction(self.preferences_action)
 
-    @Slot(str, bool)
-    def _select_theme(self, mode: str, checked: bool = True) -> None:
-        if not checked:
+    def _scheduled_timeout_minutes(self) -> int:
+        value = self.settings.value(
+            SCHEDULE_TIMEOUT_KEY, DEFAULT_SCHEDULE_TIMEOUT_MINUTES
+        )
+        try:
+            minutes = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_SCHEDULE_TIMEOUT_MINUTES
+        return (
+            minutes
+            if minutes in SCHEDULE_TIMEOUT_OPTIONS
+            else DEFAULT_SCHEDULE_TIMEOUT_MINUTES
+        )
+
+    @Slot()
+    def _open_preferences(self) -> None:
+        if self.preferences_dialog is None:
+            self.preferences_dialog = PreferencesDialog(
+                self._theme_mode, self._scheduled_timeout_minutes(), self
+            )
+            self.preferences_dialog.accepted.connect(self._save_preferences)
+        self.preferences_dialog.set_values(
+            self._theme_mode, self._scheduled_timeout_minutes()
+        )
+        self.preferences_dialog.show()
+        self.preferences_dialog.raise_()
+        self.preferences_dialog.activateWindow()
+
+    @Slot()
+    def _save_preferences(self) -> None:
+        if self.preferences_dialog is None:
             return
+        self.settings.setValue(
+            SCHEDULE_TIMEOUT_KEY, self.preferences_dialog.timeout_minutes()
+        )
+        self._select_theme(self.preferences_dialog.theme_mode())
+
+    @Slot(str)
+    def _select_theme(self, mode: str) -> None:
         app = QApplication.instance()
         if app is None:
             return
@@ -2347,7 +2367,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def schedule_batch(self) -> None:
-        dialog = ScheduleDialog(parent=self)
+        dialog = ScheduleDialog(
+            timeout_minutes=self._scheduled_timeout_minutes(), parent=self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._submit_batch(
@@ -2371,7 +2393,7 @@ class MainWindow(QMainWindow):
             schedule_text = (
                 "\nScheduled for "
                 f"{scheduled_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
-                "Must start by "
+                "Expires if not started by "
                 f"{latest_start_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
             )
         answer = QMessageBox.warning(
@@ -2810,7 +2832,7 @@ class MainWindow(QMainWindow):
                     if job.scheduled_utc
                     else "Ready now"
                 )
-                latest_start = (
+                expires_at = (
                     job.latest_start_utc.astimezone().strftime("%Y-%m-%d %H:%M")
                     if job.latest_start_utc
                     else "No expiry (legacy)" if job.scheduled_utc else "—"
@@ -2826,7 +2848,7 @@ class MainWindow(QMainWindow):
                     ),
                     QTableWidgetItem(str(job.command_count)),
                     QTableWidgetItem(scheduled),
-                    QTableWidgetItem(latest_start),
+                    QTableWidgetItem(expires_at),
                     QTableWidgetItem(status),
                     QTableWidgetItem(job.result),
                 )
@@ -3014,9 +3036,9 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         dialog = ScheduleDialog(
-            job.scheduled_utc,
-            job.latest_start_utc,
-            self,
+            initial_utc=job.scheduled_utc,
+            timeout_minutes=self._scheduled_timeout_minutes(),
+            parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -4721,6 +4743,8 @@ class MainWindow(QMainWindow):
             self._save_settings()
             if self.dictionary_dialog is not None:
                 self.dictionary_dialog.hide()
+            if self.preferences_dialog is not None:
+                self.preferences_dialog.hide()
             if self.converter_dialog is not None:
                 self.converter_dialog.hide()
             if hasattr(self, "scheduler_timer"):
@@ -4761,6 +4785,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self.dictionary_dialog is not None:
             self.dictionary_dialog.hide()
+        if self.preferences_dialog is not None:
+            self.preferences_dialog.hide()
         if self.converter_dialog is not None:
             self.converter_dialog.hide()
         if hasattr(self, "scheduler_timer"):
