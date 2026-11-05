@@ -9,13 +9,27 @@ import re
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Protocol
 
 from run_commands import Settings
 
 
 class TerminalError(RuntimeError):
     """A terminal connection or transcript could not be started."""
+
+
+class InteractiveSession(Protocol):
+    address: str
+    transcript_path: Optional[Path]
+
+    @property
+    def sensitive_values(self) -> tuple[str, ...]: ...
+    def send(self, data: str) -> None: ...
+    def resize(self, cols: int, rows: int) -> None: ...
+    def stop(self) -> None: ...
+    def run(
+        self, on_connected: Callable[[], None], on_output: Callable[[str], None]
+    ) -> Optional[Path]: ...
 
 
 def terminal_transcript_path(folder: Path, address: str, now: datetime) -> Path:
@@ -107,6 +121,14 @@ class TerminalSession:
         self.disable_paging = disable_paging
         self._requests: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
         self._stopping = threading.Event()
+
+    @property
+    def sensitive_values(self) -> tuple[str, ...]:
+        return tuple(
+            value for value in (
+                self.settings.username, self.settings.password, self.settings.enable_secret
+            ) if value
+        )
 
     def send(self, data: str) -> None:
         if not self._stopping.is_set():

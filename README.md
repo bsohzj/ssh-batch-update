@@ -156,13 +156,30 @@ lab switches before using the feature on production access switches.
 
 ### Interactive Terminal
 
-The **Terminal** tab connects to one IPv4 or IPv6 device at a time. Select a
+The **Terminal** tab supports **SSH** or a local **Console** cable, one connection
+at a time. For SSH, enter an IPv4 or IPv6 address and select a
 credential profile or enter a username and password manually, choose the device
 type, and press **Connect**. The terminal accepts normal keyboard input,
 including cursor keys and Ctrl+C. It stays connected when you switch tabs and
 can run alongside a queued batch. **Disconnect** ends its session.
 The Terminal remembers its last selected device type separately from the SSH
 batch form.
+
+For a console cable plugged into the Mac, select **Console**, choose the
+`/dev/cu.*` serial port, and set the baud rate to match the device. **Refresh
+Ports** rescans attached adapters; you can also type a port path. While Console
+mode is visible and disconnected, the app scans once per second and updates
+the list only when ports change. Scanning pauses while you edit the port field
+or use its dropdown, and it never opens a connection automatically.
+USB adapters are listed first; Bluetooth ports remain available but are not
+selected automatically. macOS port discovery uses `/dev/cu.*` callout names;
+the corresponding `/dev/tty.*` path can also be entered manually.
+Defaults are 9600 baud, 8 data bits, no parity, 1 stop bit, and no flow control. Data bits,
+parity, stop bits and RTS/CTS or XON/XOFF flow control can be adjusted before
+connecting. Press Enter after connecting to display the console prompt and log
+in directly in the terminal. The USB console adapter must be recognized by
+macOS. Removing the cable reports a connection error and closes the session.
+Console mode does not send login credentials or paging commands automatically.
 
 **Disable paging** is off by default, leaving the switch's usual page breaks
 in place. Turn it on before connecting to show long replies without `--More--`

@@ -5198,7 +5198,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "Stop active operation?",
-                "The app will disconnect active SSH work and then close. "
+                "The app will stop active work and disconnect terminal sessions before closing. "
                 "Any remaining queued batches will be restored paused next time.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -5402,6 +5402,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             if window.main_tabs.currentWidget() is not window.ssh_tab:
                 raise RuntimeError("Terminal preload changed the active tab")
             window.main_tabs.setCurrentWidget(window.terminal_tab)
+            window.terminal_pane.connection_type_combo.setCurrentIndex(1)
+            if not window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("Visible Console did not start port scanning")
+            window.main_tabs.setCurrentWidget(window.ssh_tab)
+            if window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("Hidden Console kept scanning ports")
+            window.main_tabs.setCurrentWidget(window.terminal_tab)
+            if not window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("Console did not resume port scanning")
+            window.terminal_pane.connection_type_combo.setCurrentIndex(0)
+            if window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("SSH mode kept scanning serial ports")
             window._ensure_history_ui()
             window._open_command_dictionary()
             window.dictionary_search_edit.setText("interface")
