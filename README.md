@@ -138,6 +138,8 @@ friendly profile label, device type, and counts. The Keychain payload is deleted
 when the batch completes, is cancelled, expires, or is removed. A
 profile is snapshotted when submitted, so later changes to its `.env` do not
 change the queued batch.
+If Keychain cleanup fails after a batch reaches a terminal state, the app keeps
+only its opaque job ID in settings and retries cleanup on the next launch.
 
 Queued work is restored after reopening, but the queue starts paused. A new
 schedule restored after its expiry time becomes **Expired** and its

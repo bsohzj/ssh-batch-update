@@ -2454,6 +2454,16 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNone(self.history_store.get(job.job_id))
         start_worker.assert_not_called()
 
+        self.window._refresh_queue_table(select_job_id=job.job_id)
+        with patch.object(
+            gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
+        ), patch.object(gui.QMessageBox, "critical") as error_dialog:
+            self.window.remove_selected_batch()
+
+        error_dialog.assert_not_called()
+        self.assertIsNone(self.window.queue_controller.job(job.job_id))
+        self.assertEqual(self.window.queue_table.rowCount(), 0)
+
     def test_queued_completion_updates_status_and_deletes_secret(self):
         prepared = runner.prepare_run(
             self._valid_request("huawei", "192.0.2.1"),
