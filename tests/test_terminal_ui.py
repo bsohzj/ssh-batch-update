@@ -129,7 +129,7 @@ class TerminalPaneTests(unittest.TestCase):
         with patch.object(terminal_ui, "available_console_ports", return_value=[
             ("/dev/cu.usbserial", "USB adapter")
         ]):
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
             self.assertFalse(self.pane.serial_port_combo.isHidden())
             self.assertTrue(self.pane.username_edit.isHidden())
             self.assertTrue(self.pane.device_type_combo.isHidden())
@@ -139,7 +139,7 @@ class TerminalPaneTests(unittest.TestCase):
             self.pane.serial_port_combo.setCurrentText("/dev/cu.manual")
             self.pane.refresh_serial_ports()
             self.assertEqual(self.pane.serial_port_combo.currentText(), "/dev/cu.manual")
-            self.pane.connection_type_combo.setCurrentIndex(0)
+            self.pane.connection_tabs.setCurrentIndex(0)
             self.assertFalse(self.pane.username_edit.isHidden())
             self.assertTrue(self.pane.serial_port_combo.isHidden())
 
@@ -150,7 +150,7 @@ class TerminalPaneTests(unittest.TestCase):
 
         with patch.object(terminal_ui, "available_console_ports", return_value=[]), \
              patch.object(terminal_ui, "SerialConsoleSession", FakeConsoleSession):
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
             self.pane.serial_port_combo.setCurrentText("/dev/cu.usbserial")
             self.pane.baud_rate_combo.setCurrentText("115200")
             self.pane.save_transcript_check.setChecked(True)
@@ -158,21 +158,21 @@ class TerminalPaneTests(unittest.TestCase):
             self.wait_for(lambda: self.pane.is_active())
             self.assertEqual(self.pane._session.settings.baudrate, 115200)
             self.assertEqual(self.pane._session.transcript_path.parent, self.base)
-            self.assertFalse(self.pane.connection_type_combo.isEnabled())
+            self.assertFalse(self.pane.connection_tabs.isEnabled())
             self.assertFalse(self.pane.refresh_ports_button.isEnabled())
             self.assertFalse(self.pane.serial_scan_timer.isActive())
             self.pane.bridge.sendInput("\r")
             self.assertEqual(self.pane._session.sent, ["\r"])
             self.pane.disconnect_session()
             self.wait_for(lambda: not self.pane.is_active())
-            self.assertTrue(self.pane.connection_type_combo.isEnabled())
+            self.assertTrue(self.pane.connection_tabs.isEnabled())
             self.assertTrue(self.pane.refresh_ports_button.isEnabled())
             self.assertTrue(self.pane.serial_scan_timer.isActive())
 
     def test_serial_polling_is_limited_to_visible_disconnected_console(self):
         with patch.object(terminal_ui, "available_console_ports", return_value=[]) as scan:
             self.assertFalse(self.pane.serial_scan_timer.isActive())
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
             self.assertTrue(self.pane.serial_scan_timer.isActive())
             self.assertEqual(self.pane.serial_scan_timer.interval(), 1000)
             self.pane.hide()
@@ -182,7 +182,7 @@ class TerminalPaneTests(unittest.TestCase):
             scan.assert_not_called()
             self.pane.show()
             self.assertTrue(self.pane.serial_scan_timer.isActive())
-            self.pane.connection_type_combo.setCurrentIndex(0)
+            self.pane.connection_tabs.setCurrentIndex(0)
             self.assertFalse(self.pane.serial_scan_timer.isActive())
             scan.reset_mock()
             self.pane.serial_scan_timer.timeout.emit()
@@ -191,7 +191,7 @@ class TerminalPaneTests(unittest.TestCase):
     def test_polling_detects_port_changes_without_rebuilding_unchanged_list(self):
         usb = [("/dev/cu.usbserial-AQ00KNX0", "USB adapter")]
         with patch.object(terminal_ui, "available_console_ports", side_effect=[[], usb, usb, []]):
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
             self.pane.connect_button.setFocus()
             self.pane.serial_scan_timer.timeout.emit()
             self.assertEqual(self.pane.serial_port_combo.currentText(), usb[0][0])
@@ -205,7 +205,7 @@ class TerminalPaneTests(unittest.TestCase):
 
     def test_polling_does_not_interrupt_port_editing(self):
         with patch.object(terminal_ui, "available_console_ports", return_value=[]) as scan:
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
             self.pane.serial_port_combo.lineEdit().setFocus()
             self.app.processEvents()
             self.pane.serial_port_combo.lineEdit().setText("/dev/tty.usbserial-manual")
@@ -217,7 +217,7 @@ class TerminalPaneTests(unittest.TestCase):
     def test_bluetooth_is_not_auto_selected_and_usb_is_selected_after_refresh(self):
         bluetooth = [("/dev/cu.BLTH", "n/a"), ("/dev/cu.Bluetooth-Incoming-Port", "n/a")]
         with patch.object(terminal_ui, "available_console_ports", return_value=bluetooth):
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
             self.assertEqual(self.pane.serial_port_combo.currentText(), "")
         with patch.object(terminal_ui, "available_console_ports", return_value=[
             ("/dev/cu.usbserial-AQ00KNX0", "FT232R USB UART"), *bluetooth
@@ -231,7 +231,7 @@ class TerminalPaneTests(unittest.TestCase):
 
     def test_console_invalid_baud_rate_is_shown_before_connecting(self):
         with patch.object(terminal_ui, "available_console_ports", return_value=[]):
-            self.pane.connection_type_combo.setCurrentIndex(1)
+            self.pane.connection_tabs.setCurrentIndex(1)
         self.pane.serial_port_combo.setCurrentText("/dev/cu.test")
         self.pane.baud_rate_combo.setCurrentText("bad")
         self.pane.connect_session()

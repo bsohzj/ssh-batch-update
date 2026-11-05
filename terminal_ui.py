@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSplitter,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
@@ -112,6 +113,15 @@ class TerminalPane(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
+        self.connection_tabs = QTabBar()
+        self.connection_tabs.addTab("SSH")
+        self.connection_tabs.setTabData(0, "ssh")
+        self.connection_tabs.addTab("Console")
+        self.connection_tabs.setTabData(1, "console")
+        self.connection_tabs.setExpanding(True)
+        self.connection_tabs.setDrawBase(False)
+        self.connection_tabs.setMinimumHeight(32)
+        self.connection_tabs.setAccessibleName("Terminal connection type")
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
         connection_group = QGroupBox()
@@ -119,11 +129,10 @@ class TerminalPane(QWidget):
         form = QGridLayout(connection_group)
         form.setAlignment(Qt.AlignmentFlag.AlignTop)
         form.setColumnStretch(1, 1)
-        self.connection_type_combo = QComboBox()
-        self.connection_type_combo.addItem("SSH", "ssh")
-        self.connection_type_combo.addItem("Console", "console")
-        form.addWidget(QLabel("Connection"), 0, 0)
-        form.addWidget(self.connection_type_combo, 0, 1)
+        connection_label = QLabel("Connection")
+        connection_label.setBuddy(self.connection_tabs)
+        form.addWidget(connection_label, 0, 0)
+        form.addWidget(self.connection_tabs, 0, 1)
         self._ssh_widgets: list[QWidget] = []
         self._console_widgets: list[QWidget] = []
         self.address_edit = QLineEdit()
@@ -259,7 +268,7 @@ class TerminalPane(QWidget):
         self.bridge.input_received.connect(self._send_input)
         self.bridge.size_received.connect(self._resize_terminal)
         self.web_view.loadFinished.connect(self._web_load_finished)
-        self.connection_type_combo.currentIndexChanged.connect(self._connection_type_changed)
+        self.connection_tabs.currentChanged.connect(self._connection_type_changed)
         self.refresh_ports_button.clicked.connect(self.refresh_serial_ports)
         self.serial_port_combo.activated.connect(self._serial_port_edited)
         self.serial_port_combo.lineEdit().textEdited.connect(self._serial_port_edited)
@@ -271,7 +280,7 @@ class TerminalPane(QWidget):
 
     @Slot(int)
     def _connection_type_changed(self, index: int) -> None:
-        console = self.connection_type_combo.itemData(index) == "console"
+        console = self.connection_tabs.tabData(index) == "console"
         for widget in self._ssh_widgets:
             widget.setVisible(not console)
         for widget in self._console_widgets:
@@ -291,7 +300,7 @@ class TerminalPane(QWidget):
     def _can_scan_serial_ports(self) -> bool:
         return (
             self.isVisible()
-            and self.connection_type_combo.currentData() == "console"
+            and self.connection_tabs.tabData(self.connection_tabs.currentIndex()) == "console"
             and self._thread is None
         )
 
@@ -444,7 +453,7 @@ class TerminalPane(QWidget):
         if self._thread is not None or not self._ready:
             return
         try:
-            console = self.connection_type_combo.currentData() == "console"
+            console = self.connection_tabs.tabData(self.connection_tabs.currentIndex()) == "console"
             address = (
                 self.serial_port_combo.currentText().strip()
                 if console else self.address_edit.text().strip()
@@ -479,7 +488,7 @@ class TerminalPane(QWidget):
         self.disconnect_button.setEnabled(True)
         self.save_transcript_check.setEnabled(False)
         self.disable_paging_check.setEnabled(False)
-        self.connection_type_combo.setEnabled(False)
+        self.connection_tabs.setEnabled(False)
         for widget in self._console_widgets:
             widget.setEnabled(False)
         self._thread = TerminalThread(session, self)
@@ -538,7 +547,7 @@ class TerminalPane(QWidget):
         self.save_transcript_check.setChecked(False)
         self.save_transcript_check.setEnabled(True)
         self.disable_paging_check.setEnabled(True)
-        self.connection_type_combo.setEnabled(True)
+        self.connection_tabs.setEnabled(True)
         for widget in self._console_widgets:
             widget.setEnabled(True)
         if self._close_when_finished:

@@ -156,8 +156,8 @@ lab switches before using the feature on production access switches.
 
 ### Interactive Terminal
 
-The **Terminal** tab supports **SSH** or a local **Console** cable, one connection
-at a time. For SSH, enter an IPv4 or IPv6 address and select a
+The **Terminal** page has **SSH | Console** tabs for choosing the connection
+type, with one connection at a time. For SSH, enter an IPv4 or IPv6 address and select a
 credential profile or enter a username and password manually, choose the device
 type, and press **Connect**. The terminal accepts normal keyboard input,
 including cursor keys and Ctrl+C. It stays connected when you switch tabs and

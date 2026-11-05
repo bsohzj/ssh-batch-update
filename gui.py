@@ -5402,7 +5402,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             if window.main_tabs.currentWidget() is not window.ssh_tab:
                 raise RuntimeError("Terminal preload changed the active tab")
             window.main_tabs.setCurrentWidget(window.terminal_tab)
-            window.terminal_pane.connection_type_combo.setCurrentIndex(1)
+            window.terminal_pane.connection_tabs.setCurrentIndex(1)
             if not window.terminal_pane.serial_scan_timer.isActive():
                 raise RuntimeError("Visible Console did not start port scanning")
             window.main_tabs.setCurrentWidget(window.ssh_tab)
@@ -5411,7 +5411,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             window.main_tabs.setCurrentWidget(window.terminal_tab)
             if not window.terminal_pane.serial_scan_timer.isActive():
                 raise RuntimeError("Console did not resume port scanning")
-            window.terminal_pane.connection_type_combo.setCurrentIndex(0)
+            window.terminal_pane.connection_tabs.setCurrentIndex(0)
             if window.terminal_pane.serial_scan_timer.isActive():
                 raise RuntimeError("SSH mode kept scanning serial ports")
             window._ensure_history_ui()
