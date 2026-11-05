@@ -154,12 +154,33 @@ network, and leave the application open for unattended work.
 Verify queue ordering, cancellation, and scheduled live changes against approved
 lab switches before using the feature on production access switches.
 
+### Interactive Terminal
+
+The **Terminal** tab connects to one IPv4 or IPv6 device at a time. Select a
+credential profile or enter a username and password manually, choose the device
+type, and press **Connect**. The terminal accepts normal keyboard input,
+including cursor keys and Ctrl+C. It stays connected when you switch tabs and
+can run alongside a queued batch. **Disconnect** ends its session.
+The Terminal remembers its last selected device type separately from the SSH
+batch form.
+
+**Disable paging** is off by default, leaving the switch's usual page breaks
+in place. Turn it on before connecting to show long replies without `--More--`
+prompts. The choice is fixed for the active connection and does not affect
+batch runs.
+
+**Save transcript** is off for every new session. Turn it on before connecting
+to save a readable text log in the SSH tab's Output Folder. The checkbox is
+fixed while connected and resets to off afterward. The log can contain
+passwords shown by the device; text entered without device echo is not added
+to it. Terminal sessions do not appear in Queue or History.
+
 ### Audit history dashboard
 
 The full-window **History** screen keeps a persistent audit index for live
 batches that run after the feature is installed. It does not import older
-output folders and does not record connection tests. The two top-level tabs
-are **SSH** and **History**; the app always starts on **SSH**.
+output folders and does not record connection tests. The top-level tabs are
+**SSH**, **Terminal**, and **History**; the app always starts on **SSH**.
 History is loaded only when its screen is first opened, so it does not delay
 normal queue use or SSH execution.
 

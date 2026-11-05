@@ -164,6 +164,7 @@ HISTORY_BREAKDOWN_STATUS = "status"
 HISTORY_BREAKDOWN_FAILURES = "failures"
 SCHEDULE_TIMEOUT_KEY = "schedule/timeout_minutes"
 STOP_ON_FIRST_FAILURE_KEY = "run/stop_on_first_failure"
+TERMINAL_DEVICE_TYPE_KEY = "terminal/device_type"
 SCHEDULE_TIMEOUT_CHOICES = (("30 minutes", 30), ("1 hour", 60), ("2 hours", 120))
 SCHEDULE_TIMEOUT_OPTIONS = tuple(minutes for _, minutes in SCHEDULE_TIMEOUT_CHOICES)
 DEFAULT_SCHEDULE_TIMEOUT_MINUTES = 60
@@ -992,6 +993,7 @@ class MainWindow(QMainWindow):
         self._loading_settings = True
         self._loading_profile = False
         self._close_after_run = False
+        self._terminal_close_requested = False
         self._closing = False
         self._rows: dict[str, int] = {}
         self._last_inventory_import = ""
@@ -999,6 +1001,7 @@ class MainWindow(QMainWindow):
         self._last_credential_import = ""
         self._credential_file: Optional[Path] = None
         self._history_ui_built = False
+        self.terminal_pane: Optional[QWidget] = None
         self._dictionary_ui_built = False
         self.dictionary_dialog: Optional[QDialog] = None
         self.preferences_dialog: Optional[PreferencesDialog] = None
@@ -1394,6 +1397,13 @@ class MainWindow(QMainWindow):
         self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_layout.addWidget(self.history_placeholder, 1)
 
+        self.terminal_tab = QWidget()
+        self.terminal_layout = QVBoxLayout(self.terminal_tab)
+        self.terminal_layout.setContentsMargins(0, 0, 0, 0)
+        self.terminal_placeholder = QLabel("Open Terminal to connect to one device.")
+        self.terminal_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.terminal_layout.addWidget(self.terminal_placeholder, 1)
+
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
@@ -1402,6 +1412,7 @@ class MainWindow(QMainWindow):
         ssh_layout.addWidget(self.main_splitter)
 
         self.main_tabs.addTab(ssh_tab, "SSH")
+        self.main_tabs.addTab(self.terminal_tab, "Terminal")
         self.main_tabs.addTab(self.history_tab, "History")
         self.main_tabs.currentChanged.connect(self._main_tab_changed)
         self.main_tabs.setCurrentWidget(ssh_tab)
@@ -2186,6 +2197,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("paths/credential_import", self._last_credential_import)
         self.settings.setValue("paths/output", self.output_edit.text().strip())
         self.settings.setValue("run/device_type", self.device_type_combo.currentText().strip())
+        if self.terminal_pane is not None:
+            terminal_device_type = self.terminal_pane.device_type_combo.currentText().strip()
+            if terminal_device_type:
+                self.settings.setValue(TERMINAL_DEVICE_TYPE_KEY, terminal_device_type)
         self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.remove("run/failure_patterns")
         self.settings.sync()
@@ -2306,6 +2321,8 @@ class MainWindow(QMainWindow):
             self._switch_to_manual(clear_credentials=True)
             self.validation_label.setText("Select a profile or enter credentials manually.")
         self._save_settings()
+        if self.terminal_pane is not None:
+            self.terminal_pane.refresh_profiles()
 
     @Slot()
     def invalidate_validation(self) -> None:
@@ -3167,8 +3184,11 @@ class MainWindow(QMainWindow):
             thread.deleteLater()
         if self._close_after_run:
             self._close_after_run = False
-            self._closing = True
-            QTimer.singleShot(0, self.close)
+            if not (
+                self.terminal_pane is not None and self.terminal_pane.is_active()
+            ):
+                self._closing = True
+                QTimer.singleShot(0, self.close)
         elif finished_operation == "run":
             QTimer.singleShot(0, self._queue_tick)
 
@@ -3669,9 +3689,35 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _main_tab_changed(self, index: int) -> None:
+        if index == self.main_tabs.indexOf(self.terminal_tab):
+            self._ensure_terminal_ui()
         if index == self.main_tabs.indexOf(self.history_tab):
             self._ensure_history_ui()
         self._acknowledge_results_attention_if_visible()
+
+    def _ensure_terminal_ui(self) -> None:
+        if self.terminal_pane is not None:
+            return
+        from terminal_ui import TerminalPane
+
+        pane = TerminalPane(
+            self.profile_store,
+            read_credential_profile,
+            lambda: self.output_edit.text(),
+            initial_profile_id=self.profile_combo.currentData(),
+            initial_username=self.username_edit.text(),
+            initial_password=self.password_edit.text(),
+            initial_device_type=(
+                self.settings.value(TERMINAL_DEVICE_TYPE_KEY, "", str).strip()
+                or self.device_type_combo.currentText()
+            ),
+            manage_profiles=self.manage_profiles,
+            parent=self.terminal_tab,
+        )
+        self.terminal_layout.removeWidget(self.terminal_placeholder)
+        self.terminal_placeholder.deleteLater()
+        self.terminal_layout.addWidget(pane)
+        self.terminal_pane = pane
 
     def _device_results_visible(self) -> bool:
         return (
@@ -5142,21 +5188,31 @@ class MainWindow(QMainWindow):
                 self.sleep_inhibitor.set_required(False)
             event.accept()
             return
-        if self._running:
+        terminal_active = (
+            self.terminal_pane is not None and self.terminal_pane.is_active()
+        )
+        if self._running or terminal_active:
+            if self._close_after_run or self._terminal_close_requested:
+                event.ignore()
+                return
             answer = QMessageBox.question(
                 self,
                 "Stop active operation?",
-                "The app will stop at the next safe checkpoint and then close. "
+                "The app will disconnect active SSH work and then close. "
                 "Any remaining queued batches will be restored paused next time.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._close_after_run = True
-                self.cancel_run()
+                if self._running:
+                    self._close_after_run = True
+                    self.cancel_run()
+                if terminal_active:
+                    self._terminal_close_requested = True
+                    self.terminal_pane.stop_for_close()
             event.ignore()
             return
-        if self.queue_controller.pending_jobs():
+        if self.queue_controller.pending_jobs() and not self._terminal_close_requested:
             answer = QMessageBox.question(
                 self,
                 "Close with queued batches?",
@@ -5335,7 +5391,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 history_command_store=MemoryHistoryCommandStore(),
             )
             window.show()
-            app.processEvents()
+            QTimer.singleShot(0, window._ensure_terminal_ui)
+            for _ in range(100):
+                app.processEvents()
+                if window.terminal_pane is not None and window.terminal_pane._ready:
+                    break
+                QThread.msleep(50)
+            else:
+                raise RuntimeError("Bundled Terminal view did not load")
+            if window.main_tabs.currentWidget() is not window.ssh_tab:
+                raise RuntimeError("Terminal preload changed the active tab")
+            window.main_tabs.setCurrentWidget(window.terminal_tab)
             window._ensure_history_ui()
             window._open_command_dictionary()
             window.dictionary_search_edit.setText("interface")
@@ -5353,6 +5419,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     window = MainWindow(settings)
     window.show()
+    QTimer.singleShot(0, window._ensure_terminal_ui)
     return app.exec()
 
 

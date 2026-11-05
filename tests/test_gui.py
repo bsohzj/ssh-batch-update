@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -240,9 +240,10 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
-        self.assertEqual(self.window.main_tabs.count(), 2)
+        self.assertEqual(self.window.main_tabs.count(), 3)
         self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
-        self.assertEqual(self.window.main_tabs.tabText(1), "History")
+        self.assertEqual(self.window.main_tabs.tabText(1), "Terminal")
+        self.assertEqual(self.window.main_tabs.tabText(2), "History")
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
         self.assertTrue(self.window.main_tabs.tabBar().expanding())
         self.assertGreaterEqual(self.window.main_tabs.tabBar().minimumHeight(), 44)
@@ -261,6 +262,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
+
         self.assertEqual(
             self.window.command_dictionary_button.text(), "Command Dictionary"
         )
@@ -329,6 +331,42 @@ class MainWindowTests(unittest.TestCase):
             )
             self.assertEqual(len({editor.geometry().left() for editor in editors}), 1)
             self.assertEqual(len({editor.geometry().right() for editor in editors}), 1)
+
+    def test_terminal_tab_reuses_preloaded_pane(self):
+        self.assertIsNone(self.window.terminal_pane)
+        self.window._ensure_terminal_ui()
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.window.main_tabs.setCurrentWidget(self.window.terminal_tab)
+        self.app.processEvents()
+        pane = self.window.terminal_pane
+        self.assertIsNotNone(pane)
+        self.assertFalse(pane.save_transcript_check.isChecked())
+        self.window.main_tabs.setCurrentWidget(self.window.ssh_tab)
+        self.window.main_tabs.setCurrentWidget(self.window.terminal_tab)
+        self.assertIs(self.window.terminal_pane, pane)
+
+    def test_terminal_device_type_is_saved_independently(self):
+        self.window._ensure_terminal_ui()
+        self.window.device_type_combo.setCurrentText("huawei")
+        self.window.terminal_pane.device_type_combo.setCurrentText("cisco_ios")
+
+        self.window._save_settings()
+
+        self.assertEqual(
+            self.settings.value(gui.TERMINAL_DEVICE_TYPE_KEY), "cisco_ios"
+        )
+        self.assertEqual(self.settings.value("run/device_type"), "huawei")
+
+    def test_terminal_restores_its_saved_device_type(self):
+        self.settings.setValue(gui.TERMINAL_DEVICE_TYPE_KEY, "cisco_ios")
+        self.window.device_type_combo.setCurrentText("huawei")
+
+        self.window._ensure_terminal_ui()
+
+        self.assertEqual(
+            self.window.terminal_pane.device_type_combo.currentText(), "cisco_ios"
+        )
+        self.assertEqual(self.window.device_type_combo.currentText(), "huawei")
 
     def test_settings_menu_opens_preferences_and_saves_theme(self):
         self.assertEqual(self.window.settings_menu.title().replace("&", ""), "Settings")
@@ -3599,6 +3637,23 @@ class MainWindowTests(unittest.TestCase):
         self.window._running = False
         self.window._token = None
         self.window._close_after_run = False
+
+    def test_closing_with_terminal_requests_disconnect(self):
+        pane = Mock()
+        pane.is_active.return_value = True
+        self.window.terminal_pane = pane
+        event = QCloseEvent()
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        pane.stop_for_close.assert_called_once_with()
+        self.assertTrue(self.window._terminal_close_requested)
+        self.window.terminal_pane = None
+        self.window._terminal_close_requested = False
 
     def test_completed_run_enables_existing_result_actions(self):
         run_directory = self.base / "outputs" / "run_test"
