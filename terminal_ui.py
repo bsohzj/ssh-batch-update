@@ -14,7 +14,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -108,19 +108,17 @@ class TerminalPane(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
         connection_group = QGroupBox()
-        connection_group.setMinimumWidth(350)
-        form = QFormLayout(connection_group)
+        connection_group.setMinimumWidth(400)
+        form = QGridLayout(connection_group)
+        form.setAlignment(Qt.AlignmentFlag.AlignTop)
+        form.setColumnStretch(1, 1)
         self.address_edit = QLineEdit()
         self.address_edit.setPlaceholderText("One IPv4 or IPv6 address")
         self.profile_combo = QComboBox()
-        profile_row = QWidget()
-        profile_layout = QHBoxLayout(profile_row)
-        profile_layout.setContentsMargins(0, 0, 0, 0)
-        profile_layout.addWidget(self.profile_combo, 1)
         if manage_profiles is not None:
             manage_button = QPushButton("Manage Profiles…")
             manage_button.clicked.connect(manage_profiles)
-            profile_layout.addWidget(manage_button)
+            form.addWidget(manage_button, 0, 2)
         self.username_edit = QLineEdit()
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -138,13 +136,21 @@ class TerminalPane(QWidget):
             "Show long command output without --More-- prompts. "
             "Applies only to this SSH session."
         )
-        form.addRow("Device", self.address_edit)
-        form.addRow("Profile", profile_row)
-        form.addRow("Username", self.username_edit)
-        form.addRow("Password", self.password_edit)
-        form.addRow("Device Type", self.device_type_combo)
-        form.addRow("", self.disable_paging_check)
-        form.addRow("", self.save_transcript_check)
+        for row, (text, field) in enumerate(
+            (
+                ("Profile", self.profile_combo),
+                ("Username", self.username_edit),
+                ("Password", self.password_edit),
+                ("Device Type", self.device_type_combo),
+                ("Device", self.address_edit),
+            )
+        ):
+            label = QLabel(text)
+            label.setBuddy(field)
+            form.addWidget(label, row, 0)
+            form.addWidget(field, row, 1)
+        form.addWidget(self.disable_paging_check, 5, 1)
+        form.addWidget(self.save_transcript_check, 6, 1)
         buttons = QWidget()
         button_layout = QHBoxLayout(buttons)
         button_layout.setContentsMargins(0, 0, 0, 0)
@@ -153,16 +159,18 @@ class TerminalPane(QWidget):
         self.disconnect_button.setEnabled(False)
         button_layout.addWidget(self.connect_button)
         button_layout.addWidget(self.disconnect_button)
-        form.addRow("", buttons)
+        form.addWidget(buttons, 7, 1, 1, 2)
         self.status_label = QLabel("Loading terminal…")
         self.status_label.setWordWrap(True)
-        form.addRow("Status", self.status_label)
+        form.addWidget(QLabel("Status"), 8, 0, Qt.AlignmentFlag.AlignTop)
+        form.addWidget(self.status_label, 8, 1, 1, 2)
         self.open_transcript_button = QPushButton("Open Transcript")
         self.open_transcript_button.setEnabled(False)
-        form.addRow("", self.open_transcript_button)
+        form.addWidget(self.open_transcript_button, 9, 1, 1, 2)
         self.connect_button.setEnabled(False)
 
         self.web_view = QWebEngineView()
+        self.web_view.setMinimumWidth(600)
         self.bridge = TerminalBridge(self)
         self.web_channel = QWebChannel(self.web_view.page())
         self.web_channel.registerObject("terminalBridge", self.bridge)
@@ -176,7 +184,7 @@ class TerminalPane(QWidget):
         splitter.addWidget(self.web_view)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([390, 950])
+        splitter.setSizes([480, 900])
         root.addWidget(splitter)
 
         self.refresh_profiles(initial_profile_id)
