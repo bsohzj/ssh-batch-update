@@ -157,9 +157,11 @@ lab switches before using the feature on production access switches.
 ### Interactive Terminal
 
 The **Terminal** page has **SSH | Console** tabs for choosing the connection
-type, with one connection at a time. For SSH, enter an IPv4 or IPv6 address and select a
-credential profile or enter a username and password manually, choose the device
-type, and press **Connect**. The terminal accepts normal keyboard input,
+type, with one connection at a time. For SSH, the Address and Port fields sit
+directly below Connection, followed by Profile, Username, Password and Device
+Type. Enter an IPv4 or IPv6 address and select a credential profile or enter a
+username and password manually, choose the device type, and press **Connect**.
+The terminal accepts normal keyboard input,
 including cursor keys and Ctrl+C. It stays connected when you switch tabs and
 can run alongside a queued batch. **Disconnect** ends its session.
 The Terminal remembers its last selected device type separately from the Batch

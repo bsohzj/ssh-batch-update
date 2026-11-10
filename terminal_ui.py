@@ -164,7 +164,7 @@ class TerminalPane(QWidget):
         if manage_profiles is not None:
             manage_button = QPushButton("Manage Profiles…")
             manage_button.clicked.connect(manage_profiles)
-            form.addWidget(manage_button, 1, 2)
+            form.addWidget(manage_button, 2, 2)
             self._ssh_widgets.append(manage_button)
         self.username_edit = QLineEdit()
         self.password_edit = QLineEdit()
@@ -185,11 +185,11 @@ class TerminalPane(QWidget):
         )
         for row, (text, field) in enumerate(
             (
+                ("Address", self.address_edit),
                 ("Profile", self.profile_combo),
                 ("Username", self.username_edit),
                 ("Password", self.password_edit),
                 ("Device Type", self.device_type_combo),
-                ("Address", self.address_edit),
             ), start=1
         ):
             label = QLabel(text)
@@ -206,7 +206,7 @@ class TerminalPane(QWidget):
         port_label.setBuddy(self.port_spin)
         address_layout.addWidget(port_label)
         address_layout.addWidget(self.port_spin)
-        form.addWidget(address_row, 5, 1, 1, 2)
+        form.addWidget(address_row, 1, 1, 1, 2)
         self._ssh_widgets.extend((address_row, self.port_spin))
         form.addWidget(self.disable_paging_check, 6, 1)
         self._ssh_widgets.append(self.disable_paging_check)
@@ -329,6 +329,15 @@ class TerminalPane(QWidget):
         splitter.setStretchFactor(1, 1)
         splitter.setSizes([480, 900])
         root.addWidget(splitter)
+
+        ssh_focus_order: list[QWidget] = [
+            self.connection_tabs, self.address_edit, self.port_spin, self.profile_combo,
+        ]
+        if manage_profiles is not None:
+            ssh_focus_order.append(manage_button)
+        ssh_focus_order.extend((self.username_edit, self.password_edit, self.device_type_combo))
+        for previous, current in zip(ssh_focus_order, ssh_focus_order[1:]):
+            self.setTabOrder(previous, current)
 
         self.refresh_profiles(initial_profile_id)
         if not initial_profile_id or not self.profile_combo.currentData():
