@@ -91,7 +91,7 @@ appear as **Skipped** in Device Results and `summary.csv`. This choice is saved
 with each new batch, so changing Preferences does not affect queued work.
 It does not stop later batches in the queue.
 
-The SSH form's **Output files** choice applies to each submitted batch. By
+The Batch form's **Output files** choice applies to each submitted batch. By
 default, each device gets its own transcript. Choose **One file per batch**
 to put all attempted device transcripts in one file named after the batch.
 Device Results and `summary.csv` point each attempted device to that shared
@@ -125,7 +125,7 @@ keep all devices in the live view (the default), or **By device** to clear the
 view when the next device starts. Saved output files are unaffected.
 
 For a completed batch with device failures, **Retry Failed/Skipped Devices…**
-creates an editable SSH-form draft containing failed and skipped devices and
+creates an editable Batch-form draft containing failed and skipped devices and
 the original commands. Successful and cancelled devices are excluded. The app reloads the
 original named profile when it still exists; otherwise it clears credentials
 and selects Manual. Review and validate the draft before submitting it as a new
@@ -162,8 +162,8 @@ credential profile or enter a username and password manually, choose the device
 type, and press **Connect**. The terminal accepts normal keyboard input,
 including cursor keys and Ctrl+C. It stays connected when you switch tabs and
 can run alongside a queued batch. **Disconnect** ends its session.
-The Terminal remembers its last selected device type separately from the SSH
-batch form.
+The Terminal remembers its last selected device type separately from the Batch
+form.
 
 For a console cable plugged into the Mac, select **Console**, choose the
 `/dev/cu.*` serial port, and set the baud rate to match the device. **Refresh
@@ -187,7 +187,7 @@ prompts. The choice is fixed for the active connection and does not affect
 batch runs.
 
 **Save transcript** is off for every new session. Turn it on before connecting
-to save a readable text log in the SSH tab's Output Folder. The checkbox is
+to save a readable text log in the Batch tab's Output Folder. The checkbox is
 fixed while connected and resets to off afterward. The log can contain
 passwords shown by the device; text entered without device echo is not added
 to it. Terminal sessions do not appear in Queue or History.
@@ -197,13 +197,13 @@ to it. Terminal sessions do not appear in Queue or History.
 The full-window **History** screen keeps a persistent audit index for live
 batches that run after the feature is installed. It does not import older
 output folders and does not record connection tests. The top-level tabs are
-**SSH**, **Terminal**, and **History**; the app always starts on **SSH**.
+**Batch**, **Terminal**, and **History**; the app always starts on **Batch**.
 History is loaded only when its screen is first opened, so it does not delay
 normal queue use or SSH execution.
 
 Queued and scheduled work continues while History is visible. When a batch
-starts and its device results begin updating, the **SSH** and **Device Results**
-tabs pulse briefly and retain a dot until **SSH** → **Device Results** is opened,
+starts and its device results begin updating, the **Batch** and **Device Results**
+tabs pulse briefly and retain a dot until **Batch** → **Device Results** is opened,
 without interrupting History review.
 
 The dashboard defaults to the last 30 days and provides summary cards, a line
@@ -246,7 +246,7 @@ does not stop an already confirmed live batch.
 
 ### Command dictionary
 
-The reusable, non-modal **Command Dictionary** window is opened from the SSH
+The reusable, non-modal **Command Dictionary** window is opened from the Batch
 command controls and contains 96
 entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
 CloudEngine S5755-S. Seventy entries are read-only operational commands. The
@@ -304,7 +304,7 @@ review candidate even when issues remain, but SSH `[exec]`/`[config]` export and
 **Import to SSH Commands** are blocked until every review marker, unknown command,
 and placeholder is resolved. Importing a clean result classifies operational and
 configuration commands, updates Device Type, and offers Replace or Append when
-the SSH command boxes already contain text.
+the Batch command boxes already contain text.
 
 Converted output is a human-review candidate, not a production-ready migration.
 Validate it against vendor documentation and an approved lab switch before use.

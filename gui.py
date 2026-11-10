@@ -1411,7 +1411,7 @@ class MainWindow(QMainWindow):
         self.main_splitter.setSizes([480, 900])
         ssh_layout.addWidget(self.main_splitter)
 
-        self.main_tabs.addTab(ssh_tab, "SSH")
+        self.main_tabs.addTab(ssh_tab, "Batch")
         self.main_tabs.addTab(self.terminal_tab, "Terminal")
         self.main_tabs.addTab(self.history_tab, "History")
         self.main_tabs.currentChanged.connect(self._main_tab_changed)
@@ -3761,7 +3761,7 @@ class MainWindow(QMainWindow):
 
     def _set_results_attention_labels(self, pending: bool) -> None:
         self.main_tabs.setTabText(
-            self.main_tabs.indexOf(self.ssh_tab), "SSH •" if pending else "SSH"
+            self.main_tabs.indexOf(self.ssh_tab), "Batch •" if pending else "Batch"
         )
         self.results_tabs.setTabText(
             1, "Device Results •" if pending else "Device Results"

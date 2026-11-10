@@ -241,7 +241,7 @@ class MainWindowTests(unittest.TestCase):
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
         self.assertEqual(self.window.main_tabs.count(), 3)
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch")
         self.assertEqual(self.window.main_tabs.tabText(1), "Terminal")
         self.assertEqual(self.window.main_tabs.tabText(2), "History")
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
@@ -1339,12 +1339,12 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window._selected_job_id, selected_job_id)
         self.assertTrue(self.window._results_attention_pending)
         self.assertTrue(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch •")
         self.assertEqual(
             self.window.results_tabs.tabText(1), "Device Results •"
         )
 
-    def test_reopened_window_defaults_to_ssh_instead_of_last_main_tab(self):
+    def test_reopened_window_defaults_to_batch_instead_of_last_main_tab(self):
         self.window.main_tabs.setCurrentWidget(self.window.history_tab)
         self.window._save_settings()
         self.window.close()
@@ -2357,7 +2357,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
         self.assertTrue(self.window._results_attention_pending)
         self.assertTrue(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch •")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
 
         self.window.main_tabs.setCurrentWidget(self.window.ssh_tab)
@@ -2369,7 +2369,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(self.window._results_attention_pending)
         self.assertFalse(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
 
     def test_results_attention_pulses_three_times_then_leaves_dots(self):
@@ -2396,7 +2396,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(timer.isActive())
         self.assertTrue(self.window._results_attention_pending)
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch •")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
         self.assertFalse(
             self.window.main_tabs.tabBar().tabTextColor(0).isValid()
@@ -2412,7 +2412,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(self.window._results_attention_pending)
         self.assertFalse(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
 
     def test_theme_change_updates_active_results_attention_color(self):

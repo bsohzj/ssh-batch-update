@@ -152,7 +152,7 @@ class TerminalPane(QWidget):
         self.device_type_combo.setCurrentText(initial_device_type)
         self.save_transcript_check = QCheckBox("Save transcript")
         self.save_transcript_check.setToolTip(
-            "Save a readable session log in the SSH tab's Output Folder. "
+            "Save a readable session log in the Batch tab's Output Folder. "
             "Device output may contain passwords."
         )
         self.disable_paging_check = QCheckBox("Disable paging")
@@ -462,7 +462,7 @@ class TerminalPane(QWidget):
             if self.save_transcript_check.isChecked():
                 folder_text = self.output_folder().strip()
                 if not folder_text:
-                    raise ValueError("Set an Output Folder on the SSH tab first.")
+                    raise ValueError("Set an Output Folder on the Batch tab first.")
                 path = terminal_transcript_path(
                     Path(folder_text).expanduser(), Path(address).name if console else address, datetime.now()
                 )
