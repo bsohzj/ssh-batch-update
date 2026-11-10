@@ -165,6 +165,22 @@ can run alongside a queued batch. **Disconnect** ends its session.
 The Terminal remembers its last selected device type separately from the Batch
 form.
 
+SSH **Port** defaults to 22; selecting a profile loads its port. The visible port
+is used for both connecting and testing, including after switching to Manual.
+**Advanced SSH Settings** starts collapsed. Its key exchange, server host-key,
+cipher and MAC choices default to **Automatic**, preserving normal negotiation.
+A manual choice restricts that category to exactly the selected installed
+Paramiko algorithm; incompatible choices fail without a fallback. A manual MAC
+excludes AEAD ciphers when Cipher is Automatic and cannot be combined with an
+explicit AEAD cipher. These choices and the port apply only to Terminal SSH and
+are not saved between app launches.
+
+**Test TCP Port** checks the entered IP address and port without credentials,
+SSH negotiation or commands. It reports success, refusal, timeout or another
+connection error with elapsed time, and closes the socket immediately. The
+timeout is five seconds. Connection settings stay locked during testing and
+while a session is connecting or connected.
+
 For a console cable plugged into the Mac, select **Console**, choose the
 `/dev/cu.*` serial port, and set the baud rate to match the device. **Refresh
 Ports** rescans attached adapters; you can also type a port path. While Console

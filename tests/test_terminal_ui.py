@@ -33,11 +33,12 @@ class FakeTerminalSession:
     instances = []
     sensitive_values = ()
 
-    def __init__(self, address, settings, transcript_path, disable_paging=False):
+    def __init__(self, address, settings, transcript_path, disable_paging=False, algorithms=None):
         self.address = address
         self.settings = settings
         self.transcript_path = transcript_path
         self.disable_paging = disable_paging
+        self.algorithms = algorithms
         self.stopped = threading.Event()
         self.sent = []
         self.sizes = []
@@ -123,7 +124,85 @@ class TerminalPaneTests(unittest.TestCase):
         self.pane.username_edit.setText("other")
         self.pane.username_edit.textEdited.emit("other")
         self.assertIsNone(self.pane.profile_combo.currentData())
-        self.assertEqual(self.pane._connection_settings().port, 22)
+        self.assertEqual(self.pane._connection_settings().port, 2222)
+
+    def test_advanced_defaults_and_port_are_independent_of_console(self):
+        self.assertTrue(self.pane.advanced_settings.isHidden())
+        self.assertFalse(self.pane.port_spin.isHidden())
+        self.assertEqual(self.pane.port_spin.value(), 22)
+        self.assertTrue(all(combo.currentData() is None for combo in self.pane.algorithm_combos.values()))
+        self.pane.advanced_button.click()
+        self.assertFalse(self.pane.advanced_settings.isHidden())
+        self.pane.port_spin.setValue(2200)
+        self.pane.connection_tabs.setCurrentIndex(1)
+        self.assertTrue(self.pane.advanced_settings.isHidden())
+        self.pane.connection_tabs.setCurrentIndex(0)
+        self.assertFalse(self.pane.advanced_settings.isHidden())
+        self.assertEqual(self.pane.port_spin.value(), 2200)
+
+    def test_connection_locks_ssh_fields_and_passes_selected_algorithms(self):
+        with patch.object(terminal_ui, "TerminalSession", FakeTerminalSession):
+            self.pane.address_edit.setText("192.0.2.1")
+            self.pane.port_spin.setValue(2200)
+            combo = self.pane.algorithm_combos["cipher"]
+            combo.setCurrentIndex(1)
+            self.pane.connect_session()
+            self.wait_for(lambda: self.pane._session is not None)
+            self.assertEqual(self.pane._session.settings.port, 2200)
+            self.assertEqual(self.pane._session.algorithms.cipher, combo.currentData())
+            for field in (self.pane.address_edit, self.pane.port_spin, self.pane.profile_combo,
+                          self.pane.username_edit, self.pane.password_edit, self.pane.device_type_combo,
+                          self.pane.connection_tabs, self.pane.disable_paging_check, combo,
+                          self.pane.test_tcp_button):
+                self.assertFalse(field.isEnabled())
+            self.pane.refresh_profiles("profile-1")
+            self.assertEqual(self.pane.username_edit.text(), "")
+            self.pane.disconnect_session()
+            self.wait_for(lambda: not self.pane.is_active())
+            self.assertEqual(self.pane.username_edit.text(), "operator")
+            self.assertTrue(self.pane.address_edit.isEnabled())
+
+    def test_tcp_test_without_credentials_serializes_connection_and_waits_on_close(self):
+        release = threading.Event()
+        started = threading.Event()
+        calls = []
+
+        def check(address, port):
+            calls.append((address, port, threading.current_thread()))
+            started.set()
+            release.wait(2)
+            return terminal_ui.TCPPortResult("success", 0.25)
+
+        with patch.object(terminal_ui, "test_tcp_port", side_effect=check), \
+             patch.object(terminal_ui, "TerminalSession") as session_factory:
+            self.pane.address_edit.setText("::1")
+            self.pane.port_spin.setValue(2222)
+            self.pane.test_tcp_connection()
+            self.wait_for(started.is_set)
+            self.assertTrue(self.pane.is_active())
+            self.assertFalse(self.pane.connect_button.isEnabled())
+            self.assertFalse(self.pane.port_spin.isEnabled())
+            self.pane.connect_session()
+            session_factory.assert_not_called()
+            self.pane.test_tcp_connection()
+            self.pane.stop_for_close()
+            self.assertTrue(self.pane.is_active())
+            release.set()
+            self.wait_for(lambda: not self.pane.is_active())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][:2], ("::1", 2222))
+            self.assertIsNot(calls[0][2], threading.current_thread())
+            self.assertIn("succeeded (0.25 s)", self.pane.tcp_result_label.text())
+
+    def test_tcp_invalid_address_and_failure_results(self):
+        with patch.object(terminal_ui, "test_tcp_port") as check:
+            self.pane.address_edit.setText("hostname.example")
+            self.pane.test_tcp_connection()
+            check.assert_not_called()
+            self.assertIn("valid IPv4 or IPv6", self.pane.tcp_result_label.text())
+        for status in ("refused", "timeout", "error"):
+            self.pane._tcp_test_result(terminal_ui.TCPPortResult(status, 1.0, "detail"))
+            self.assertIn("detail", self.pane.tcp_result_label.text())
 
     def test_console_mode_shows_serial_fields_and_preserves_manual_port(self):
         with patch.object(terminal_ui, "available_console_ports", return_value=[

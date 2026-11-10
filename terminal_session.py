@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol
 
 from run_commands import Settings
+from terminal_ssh_settings import SSHAlgorithms, restricted_connect_handler, validate_algorithms
 
 
 class TerminalError(RuntimeError):
@@ -109,6 +110,7 @@ class TerminalSession:
         transcript_path: Optional[Path] = None,
         connect_handler: Optional[Callable[..., Any]] = None,
         disable_paging: bool = False,
+        algorithms: SSHAlgorithms = SSHAlgorithms(),
     ) -> None:
         self.address = str(ipaddress.ip_address(address.strip()))
         if not settings.device_type.strip():
@@ -119,6 +121,9 @@ class TerminalSession:
         self.transcript_path = transcript_path
         self.connect_handler = connect_handler
         self.disable_paging = disable_paging
+        if not algorithms.automatic:
+            validate_algorithms(algorithms)
+        self.algorithms = algorithms
         self._requests: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
         self._stopping = threading.Event()
 
@@ -173,8 +178,19 @@ class TerminalSession:
                 parameters["secret"] = self.settings.enable_secret
             if not self.disable_paging:
                 parameters["auto_connect"] = False
-            connection = handler(**parameters)
-            if not self.disable_paging:
+            if self.algorithms.automatic:
+                connection = handler(**parameters)
+            else:
+                try:
+                    connection = restricted_connect_handler(self.algorithms, **parameters)
+                    if not self.disable_paging:
+                        connection.establish_connection()
+                except Exception as exc:
+                    selected = ", ".join(
+                        f"{name}={value}" for name, value in vars(self.algorithms).items() if value
+                    )
+                    raise TerminalError(f"SSH connection failed with {selected}: {exc}") from exc
+            if not self.disable_paging and self.algorithms.automatic:
                 connection.establish_connection()
             channel = connection.remote_conn
             if channel is None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import ipaddress
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -20,6 +21,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabBar,
     QVBoxLayout,
@@ -31,6 +35,18 @@ from serial_console import (
     ConsoleSettings, SerialConsoleSession, available_console_ports, is_bluetooth_port,
 )
 from terminal_session import InteractiveSession, TerminalError, TerminalSession, terminal_transcript_path
+from terminal_ssh_settings import SSHAlgorithms, TCPPortResult, supported_algorithms, test_tcp_port
+
+
+class TCPPortThread(QThread):
+    result = Signal(object)
+
+    def __init__(self, address: str, port: int, parent: QObject) -> None:
+        super().__init__(parent)
+        self.address, self.port = address, port
+
+    def run(self) -> None:
+        self.result.emit(test_tcp_port(self.address, self.port))
 
 
 class TerminalBridge(QObject):
@@ -100,6 +116,9 @@ class TerminalPane(QWidget):
         self.output_folder = output_folder
         self._session: Optional[InteractiveSession] = None
         self._thread: Optional[TerminalThread] = None
+        self._tcp_thread: Optional[TCPPortThread] = None
+        self._pending_profile_refresh = False
+        self._pending_profile_id: Optional[str] = None
         self._ready = False
         self._terminal_size = (80, 24)
         self._loading_profile = False
@@ -137,6 +156,10 @@ class TerminalPane(QWidget):
         self._console_widgets: list[QWidget] = []
         self.address_edit = QLineEdit()
         self.address_edit.setPlaceholderText("One IPv4 or IPv6 address")
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(22)
+        self.port_spin.setAccessibleName("SSH Port")
         self.profile_combo = QComboBox()
         if manage_profiles is not None:
             manage_button = QPushButton("Manage Profiles…")
@@ -166,7 +189,7 @@ class TerminalPane(QWidget):
                 ("Username", self.username_edit),
                 ("Password", self.password_edit),
                 ("Device Type", self.device_type_combo),
-                ("Device", self.address_edit),
+                ("Address", self.address_edit),
             ), start=1
         ):
             label = QLabel(text)
@@ -174,8 +197,56 @@ class TerminalPane(QWidget):
             form.addWidget(label, row, 0)
             form.addWidget(field, row, 1)
             self._ssh_widgets.extend((label, field))
+        address_row = QWidget()
+        address_layout = QHBoxLayout(address_row)
+        address_layout.setContentsMargins(0, 0, 0, 0)
+        form.removeWidget(self.address_edit)
+        address_layout.addWidget(self.address_edit, 1)
+        port_label = QLabel("Port")
+        port_label.setBuddy(self.port_spin)
+        address_layout.addWidget(port_label)
+        address_layout.addWidget(self.port_spin)
+        form.addWidget(address_row, 5, 1, 1, 2)
+        self._ssh_widgets.extend((address_row, self.port_spin))
         form.addWidget(self.disable_paging_check, 6, 1)
         self._ssh_widgets.append(self.disable_paging_check)
+
+        self.advanced_button = QPushButton("Advanced SSH Settings")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setToolTip("Show SSH negotiation preferences and TCP port test.")
+        form.addWidget(self.advanced_button, 7, 1, 1, 2)
+        self.advanced_settings = QWidget()
+        advanced = QGridLayout(self.advanced_settings)
+        advanced.setContentsMargins(0, 0, 0, 0)
+        self.algorithm_combos: dict[str, QComboBox] = {}
+        eligible_algorithms = supported_algorithms()
+        for row, (category, label) in enumerate((
+            ("kex", "Key exchange"), ("host_key", "Server host key"),
+            ("cipher", "Cipher"), ("mac", "MAC"),
+        )):
+            combo = QComboBox()
+            combo.addItem("Automatic", None)
+            for algorithm in eligible_algorithms[category]:
+                combo.addItem(algorithm, algorithm)
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(12)
+            combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            advanced.addWidget(QLabel(label), row, 0)
+            advanced.addWidget(combo, row, 1)
+            self.algorithm_combos[category] = combo
+        self.algorithm_combos["mac"].setToolTip(
+            "A manual MAC requires a non-AEAD cipher. Automatic cipher excludes AEAD when a MAC is selected."
+        )
+        self.test_tcp_button = QPushButton("Test TCP Port")
+        self.test_tcp_button.setToolTip("Open and close TCP only; no SSH login or device commands. Timeout: 5 seconds.")
+        self.tcp_result_label = QLabel()
+        self.tcp_result_label.setWordWrap(True)
+        advanced.addWidget(self.test_tcp_button, 4, 0, 1, 2)
+        advanced.addWidget(self.tcp_result_label, 5, 0, 1, 2)
+        form.addWidget(self.advanced_settings, 8, 1, 1, 2)
+        self.advanced_settings.hide()
+        self.advanced_button.toggled.connect(self.advanced_settings.setVisible)
+        self._ssh_widgets.extend((self.advanced_button,))
 
         self.serial_port_combo = QComboBox()
         self.serial_port_combo.setEditable(True)
@@ -217,7 +288,7 @@ class TerminalPane(QWidget):
         console_hint.setWordWrap(True)
         form.addWidget(console_hint, 7, 1, 1, 2)
         self._console_widgets.append(console_hint)
-        form.addWidget(self.save_transcript_check, 8, 1)
+        form.addWidget(self.save_transcript_check, 9, 1)
         buttons = QWidget()
         button_layout = QHBoxLayout(buttons)
         button_layout.setContentsMargins(0, 0, 0, 0)
@@ -226,14 +297,14 @@ class TerminalPane(QWidget):
         self.disconnect_button.setEnabled(False)
         button_layout.addWidget(self.connect_button)
         button_layout.addWidget(self.disconnect_button)
-        form.addWidget(buttons, 9, 1, 1, 2)
+        form.addWidget(buttons, 10, 1, 1, 2)
         self.status_label = QLabel("Loading terminal…")
         self.status_label.setWordWrap(True)
-        form.addWidget(QLabel("Status"), 10, 0, Qt.AlignmentFlag.AlignTop)
-        form.addWidget(self.status_label, 10, 1, 1, 2)
+        form.addWidget(QLabel("Status"), 11, 0, Qt.AlignmentFlag.AlignTop)
+        form.addWidget(self.status_label, 11, 1, 1, 2)
         self.open_transcript_button = QPushButton("Open Transcript")
         self.open_transcript_button.setEnabled(False)
-        form.addWidget(self.open_transcript_button, 11, 1, 1, 2)
+        form.addWidget(self.open_transcript_button, 12, 1, 1, 2)
         self.connect_button.setEnabled(False)
 
         self.web_view = QWebEngineView()
@@ -247,7 +318,12 @@ class TerminalPane(QWidget):
                 str(Path(__file__).resolve().parent / "terminal_assets" / "terminal.html")
             )
         )
-        splitter.addWidget(connection_group)
+        self.connection_scroll = QScrollArea()
+        self.connection_scroll.setWidgetResizable(True)
+        self.connection_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.connection_scroll.setMinimumWidth(400)
+        self.connection_scroll.setWidget(connection_group)
+        splitter.addWidget(self.connection_scroll)
         splitter.addWidget(self.web_view)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
@@ -263,6 +339,7 @@ class TerminalPane(QWidget):
         self.password_edit.textEdited.connect(self._credentials_edited)
         self.connect_button.clicked.connect(self.connect_session)
         self.disconnect_button.clicked.connect(self.disconnect_session)
+        self.test_tcp_button.clicked.connect(self.test_tcp_connection)
         self.open_transcript_button.clicked.connect(self.open_transcript)
         self.bridge.loaded.connect(self._terminal_loaded)
         self.bridge.input_received.connect(self._send_input)
@@ -285,6 +362,7 @@ class TerminalPane(QWidget):
             widget.setVisible(not console)
         for widget in self._console_widgets:
             widget.setVisible(console)
+        self.advanced_settings.setVisible(not console and self.advanced_button.isChecked())
         if console:
             self.refresh_serial_ports()
         self._update_serial_scan_timer()
@@ -367,6 +445,10 @@ class TerminalPane(QWidget):
         )
 
     def refresh_profiles(self, selected_id: Optional[str] = None) -> None:
+        if self.is_active():
+            self._pending_profile_refresh = True
+            self._pending_profile_id = selected_id
+            return
         if selected_id is None:
             selected_id = self.profile_combo.currentData()
         self.profile_combo.clear()
@@ -407,6 +489,7 @@ class TerminalPane(QWidget):
         try:
             self.username_edit.setText(credentials.username)
             self.password_edit.setText(credentials.password)
+            self.port_spin.setValue(credentials.port)
         finally:
             self._loading_profile = False
 
@@ -418,8 +501,9 @@ class TerminalPane(QWidget):
     @Slot()
     def _terminal_loaded(self) -> None:
         self._ready = True
-        self.connect_button.setEnabled(True)
-        self.status_label.setText("Disconnected")
+        self.connect_button.setEnabled(not self.is_active())
+        if not self.is_active():
+            self.status_label.setText("Disconnected")
 
     @Slot(bool)
     def _web_load_finished(self, success: bool) -> None:
@@ -438,19 +522,20 @@ class TerminalPane(QWidget):
                 username=self.username_edit.text().strip(),
                 password=self.password_edit.text(),
                 device_type=self.device_type_combo.currentText().strip(),
+                port=self.port_spin.value(),
             )
         return Settings(
             username=self.username_edit.text().strip(),
             password=self.password_edit.text(),
             enable_secret=None,
-            port=22,
+            port=self.port_spin.value(),
             timeout=15,
             device_type=self.device_type_combo.currentText().strip(),
         )
 
     @Slot()
     def connect_session(self) -> None:
-        if self._thread is not None or not self._ready:
+        if self.is_active() or not self._ready:
             return
         try:
             console = self.connection_tabs.tabData(self.connection_tabs.currentIndex()) == "console"
@@ -473,6 +558,10 @@ class TerminalPane(QWidget):
                 session = TerminalSession(
                     address, self._connection_settings(), path,
                     disable_paging=self.disable_paging_check.isChecked(),
+                    algorithms=SSHAlgorithms(**{
+                        category: combo.currentData()
+                        for category, combo in self.algorithm_combos.items()
+                    }),
                 )
         except (OSError, ValueError, TerminalError) as exc:
             self.status_label.setText(f"Cannot connect: {exc}")
@@ -484,13 +573,8 @@ class TerminalPane(QWidget):
         self.bridge.clear.emit()
         self.bridge.enabled.emit(False)
         self.status_label.setText(f"Connecting to {session.address}…")
-        self.connect_button.setEnabled(False)
+        self._set_connection_fields_enabled(False)
         self.disconnect_button.setEnabled(True)
-        self.save_transcript_check.setEnabled(False)
-        self.disable_paging_check.setEnabled(False)
-        self.connection_tabs.setEnabled(False)
-        for widget in self._console_widgets:
-            widget.setEnabled(False)
         self._thread = TerminalThread(session, self)
         self._update_serial_scan_timer()
         self._thread.connected.connect(self._connected)
@@ -498,6 +582,49 @@ class TerminalPane(QWidget):
         self._thread.done.connect(self._session_finished)
         self._thread.finished.connect(self._thread_finished)
         self._thread.start()
+
+    def _set_connection_fields_enabled(self, enabled: bool) -> None:
+        for widget in (
+            *self._ssh_widgets, *self._console_widgets, self.advanced_settings,
+            self.connection_tabs, self.save_transcript_check,
+        ):
+            widget.setEnabled(enabled)
+        self.connect_button.setEnabled(enabled and self._ready)
+
+    @Slot()
+    def test_tcp_connection(self) -> None:
+        if self.is_active() or self.connection_tabs.currentIndex() != 0:
+            return
+        try:
+            address = str(ipaddress.ip_address(self.address_edit.text().strip()))
+        except ValueError:
+            self.tcp_result_label.setText("Enter one valid IPv4 or IPv6 address.")
+            return
+        self._set_connection_fields_enabled(False)
+        self.tcp_result_label.setText(f"Testing {address}:{self.port_spin.value()}…")
+        self._tcp_thread = TCPPortThread(address, self.port_spin.value(), self)
+        self._tcp_thread.result.connect(self._tcp_test_result)
+        self._tcp_thread.finished.connect(self._tcp_test_finished)
+        self._tcp_thread.start()
+
+    @Slot(object)
+    def _tcp_test_result(self, result: TCPPortResult) -> None:
+        descriptions = {
+            "success": "TCP connection succeeded", "refused": "TCP connection refused",
+            "timeout": "TCP connection timed out", "error": "TCP connection error",
+        }
+        text = f"{descriptions[result.status]} ({result.elapsed:.2f} s)."
+        if result.detail:
+            text += f" {result.detail}"
+        self.tcp_result_label.setText(text)
+
+    @Slot()
+    def _tcp_test_finished(self) -> None:
+        thread = self._tcp_thread
+        self._tcp_thread = None
+        if thread is not None:
+            thread.deleteLater()
+        self._after_worker_finished()
 
     @Slot()
     def _connected(self) -> None:
@@ -542,14 +669,16 @@ class TerminalPane(QWidget):
         self._session = None
         if thread is not None:
             thread.deleteLater()
-        self.connect_button.setEnabled(self._ready)
         self.disconnect_button.setEnabled(False)
         self.save_transcript_check.setChecked(False)
-        self.save_transcript_check.setEnabled(True)
-        self.disable_paging_check.setEnabled(True)
-        self.connection_tabs.setEnabled(True)
-        for widget in self._console_widgets:
-            widget.setEnabled(True)
+        self._after_worker_finished()
+
+    def _after_worker_finished(self) -> None:
+        self._set_connection_fields_enabled(True)
+        if self._pending_profile_refresh:
+            self._pending_profile_refresh = False
+            self.refresh_profiles(self._pending_profile_id)
+            self._pending_profile_id = None
         if self._close_when_finished:
             self._close_when_finished = False
             self.window().close()
@@ -562,7 +691,7 @@ class TerminalPane(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._transcript_path)))
 
     def is_active(self) -> bool:
-        return self._thread is not None
+        return self._thread is not None or self._tcp_thread is not None
 
     def stop_for_close(self) -> None:
         self._close_when_finished = True

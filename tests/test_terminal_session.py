@@ -5,9 +5,11 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from run_commands import Settings
 from terminal_session import ReadableTranscript, TerminalSession, terminal_transcript_path
+from terminal_ssh_settings import SSHAlgorithms
 
 
 class FakeChannel:
@@ -110,6 +112,27 @@ class TerminalSessionTests(unittest.TestCase):
             path.read_text(encoding="utf-8"),
             "switch# show version\nVersion 1\nswitch# \n",
         )
+
+    def test_automatic_keeps_original_connection_parameters(self):
+        connection = FakeConnection(FakeChannel())
+        connection.remote_conn.closed = True
+        with patch("netmiko.ConnectHandler", return_value=connection) as handler, \
+             patch("terminal_session.restricted_connect_handler") as restricted:
+            TerminalSession("192.0.2.1", self.settings).run(lambda: None, lambda text: None)
+        restricted.assert_not_called()
+        handler.assert_called_once_with(
+            device_type="cisco_ios", host="192.0.2.1", username="admin", password="secret",
+            port=22, timeout=15, conn_timeout=15, auto_connect=False,
+        )
+
+    def test_manual_connection_uses_scoped_handler_and_reports_no_fallback(self):
+        choices = SSHAlgorithms(cipher="aes128-ctr")
+        with patch("terminal_session.restricted_connect_handler", side_effect=ValueError("no compatible cipher")) as restricted, \
+             patch("netmiko.ConnectHandler") as automatic:
+            with self.assertRaisesRegex(RuntimeError, "cipher=aes128-ctr: no compatible cipher"):
+                TerminalSession("192.0.2.1", self.settings, algorithms=choices).run(lambda: None, lambda text: None)
+        self.assertEqual(restricted.call_args.args, (choices,))
+        automatic.assert_not_called()
 
     def test_unchecked_session_creates_no_file(self):
         result, path = self.run_fake_session(False)
