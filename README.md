@@ -264,8 +264,8 @@ does not stop an already confirmed live batch.
 
 ### Command dictionary
 
-The reusable, non-modal **Command Dictionary** window is opened from the Batch
-command controls and contains 96
+The reusable, non-modal **Command Dictionary** window opens from **Tools >
+Command Dictionary** in the menu bar, from any main tab, and contains 96
 entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
 CloudEngine S5755-S. Seventy entries are read-only operational commands. The
 remaining entries are explicitly marked as configuration changes, service-
@@ -297,9 +297,10 @@ must not be treated as unattended operations.
 
 ### Config converter
 
-The reusable, non-modal **Config Converter** window opens below the Command
-Dictionary control. It converts a conservative command and configuration
-baseline between generic Cisco IOS XE and Huawei VRP syntax entirely in memory;
+The reusable, non-modal **Config Converter** window opens from **Tools >
+Config Converter** in the menu bar, from any main tab. It converts a conservative
+command and configuration baseline between generic Cisco IOS XE and Huawei VRP
+syntax entirely in memory;
 it does not connect to a device, queue work, or create audit History. Source text
 can be pasted or imported from `.cfg` and `.txt` files. Select a source vendor or
 use auto-detection, then click **Convert** to produce an editable target candidate.

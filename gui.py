@@ -1112,18 +1112,6 @@ class MainWindow(QMainWindow):
         self.clear_commands_button = QPushButton("Clear Commands")
         self.clear_commands_button.setEnabled(False)
         self.clear_commands_button.clicked.connect(self._clear_commands)
-        self.command_dictionary_button = QPushButton("Command Dictionary")
-        self.command_dictionary_button.setToolTip(
-            "Open the offline command dictionary in a separate window."
-        )
-        self.command_dictionary_button.clicked.connect(
-            self._open_command_dictionary
-        )
-        self.config_converter_button = QPushButton("Config Converter")
-        self.config_converter_button.setToolTip(
-            "Convert reviewed Cisco IOS XE and Huawei VRP commands locally."
-        )
-        self.config_converter_button.clicked.connect(self._open_config_converter)
         command_file_buttons = QWidget()
         self.command_file_buttons = command_file_buttons
         command_file_buttons_layout = QGridLayout(command_file_buttons)
@@ -1150,15 +1138,6 @@ class MainWindow(QMainWindow):
         command_inputs_layout.addWidget(self.exec_commands_edit, 5, 1)
         command_inputs_layout.addWidget(config_commands_label, 6, 0)
         command_inputs_layout.addWidget(self.config_commands_edit, 6, 1)
-        command_tools = QWidget()
-        command_tools_layout = QVBoxLayout(command_tools)
-        command_tools_layout.setContentsMargins(0, 0, 0, 0)
-        command_tools_layout.addWidget(self.command_dictionary_button)
-        command_tools_layout.addWidget(self.config_converter_button)
-        command_inputs_layout.addWidget(
-            command_tools, 5, 2, 2, 1, Qt.AlignmentFlag.AlignVCenter
-        )
-        self.command_tools_container = command_tools
         command_inputs_layout.addWidget(command_file_buttons, 7, 1, 1, 2)
         command_inputs_layout.setColumnStretch(1, 1)
 
@@ -1434,6 +1413,22 @@ class MainWindow(QMainWindow):
         self.preferences_action.setMenuRole(QAction.MenuRole.NoRole)
         self.preferences_action.triggered.connect(self._open_preferences)
         self.settings_menu.addAction(self.preferences_action)
+
+        self.tools_menu = self.menuBar().addMenu("&Tools")
+        self.command_dictionary_action = QAction("Command Dictionary", self)
+        self.command_dictionary_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.command_dictionary_action.setToolTip(
+            "Open the offline command dictionary in a separate window."
+        )
+        self.command_dictionary_action.triggered.connect(self._open_command_dictionary)
+        self.tools_menu.addAction(self.command_dictionary_action)
+        self.config_converter_action = QAction("Config Converter", self)
+        self.config_converter_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.config_converter_action.setToolTip(
+            "Convert reviewed Cisco IOS XE and Huawei VRP commands locally."
+        )
+        self.config_converter_action.triggered.connect(self._open_config_converter)
+        self.tools_menu.addAction(self.config_converter_action)
 
     def _scheduled_timeout_minutes(self) -> int:
         value = self.settings.value(
@@ -5415,9 +5410,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             if window.terminal_pane.serial_scan_timer.isActive():
                 raise RuntimeError("SSH mode kept scanning serial ports")
             window._ensure_history_ui()
-            window._open_command_dictionary()
+            window.command_dictionary_action.trigger()
             window.dictionary_search_edit.setText("interface")
-            window._open_config_converter()
+            window.config_converter_action.trigger()
             window.converter_source_edit.setPlainText("show version")
             window._convert_converter_source()
             app.processEvents()

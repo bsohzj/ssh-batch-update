@@ -263,20 +263,10 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
 
-        self.assertEqual(
-            self.window.command_dictionary_button.text(), "Command Dictionary"
-        )
-        self.assertEqual(self.window.config_converter_button.text(), "Config Converter")
-        self.assertTrue(
-            self.window.command_inputs_container.isAncestorOf(
-                self.window.command_dictionary_button
-            )
-        )
+        self.assertFalse(hasattr(self.window, "command_dictionary_button"))
+        self.assertFalse(hasattr(self.window, "config_converter_button"))
+        self.assertFalse(hasattr(self.window, "command_tools_container"))
         command_inputs_layout = self.window.command_inputs_container.layout()
-        button_index = command_inputs_layout.indexOf(
-            self.window.command_tools_container
-        )
-        button_position = command_inputs_layout.getItemPosition(button_index)
         exec_position = command_inputs_layout.getItemPosition(
             command_inputs_layout.indexOf(self.window.exec_commands_edit)
         )
@@ -290,16 +280,6 @@ class MainWindowTests(unittest.TestCase):
         )
         inventory_position = command_inputs_layout.getItemPosition(
             command_inputs_layout.indexOf(self.window.inventory_text_edit)
-        )
-        self.assertEqual(button_position, (5, 2, 2, 1))
-        self.assertEqual(
-            command_inputs_layout.itemAt(button_index).alignment(),
-            Qt.AlignmentFlag.AlignVCenter,
-        )
-        tools_layout = self.window.command_tools_container.layout()
-        self.assertLess(
-            tools_layout.indexOf(self.window.command_dictionary_button),
-            tools_layout.indexOf(self.window.config_converter_button),
         )
         self.assertEqual(inventory_position[1], 1)
         self.assertEqual(exec_position[1], 1)
@@ -368,6 +348,22 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertEqual(self.window.device_type_combo.currentText(), "huawei")
 
+    def test_tools_menu_contains_dictionary_then_converter(self):
+        self.assertEqual(
+            [action.text().replace("&", "") for action in self.window.menuBar().actions()],
+            ["Settings", "Tools"],
+        )
+        self.assertEqual(self.window.tools_menu.actions(), [
+            self.window.command_dictionary_action, self.window.config_converter_action,
+        ])
+        self.assertEqual(
+            [action.text() for action in self.window.tools_menu.actions()],
+            ["Command Dictionary", "Config Converter"],
+        )
+        for action in self.window.tools_menu.actions():
+            self.assertEqual(action.menuRole(), gui.QAction.MenuRole.NoRole)
+            self.assertTrue(action.isEnabled())
+
     def test_settings_menu_opens_preferences_and_saves_theme(self):
         self.assertEqual(self.window.settings_menu.title().replace("&", ""), "Settings")
         self.assertEqual(self.window.settings_menu.actions(), [self.window.preferences_action])
@@ -430,7 +426,7 @@ class MainWindowTests(unittest.TestCase):
             (self.window.username_edit, QPalette.ColorRole.Text),
             (self.window.inventory_text_edit, QPalette.ColorRole.Text),
             (self.window.device_type_combo, QPalette.ColorRole.ButtonText),
-            (self.window.command_dictionary_button, QPalette.ColorRole.ButtonText),
+            (self.window.tools_menu, QPalette.ColorRole.WindowText),
             (self.window.queue_table, QPalette.ColorRole.Text),
         )
 
@@ -555,7 +551,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNone(self.window.dictionary_dialog)
 
         self.window.show()
-        self.window.command_dictionary_button.click()
+        self.window.command_dictionary_action.trigger()
         self.app.processEvents()
 
         self.assertTrue(self.window._dictionary_ui_built)
@@ -599,18 +595,27 @@ class MainWindowTests(unittest.TestCase):
         dialog.close()
         self.app.processEvents()
         self.assertTrue(dialog.isHidden())
-        self.window.command_dictionary_button.click()
+        self.window.command_dictionary_action.trigger()
         self.app.processEvents()
         self.assertIs(self.window.dictionary_dialog, dialog)
         self.assertEqual(self.window.dictionary_search_edit.text(), "interface")
         self.assertFalse(dialog.isHidden())
+        for index in range(self.window.main_tabs.count()):
+            dialog.close()
+            self.window.main_tabs.setCurrentIndex(index)
+            self.window.command_dictionary_action.trigger()
+            self.app.processEvents()
+            self.assertIs(self.window.dictionary_dialog, dialog)
+            self.assertFalse(dialog.isHidden())
+            self.assertEqual(self.window.main_tabs.currentIndex(), index)
+            self.assertEqual(self.window.dictionary_search_edit.text(), "interface")
 
     def test_config_converter_opens_lazy_reusable_non_modal_window(self):
         self.assertFalse(self.window._converter_ui_built)
         self.assertIsNone(self.window.converter_dialog)
 
         self.window.show()
-        self.window.config_converter_button.click()
+        self.window.config_converter_action.trigger()
         self.app.processEvents()
 
         self.assertTrue(self.window._converter_ui_built)
@@ -635,10 +640,19 @@ class MainWindowTests(unittest.TestCase):
         dialog.close()
         self.app.processEvents()
         self.assertTrue(dialog.isHidden())
-        self.window.config_converter_button.click()
+        self.window.config_converter_action.trigger()
         self.app.processEvents()
         self.assertIs(self.window.converter_dialog, dialog)
         self.assertEqual(self.window.converter_source_edit.toPlainText(), "show version")
+        for index in range(self.window.main_tabs.count()):
+            dialog.close()
+            self.window.main_tabs.setCurrentIndex(index)
+            self.window.config_converter_action.trigger()
+            self.app.processEvents()
+            self.assertIs(self.window.converter_dialog, dialog)
+            self.assertFalse(dialog.isHidden())
+            self.assertEqual(self.window.main_tabs.currentIndex(), index)
+            self.assertEqual(self.window.converter_source_edit.toPlainText(), "show version")
 
     def test_config_converter_auto_detects_converts_and_rechecks(self):
         self.window._ensure_converter_ui()
@@ -1329,7 +1343,7 @@ class MainWindowTests(unittest.TestCase):
         selected_job_id = self.window._selected_job_id
         self.window._request_results_attention()
 
-        self.window.command_dictionary_button.click()
+        self.window.command_dictionary_action.trigger()
         self.window.dictionary_search_edit.setText("interface")
         self.app.processEvents()
 
