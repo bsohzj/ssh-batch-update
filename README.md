@@ -39,8 +39,8 @@ Connections** logs in to each valid IP, detects the prompt, optionally verifies
 enable mode, and disconnects without running either command box. Its status,
 stage, full error, and diagnostic file appear in the same results table used by
 live runs. **Run Live** and **Schedule Run** validate and confirm a complete
-batch snapshot before it can make changes. Per-device
-progress never displays literal commands. Reports default to
+batch snapshot before it can make changes. The **Device Results** progress
+table does not display literal commands. Reports default to
 `~/Documents/SSH Batch Update/outputs`.
 Double-click a file path in the Output column to open that device's output.
 Double-click the Result column to view the complete status or error message.
@@ -74,15 +74,32 @@ permissions, and never commit them to Git.
 The GUI runs only one SSH batch at a time. **Run Live** always appends the batch
 to the end of the queue. It starts automatically when nothing else is running,
 or waits in FIFO order when another batch is active; it never jumps ahead of
-earlier ready work. Use **Schedule Run** to select a future local date from the
-calendar, a time, and a required latest-start deadline. New schedules default
-to a one-hour start window. A batch may begin at the deadline, but it becomes
-**Expired** if it has not started after that time. Expiry never stops work that
-is already running. Future jobs do not block ready jobs, and batches scheduled
-for the same time run in visible queue order.
+earlier ready work. Use **Schedule Run** to select a future local date and time.
+Use **Settings → Preferences…** in the macOS menu bar to choose the theme,
+set the scheduled batch timeout, and choose what happens after a device fails.
+Hover over the **?** next to the timeout for its explanation.
+The timeout is 30 minutes, 1 hour, or 2 hours (1 hour by default). It starts
+at the scheduled time and is saved with each new or rescheduled batch. A batch
+may begin at its expiry time, but it becomes **Expired** if it has not started after
+that time. Changing the setting does not change already queued deadlines, and
+expiry never stops work that is already running. Future jobs do not block ready
+jobs, and batches scheduled for the same time run in visible queue order.
+
+By default, a failed device does not stop the other devices in its batch.
+Choose **Stop after first failure** to leave all remaining devices unrun; they
+appear as **Skipped** in Device Results and `summary.csv`. This choice is saved
+with each new batch, so changing Preferences does not affect queued work.
+It does not stop later batches in the queue.
+
+The Batch form's **Output files** choice applies to each submitted batch. By
+default, each device gets its own transcript. Choose **One file per batch**
+to put all attempted device transcripts in one file named after the batch.
+Device Results and `summary.csv` point each attempted device to that shared
+file. The output choice can be changed when editing a queued batch; connection
+tests continue to write separate device diagnostics.
 
 The **Queue** tab shows order, batch name, device and command counts, schedule,
-latest start, status, and result. Pending jobs can be moved, edited,
+expiry time, status, and result. Pending jobs can be moved, edited,
 rescheduled, retried, or removed. Cancelled, completed, and expired Queue
 entries can also be removed; removing an entry never deletes its transcripts,
 summary, or output directory. **Clear Completed** removes all successful,
@@ -95,23 +112,37 @@ open its per-device results. **Pause Queue** stops new batches from starting;
 pauses the queue. A batch with device failures does not prevent the next ready
 batch from starting.
 
-For a completed batch with device failures, **Retry Failed Devices…** creates an
-editable SSH-form draft containing only failed devices and the original
-commands. Successful and cancelled devices are excluded. The app reloads the
+The **Live Output** tab follows the active batch regardless of which Queue row
+is selected. It shows each literal exec or config command as it is sent and the
+switch's response when that command returns. It may reveal passwords or other
+sensitive text. The last run stays visible until another starts or the app
+closes; connection tests do not appear there. The view keeps roughly the latest
+2 MB of text, while saved output files retain the complete transcript. Use the
+**Text size** controls above the output box to adjust its font from 50% to 200%;
+the percentage is remembered when the app reopens. At 100%, the text matches
+the previous 120% size. In **Settings → Preferences…**, choose **By batch** to
+keep all devices in the live view (the default), or **By device** to clear the
+view when the next device starts. Saved output files are unaffected.
+
+For a completed batch with device failures, **Retry Failed/Skipped Devices…**
+creates an editable Batch-form draft containing failed and skipped devices and
+the original commands. Successful and cancelled devices are excluded. The app reloads the
 original named profile when it still exists; otherwise it clears credentials
 and selects Manual. Review and validate the draft before submitting it as a new
 batch. No retry is queued or executed automatically.
 
 Queued device addresses, commands, output settings, and credentials are stored
 as a complete macOS Keychain payload. Ordinary application settings contain
-only an opaque job ID, batch name, ordering, schedule window, friendly profile
-label, device type, and counts. The Keychain payload is deleted when the batch
-completes, is cancelled, expires, or is removed. A
+only an opaque job ID, batch name, ordering, schedule window, timeout setting,
+friendly profile label, device type, and counts. The Keychain payload is deleted
+when the batch completes, is cancelled, expires, or is removed. A
 profile is snapshotted when submitted, so later changes to its `.env` do not
 change the queued batch.
+If Keychain cleanup fails after a batch reaches a terminal state, the app keeps
+only its opaque job ID in settings and retries cleanup on the next launch.
 
 Queued work is restored after reopening, but the queue starts paused. A new
-schedule restored after its latest-start deadline becomes **Expired** and its
+schedule restored after its expiry time becomes **Expired** and its
 Keychain payload is deleted. Older saved schedules that predate deadlines keep
 their legacy no-expiry behavior. A batch that
 was running when the app stopped becomes **Interrupted** and must be retried
@@ -123,18 +154,74 @@ network, and leave the application open for unattended work.
 Verify queue ordering, cancellation, and scheduled live changes against approved
 lab switches before using the feature on production access switches.
 
+### Interactive Terminal
+
+The **Terminal** page has **SSH | Console** tabs for choosing the connection
+type, with one connection at a time. For SSH, the Address and Port fields sit
+directly below Connection, followed by Profile, Username, Password and Device
+Type. Enter an IPv4 or IPv6 address and select a credential profile or enter a
+username and password manually, choose the device type, and press **Connect**.
+The terminal accepts normal keyboard input,
+including cursor keys and Ctrl+C. It stays connected when you switch tabs and
+can run alongside a queued batch. **Disconnect** ends its session.
+The Terminal remembers its last selected device type separately from the Batch
+form.
+
+SSH **Port** defaults to 22; selecting a profile loads its port. The visible port
+is used for both connecting and testing, including after switching to Manual.
+**Advanced SSH Settings** starts collapsed. Its key exchange, server host-key,
+cipher and MAC choices default to **Automatic**, preserving normal negotiation.
+A manual choice restricts that category to exactly the selected installed
+Paramiko algorithm; incompatible choices fail without a fallback. A manual MAC
+excludes AEAD ciphers when Cipher is Automatic and cannot be combined with an
+explicit AEAD cipher. These choices and the port apply only to Terminal SSH and
+are not saved between app launches.
+
+**Test TCP Port** checks the entered IP address and port without credentials,
+SSH negotiation or commands. It reports success, refusal, timeout or another
+connection error with elapsed time, and closes the socket immediately. The
+timeout is five seconds. Connection settings stay locked during testing and
+while a session is connecting or connected.
+
+For a console cable plugged into the Mac, select **Console**, choose the
+`/dev/cu.*` serial port, and set the baud rate to match the device. **Refresh
+Ports** rescans attached adapters; you can also type a port path. While Console
+mode is visible and disconnected, the app scans once per second and updates
+the list only when ports change. Scanning pauses while you edit the port field
+or use its dropdown, and it never opens a connection automatically.
+USB adapters are listed first; Bluetooth ports remain available but are not
+selected automatically. macOS port discovery uses `/dev/cu.*` callout names;
+the corresponding `/dev/tty.*` path can also be entered manually.
+Defaults are 9600 baud, 8 data bits, no parity, 1 stop bit, and no flow control. Data bits,
+parity, stop bits and RTS/CTS or XON/XOFF flow control can be adjusted before
+connecting. Press Enter after connecting to display the console prompt and log
+in directly in the terminal. The USB console adapter must be recognized by
+macOS. Removing the cable reports a connection error and closes the session.
+Console mode does not send login credentials or paging commands automatically.
+
+**Disable paging** is off by default, leaving the switch's usual page breaks
+in place. Turn it on before connecting to show long replies without `--More--`
+prompts. The choice is fixed for the active connection and does not affect
+batch runs.
+
+**Save transcript** is off for every new session. Turn it on before connecting
+to save a readable text log in the Batch tab's Output Folder. The checkbox is
+fixed while connected and resets to off afterward. The log can contain
+passwords shown by the device; text entered without device echo is not added
+to it. Terminal sessions do not appear in Queue or History.
+
 ### Audit history dashboard
 
 The full-window **History** screen keeps a persistent audit index for live
 batches that run after the feature is installed. It does not import older
-output folders and does not record connection tests. The two top-level tabs
-are **SSH** and **History**; the app always starts on **SSH**.
+output folders and does not record connection tests. The top-level tabs are
+**Batch**, **Terminal**, and **History**; the app always starts on **Batch**.
 History is loaded only when its screen is first opened, so it does not delay
 normal queue use or SSH execution.
 
 Queued and scheduled work continues while History is visible. When a batch
-starts and its device results begin updating, the **SSH** and **Device Results**
-tabs pulse briefly and retain a dot until **SSH** → **Device Results** is opened,
+starts and its device results begin updating, the **Batch** and **Device Results**
+tabs pulse briefly and retain a dot until **Batch** → **Device Results** is opened,
 without interrupting History review.
 
 The dashboard defaults to the last 30 days and provides summary cards, a line
@@ -145,8 +232,8 @@ pagination. Legacy failures without stored categories appear as
 source, device type, and credential-profile label.
 Selecting a record can load its `summary.csv` into **Device Results**, open its
 output or summary, or show its encrypted command snapshot after a sensitive
-content warning. **Retry Failed Devices…** can also create a failed-only draft
-from a historical summary and encrypted command snapshot; credentials are
+content warning. **Retry Failed/Skipped Devices…** can also create a draft for
+failed and skipped devices from a historical summary and encrypted command snapshot; credentials are
 reloaded from an existing named profile rather than History.
 
 Audit metadata is stored in an owner-private SQLite database at the app's
@@ -177,7 +264,7 @@ does not stop an already confirmed live batch.
 
 ### Command dictionary
 
-The reusable, non-modal **Command Dictionary** window is opened from the SSH
+The reusable, non-modal **Command Dictionary** window is opened from the Batch
 command controls and contains 96
 entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
 CloudEngine S5755-S. Seventy entries are read-only operational commands. The
@@ -235,7 +322,7 @@ review candidate even when issues remain, but SSH `[exec]`/`[config]` export and
 **Import to SSH Commands** are blocked until every review marker, unknown command,
 and placeholder is resolved. Importing a clean result classifies operational and
 configuration commands, updates Device Type, and offers Replace or Append when
-the SSH command boxes already contain text.
+the Batch command boxes already contain text.
 
 Converted output is a human-review candidate, not a production-ready migration.
 Validate it against vendor documentation and an approved lab switch before use.
@@ -287,8 +374,9 @@ python3 run_commands.py devices.txt commands.txt --device-type huawei --apply \
 Each apply run creates an owner-only timestamped directory under `outputs/`
 (or `--output-dir`) containing one exact device transcript and `summary.csv`.
 The runner stops only the affected device after a command error and continues
-with remaining devices. It does not roll back partial configurations. While it
-runs, the console shows the current device, section, source line, and command.
+with remaining devices by default. Add `--stop-on-first-failure` to skip later
+devices after any device failure. It does not roll back partial configurations.
+While it runs, the console shows the current device, section, source line, and command.
 Those progress messages include literal command-file passwords, so do not share
 or redirect that output where others can read it.
 

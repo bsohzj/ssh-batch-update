@@ -14,9 +14,15 @@ a = Analysis(
     ["gui.py"],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[("terminal_assets", "terminal_assets")],
     hiddenimports=collect_submodules("netmiko")
-    + ["history", "keyring.backends.macOS", "PySide6.QtCharts"],
+    + [
+        "history",
+        "keyring.backends.macOS",
+        "PySide6.QtCharts",
+        "PySide6.QtWebChannel",
+        "PySide6.QtWebEngineWidgets",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -8,8 +8,9 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from html import escape
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 from uuid import uuid4
@@ -29,14 +30,19 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction,
-    QActionGroup,
     QBrush,
     QCloseEvent,
     QColor,
     QCursor,
     QDesktopServices,
+    QEnterEvent,
+    QFont,
+    QFontDatabase,
+    QFocusEvent,
     QPainter,
+    QPaintEvent,
     QPalette,
+    QPen,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -66,6 +72,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTabWidget,
     QTimeEdit,
+    QToolButton,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -124,6 +131,8 @@ from run_commands import (
     ConfigurationError,
     DeviceResult,
     FailureCategory,
+    OUTPUT_PER_DEVICE,
+    OUTPUT_SINGLE_FILE,
     PreparedRun,
     ProgressEvent,
     RunRequest,
@@ -153,6 +162,24 @@ HISTORY_TREND_DEVICES = "devices"
 HISTORY_TREND_DURATION = "duration"
 HISTORY_BREAKDOWN_STATUS = "status"
 HISTORY_BREAKDOWN_FAILURES = "failures"
+SCHEDULE_TIMEOUT_KEY = "schedule/timeout_minutes"
+STOP_ON_FIRST_FAILURE_KEY = "run/stop_on_first_failure"
+TERMINAL_DEVICE_TYPE_KEY = "terminal/device_type"
+SCHEDULE_TIMEOUT_CHOICES = (("30 minutes", 30), ("1 hour", 60), ("2 hours", 120))
+SCHEDULE_TIMEOUT_OPTIONS = tuple(minutes for _, minutes in SCHEDULE_TIMEOUT_CHOICES)
+DEFAULT_SCHEDULE_TIMEOUT_MINUTES = 60
+LIVE_OUTPUT_LIMIT = 2_000_000
+LIVE_OUTPUT_TRUNCATED = "[Earlier live output omitted; complete output is in saved files.]\n"
+LIVE_OUTPUT_MODE_KEY = "view/live_output_mode"
+LIVE_OUTPUT_BY_BATCH = "batch"
+LIVE_OUTPUT_BY_DEVICE = "device"
+LIVE_OUTPUT_FONT_PERCENT_KEY = "view/live_output_font_percent"
+LIVE_OUTPUT_FONT_BASE_VERSION_KEY = "view/live_output_font_base_version"
+LIVE_OUTPUT_FONT_BASE_VERSION = 2
+LIVE_OUTPUT_FONT_BASE_SCALE = 1.2
+LIVE_OUTPUT_FONT_MIN = 50
+LIVE_OUTPUT_FONT_MAX = 200
+LIVE_OUTPUT_FONT_STEP = 10
 
 
 def normalize_theme_mode(value: object) -> str:
@@ -554,11 +581,13 @@ class BatchWorker(QObject):
         prepared: PreparedRun,
         cancellation_token: CancellationToken,
         operation: str = "run",
+        batch_name: str = "",
     ) -> None:
         super().__init__()
         self.prepared = prepared
         self.cancellation_token = cancellation_token
         self.operation = operation
+        self.batch_name = batch_name
 
     @Slot()
     def run(self) -> None:
@@ -574,6 +603,7 @@ class BatchWorker(QObject):
                     self.prepared,
                     progress_callback=self.event.emit,
                     cancellation_token=self.cancellation_token,
+                    batch_name=self.batch_name,
                 )
         except Exception as exc:  # The GUI boundary must surface all worker failures.
             self.failed.emit(f"{exc.__class__.__name__}: {exc}")
@@ -582,19 +612,22 @@ class BatchWorker(QObject):
 
 
 class ScheduleDialog(QDialog):
-    """Select a scheduled start and required latest-start deadline."""
+    """Select a start time and preview its configured expiry."""
 
     def __init__(
         self,
         initial_utc: Optional[datetime] = None,
-        initial_latest_start_utc: Optional[datetime] = None,
+        timeout_minutes: int = DEFAULT_SCHEDULE_TIMEOUT_MINUTES,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
+        if timeout_minutes not in SCHEDULE_TIMEOUT_OPTIONS:
+            raise ValueError("Unsupported scheduled batch timeout.")
+        self.timeout_minutes = timeout_minutes
         self.setWindowTitle("Schedule Run")
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Run this batch during this start window:"))
+        layout.addWidget(QLabel("Choose when this batch should start:"))
 
         minimum = QDateTime.currentDateTime().addSecs(60)
         if initial_utc is not None:
@@ -606,17 +639,6 @@ class ScheduleDialog(QDialog):
             selected = selected.addSecs(60 - selected.time().second())
         selected.setTime(selected.time().addMSecs(-selected.time().msec()))
 
-        window_seconds = 3600
-        if initial_utc is not None and initial_latest_start_utc is not None:
-            window_seconds = max(
-                60,
-                int((initial_latest_start_utc - initial_utc).total_seconds()),
-            )
-        latest = selected.addSecs(window_seconds)
-        self._latest_manually_edited = False
-        self._updating_schedule = False
-        self._last_start_local = selected
-
         fields = QFormLayout()
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
@@ -626,26 +648,14 @@ class ScheduleDialog(QDialog):
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat("h:mm AP")
         self.time_edit.setTime(selected.time())
-        self.latest_date_edit = QDateEdit()
-        self.latest_date_edit.setCalendarPopup(True)
-        self.latest_date_edit.setDisplayFormat("ddd, d MMM yyyy")
-        self.latest_date_edit.setMinimumDate(QDateTime.currentDateTime().date())
-        self.latest_date_edit.setDate(latest.date())
-        self.latest_time_edit = QTimeEdit()
-        self.latest_time_edit.setDisplayFormat("h:mm AP")
-        self.latest_time_edit.setTime(latest.time())
         fields.addRow("Date", self.date_edit)
         fields.addRow("Time", self.time_edit)
-        fields.addRow("Latest start date", self.latest_date_edit)
-        fields.addRow("Latest start time", self.latest_time_edit)
         layout.addLayout(fields)
 
         self.preview_label = QLabel()
         self.preview_label.setWordWrap(True)
-        self.date_edit.dateChanged.connect(self._start_changed)
-        self.time_edit.timeChanged.connect(self._start_changed)
-        self.latest_date_edit.dateChanged.connect(self._latest_changed)
-        self.latest_time_edit.timeChanged.connect(self._latest_changed)
+        self.date_edit.dateChanged.connect(self._update_preview)
+        self.time_edit.timeChanged.connect(self._update_preview)
         layout.addWidget(self.preview_label)
         self._update_preview()
 
@@ -660,39 +670,17 @@ class ScheduleDialog(QDialog):
     def _selected_local(self) -> QDateTime:
         return QDateTime(self.date_edit.date(), self.time_edit.time())
 
-    def _latest_local(self) -> QDateTime:
-        return QDateTime(self.latest_date_edit.date(), self.latest_time_edit.time())
-
-    @Slot()
-    def _start_changed(self) -> None:
-        selected = self._selected_local()
-        if not self._latest_manually_edited:
-            delta = self._last_start_local.secsTo(selected)
-            self._updating_schedule = True
-            try:
-                shifted = self._latest_local().addSecs(delta)
-                self.latest_date_edit.setDate(shifted.date())
-                self.latest_time_edit.setTime(shifted.time())
-            finally:
-                self._updating_schedule = False
-        self._last_start_local = selected
-        self._update_preview()
-
-    @Slot()
-    def _latest_changed(self) -> None:
-        if not self._updating_schedule:
-            self._latest_manually_edited = True
-        self._update_preview()
-
     @Slot()
     def _update_preview(self) -> None:
         display = self._selected_local().toString(
             "dddd, d MMMM yyyy 'at' h:mm AP"
         )
-        latest = self._latest_local().toString(
+        latest = self._selected_local().addSecs(self.timeout_minutes * 60).toString(
             "dddd, d MMMM yyyy 'at' h:mm AP"
         )
-        self.preview_label.setText(f"Scheduled for {display}\nMust start by {latest}")
+        self.preview_label.setText(
+            f"Scheduled for {display}\nExpires if not started by {latest}"
+        )
 
     def selected_utc(self) -> datetime:
         local = self._selected_local().toPython().replace(second=0, microsecond=0)
@@ -701,24 +689,169 @@ class ScheduleDialog(QDialog):
         return local.astimezone(timezone.utc)
 
     def latest_start_utc(self) -> datetime:
-        local = self._latest_local().toPython().replace(second=0, microsecond=0)
-        if local.tzinfo is None:
-            local = local.astimezone()
-        return local.astimezone(timezone.utc)
+        return self.selected_utc() + timedelta(minutes=self.timeout_minutes)
 
     @Slot()
     def _accept_if_future(self) -> None:
         if self.selected_utc() <= datetime.now(timezone.utc):
             QMessageBox.critical(self, "Invalid schedule", "Choose a future date and time.")
             return
-        if self.latest_start_utc() <= self.selected_utc():
-            QMessageBox.critical(
-                self,
-                "Invalid schedule",
-                "Latest start must be later than the scheduled time.",
-            )
-            return
         self.accept()
+
+
+class ImmediateHelpButton(QToolButton):
+    """Draw a theme-aware circular help control with an immediate tooltip."""
+
+    def __init__(self, help_text: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setText("?")
+        tooltip_text = escape(help_text).replace("\n", "<br>")
+        self.setToolTip(f'<div style="font-size: 12pt;">{tooltip_text}</div>')
+        self.setFixedSize(22, 22)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        palette = self.palette()
+        outline = (
+            palette.color(QPalette.ColorRole.Highlight)
+            if self.hasFocus()
+            else palette.color(QPalette.ColorRole.Mid)
+        )
+        painter.setPen(QPen(outline, 1))
+        painter.setBrush(palette.color(QPalette.ColorRole.Mid))
+        painter.drawEllipse(self.rect().adjusted(1, 1, -2, -2))
+        dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+        painter.setPen(QColor("#ffffff" if dark else "#202124"))
+        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.end()
+
+    def enterEvent(self, event: QEnterEvent) -> None:
+        super().enterEvent(event)
+        QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
+    def focusInEvent(self, event: QFocusEvent) -> None:
+        super().focusInEvent(event)
+        QToolTip.showText(self.mapToGlobal(self.rect().bottomLeft()), self.toolTip(), self)
+
+    def focusOutEvent(self, event: QFocusEvent) -> None:
+        QToolTip.hideText()
+        super().focusOutEvent(event)
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.ToolTip:
+            return True
+        return super().event(event)
+
+
+class PreferencesDialog(QDialog):
+    """Edit appearance, Live Output display, and run defaults."""
+
+    def __init__(
+        self,
+        theme_mode: str,
+        timeout_minutes: int,
+        stop_on_first_failure: bool,
+        live_output_mode: str,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+        self.setMinimumWidth(390)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.theme_combo = QComboBox()
+        for label, mode in (
+            ("System", THEME_SYSTEM),
+            ("Light", THEME_LIGHT),
+            ("Dark", THEME_DARK),
+        ):
+            self.theme_combo.addItem(label, mode)
+        form.addRow("Theme", self.theme_combo)
+        self.timeout_combo = QComboBox()
+        for label, minutes in SCHEDULE_TIMEOUT_CHOICES:
+            self.timeout_combo.addItem(label, minutes)
+        timeout_field = QWidget()
+        timeout_field_layout = QHBoxLayout(timeout_field)
+        timeout_field_layout.setContentsMargins(0, 0, 0, 0)
+        timeout_field_layout.setSpacing(4)
+        timeout_text = QLabel("Scheduled batch timeout")
+        timeout_text.setBuddy(self.timeout_combo)
+        timeout_field_layout.addWidget(self.timeout_combo, 1)
+        self.timeout_help_button = ImmediateHelpButton(
+            "A scheduled batch expires if it has not started within this time after its scheduled start."
+        )
+        self.timeout_help_button.setAccessibleName("Scheduled batch timeout help")
+        timeout_field_layout.addWidget(self.timeout_help_button)
+        form.addRow(timeout_text, timeout_field)
+        self.failure_combo = QComboBox()
+        self.failure_combo.addItem("Continue with remaining devices", False)
+        self.failure_combo.addItem("Stop after first failure", True)
+        form.addRow("When a device fails", self.failure_combo)
+        self.live_output_mode_combo = QComboBox()
+        self.live_output_mode_combo.addItem("By batch", LIVE_OUTPUT_BY_BATCH)
+        self.live_output_mode_combo.addItem("By device", LIVE_OUTPUT_BY_DEVICE)
+        live_output_field = QWidget()
+        live_output_field_layout = QHBoxLayout(live_output_field)
+        live_output_field_layout.setContentsMargins(0, 0, 0, 0)
+        live_output_field_layout.setSpacing(4)
+        live_output_text = QLabel("Live Output")
+        live_output_text.setBuddy(self.live_output_mode_combo)
+        live_output_field_layout.addWidget(self.live_output_mode_combo, 1)
+        self.live_output_help_button = ImmediateHelpButton(
+            "By batch keeps output from all devices.\n"
+            "By device clears Live Output when the next device starts."
+        )
+        self.live_output_help_button.setAccessibleName("Live Output help")
+        live_output_field_layout.addWidget(self.live_output_help_button)
+        form.addRow(live_output_text, live_output_field)
+        layout.addLayout(form)
+        self.set_values(
+            theme_mode, timeout_minutes, stop_on_first_failure, live_output_mode
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def set_values(
+        self,
+        theme_mode: str,
+        timeout_minutes: int,
+        stop_on_first_failure: bool,
+        live_output_mode: str,
+    ) -> None:
+        self.theme_combo.setCurrentIndex(
+            self.theme_combo.findData(normalize_theme_mode(theme_mode))
+        )
+        self.timeout_combo.setCurrentIndex(
+            self.timeout_combo.findData(timeout_minutes)
+        )
+        self.failure_combo.setCurrentIndex(
+            self.failure_combo.findData(stop_on_first_failure)
+        )
+        self.live_output_mode_combo.setCurrentIndex(
+            self.live_output_mode_combo.findData(live_output_mode)
+        )
+
+    def theme_mode(self) -> str:
+        return str(self.theme_combo.currentData())
+
+    def timeout_minutes(self) -> int:
+        return int(self.timeout_combo.currentData())
+
+    def stop_on_first_failure(self) -> bool:
+        return bool(self.failure_combo.currentData())
+
+    def live_output_mode(self) -> str:
+        return str(self.live_output_mode_combo.currentData())
 
 
 class IdleSleepInhibitor(QObject):
@@ -806,6 +939,48 @@ class MainWindow(QMainWindow):
         self._job_results: dict[str, BatchResult] = {}
         self._job_rows: dict[str, list[list[str]]] = {}
         self._job_progress: dict[str, tuple[int, int, str, str]] = {}
+        self._live_output_job_id: Optional[str] = None
+        self._live_output_batch_name = ""
+        self._live_output_device_address: Optional[str] = None
+        self._live_output_text = ""
+        live_output_mode = self.settings.value(
+            LIVE_OUTPUT_MODE_KEY, LIVE_OUTPUT_BY_BATCH, str
+        )
+        self._live_output_mode = (
+            live_output_mode
+            if live_output_mode in {LIVE_OUTPUT_BY_BATCH, LIVE_OUTPUT_BY_DEVICE}
+            else LIVE_OUTPUT_BY_BATCH
+        )
+        stored_font_percent = self.settings.value(LIVE_OUTPUT_FONT_PERCENT_KEY)
+        try:
+            font_percent = (
+                int(stored_font_percent) if stored_font_percent is not None else 100
+            )
+        except (TypeError, ValueError):
+            font_percent = 100
+        valid_font_percent = font_percent in range(
+            LIVE_OUTPUT_FONT_MIN, LIVE_OUTPUT_FONT_MAX + 1, LIVE_OUTPUT_FONT_STEP
+        )
+        if (
+            stored_font_percent is not None
+            and valid_font_percent
+            and self.settings.value(LIVE_OUTPUT_FONT_BASE_VERSION_KEY, 1, type=int)
+            < LIVE_OUTPUT_FONT_BASE_VERSION
+        ):
+            # Keep existing users near their previous visual size after rebasing 100%.
+            font_percent = round(
+                font_percent / LIVE_OUTPUT_FONT_BASE_SCALE / LIVE_OUTPUT_FONT_STEP
+            ) * LIVE_OUTPUT_FONT_STEP
+            font_percent = min(LIVE_OUTPUT_FONT_MAX, max(LIVE_OUTPUT_FONT_MIN, font_percent))
+            self.settings.setValue(LIVE_OUTPUT_FONT_PERCENT_KEY, font_percent)
+            self.settings.setValue(
+                LIVE_OUTPUT_FONT_BASE_VERSION_KEY, LIVE_OUTPUT_FONT_BASE_VERSION
+            )
+        self._live_output_font_percent = (
+            font_percent
+            if valid_font_percent
+            else 100
+        )
         self._selected_job_id: Optional[str] = None
         self._active_job_id: Optional[str] = None
         self._editing_job_id: Optional[str] = None
@@ -818,6 +993,7 @@ class MainWindow(QMainWindow):
         self._loading_settings = True
         self._loading_profile = False
         self._close_after_run = False
+        self._terminal_close_requested = False
         self._closing = False
         self._rows: dict[str, int] = {}
         self._last_inventory_import = ""
@@ -825,8 +1001,10 @@ class MainWindow(QMainWindow):
         self._last_credential_import = ""
         self._credential_file: Optional[Path] = None
         self._history_ui_built = False
+        self.terminal_pane: Optional[QWidget] = None
         self._dictionary_ui_built = False
         self.dictionary_dialog: Optional[QDialog] = None
+        self.preferences_dialog: Optional[PreferencesDialog] = None
         self._converter_ui_built = False
         self.converter_dialog: Optional[QDialog] = None
         self._converter_result: Optional[ConversionResult] = None
@@ -993,6 +1171,9 @@ class MainWindow(QMainWindow):
         self.manage_profiles_button = QPushButton("Manage Profiles…")
         self.manage_profiles_button.clicked.connect(self.manage_profiles)
         self.output_edit, output_row = self._path_row("Choose output folder…", self._choose_output)
+        self.output_mode_combo = QComboBox()
+        self.output_mode_combo.addItem("One file per device", OUTPUT_PER_DEVICE)
+        self.output_mode_combo.addItem("One file per batch", OUTPUT_SINGLE_FILE)
 
         self.device_type_combo = QComboBox()
         self.device_type_combo.setEditable(True)
@@ -1019,6 +1200,10 @@ class MainWindow(QMainWindow):
         command_inputs_layout.addWidget(self.device_type_combo, 3, 1)
         command_inputs_layout.addWidget(output_label, 8, 0)
         command_inputs_layout.addWidget(output_row, 8, 1)
+        output_mode_label = QLabel("Output files")
+        output_mode_label.setBuddy(self.output_mode_combo)
+        command_inputs_layout.addWidget(output_mode_label, 9, 0)
+        command_inputs_layout.addWidget(self.output_mode_combo, 9, 1)
 
         form.addRow(self.command_inputs_container)
 
@@ -1061,7 +1246,7 @@ class MainWindow(QMainWindow):
         self.queue_table.setHorizontalHeaderLabels(
             [
                 "Order", "Batch", "Device Type", "Devices", "Commands",
-                "Run At", "Latest Start", "Status", "Result",
+                "Run", "Expires", "Status", "Result",
             ]
         )
         self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1084,7 +1269,7 @@ class MainWindow(QMainWindow):
         self.edit_batch_button = QPushButton("Edit Batch")
         self.reschedule_button = QPushButton("Reschedule…")
         self.retry_button = QPushButton("Retry")
-        self.retry_failed_button = QPushButton("Retry Failed Devices…")
+        self.retry_failed_button = QPushButton("Retry Failed/Skipped Devices…")
         self.remove_batch_button = QPushButton("Remove")
         self.clear_completed_button = QPushButton("Clear Completed")
         self.pause_queue_button.clicked.connect(self.toggle_queue_pause)
@@ -1155,6 +1340,52 @@ class MainWindow(QMainWindow):
 
         self.results_tabs.addTab(queue_tab, "Queue")
         self.results_tabs.addTab(device_results_tab, "Device Results")
+        live_output_tab = QWidget()
+        live_output_layout = QVBoxLayout(live_output_tab)
+        self.live_output_batch_label = QLabel("No live batch has run in this session")
+        live_output_layout.addWidget(self.live_output_batch_label)
+        warning = QLabel("Live output may contain passwords or other sensitive text.")
+        warning.setWordWrap(True)
+        output_controls = QHBoxLayout()
+        output_controls.addWidget(warning, 1)
+        output_controls.addStretch()
+        output_controls.addWidget(QLabel("Text size"))
+        self.live_output_smaller_button = QToolButton()
+        self.live_output_smaller_button.setText("-")
+        self.live_output_smaller_button.setAccessibleName("Decrease live output text size")
+        self.live_output_smaller_button.setToolTip("Decrease live output text size")
+        self.live_output_smaller_button.setFixedWidth(28)
+        self.live_output_smaller_button.clicked.connect(
+            lambda: self._change_live_output_font_size(-LIVE_OUTPUT_FONT_STEP)
+        )
+        output_controls.addWidget(self.live_output_smaller_button)
+        self.live_output_font_percent_label = QLabel()
+        self.live_output_font_percent_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.live_output_font_percent_label.setMinimumWidth(44)
+        output_controls.addWidget(self.live_output_font_percent_label)
+        self.live_output_larger_button = QToolButton()
+        self.live_output_larger_button.setText("+")
+        self.live_output_larger_button.setAccessibleName("Increase live output text size")
+        self.live_output_larger_button.setToolTip("Increase live output text size")
+        self.live_output_larger_button.setFixedWidth(28)
+        self.live_output_larger_button.clicked.connect(
+            lambda: self._change_live_output_font_size(LIVE_OUTPUT_FONT_STEP)
+        )
+        output_controls.addWidget(self.live_output_larger_button)
+        live_output_layout.addLayout(output_controls)
+        self.live_output_edit = QPlainTextEdit()
+        self.live_output_edit.setReadOnly(True)
+        self.live_output_edit.setUndoRedoEnabled(False)
+        self.live_output_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self._live_output_base_font = QFontDatabase.systemFont(
+            QFontDatabase.SystemFont.FixedFont
+        )
+        self._apply_live_output_font_size()
+        self.live_output_edit.setPlaceholderText(
+            "Commands and switch replies will appear here while a batch runs."
+        )
+        live_output_layout.addWidget(self.live_output_edit, 1)
+        self.results_tabs.addTab(live_output_tab, "Live Output")
         self.results_tabs.currentChanged.connect(self._results_tab_changed)
         results_layout.addWidget(self.results_tabs, 1)
 
@@ -1166,6 +1397,13 @@ class MainWindow(QMainWindow):
         self.history_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.history_layout.addWidget(self.history_placeholder, 1)
 
+        self.terminal_tab = QWidget()
+        self.terminal_layout = QVBoxLayout(self.terminal_tab)
+        self.terminal_layout.setContentsMargins(0, 0, 0, 0)
+        self.terminal_placeholder = QLabel("Open Terminal to connect to one device.")
+        self.terminal_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.terminal_layout.addWidget(self.terminal_placeholder, 1)
+
         self.main_splitter.addWidget(settings_panel)
         self.main_splitter.addWidget(results_panel)
         self.main_splitter.setStretchFactor(0, 0)
@@ -1173,7 +1411,8 @@ class MainWindow(QMainWindow):
         self.main_splitter.setSizes([480, 900])
         ssh_layout.addWidget(self.main_splitter)
 
-        self.main_tabs.addTab(ssh_tab, "SSH")
+        self.main_tabs.addTab(ssh_tab, "Batch")
+        self.main_tabs.addTab(self.terminal_tab, "Terminal")
         self.main_tabs.addTab(self.history_tab, "History")
         self.main_tabs.currentChanged.connect(self._main_tab_changed)
         self.main_tabs.setCurrentWidget(ssh_tab)
@@ -1190,36 +1429,75 @@ class MainWindow(QMainWindow):
         self._update_destructive_button_styles()
 
     def _build_menu(self) -> None:
-        self.view_menu = self.menuBar().addMenu("&View")
-        self.theme_menu = self.view_menu.addMenu("&Theme")
-        self.theme_action_group = QActionGroup(self)
-        self.theme_action_group.setExclusive(True)
-        self.theme_actions: dict[str, QAction] = {}
-        for mode, label in (
-            (THEME_SYSTEM, "System"),
-            (THEME_LIGHT, "Light"),
-            (THEME_DARK, "Dark"),
-        ):
-            action = QAction(label, self)
-            action.setCheckable(True)
-            action.setData(mode)
-            action.setChecked(mode == self._theme_mode)
-            action.triggered.connect(
-                lambda checked=False, selected=mode: self._select_theme(
-                    selected, checked
-                )
-            )
-            self.theme_action_group.addAction(action)
-            self.theme_menu.addAction(action)
-            self.theme_actions[mode] = action
-        self.theme_system_action = self.theme_actions[THEME_SYSTEM]
-        self.theme_light_action = self.theme_actions[THEME_LIGHT]
-        self.theme_dark_action = self.theme_actions[THEME_DARK]
+        self.settings_menu = self.menuBar().addMenu("&Settings")
+        self.preferences_action = QAction("Preferences…", self)
+        self.preferences_action.setMenuRole(QAction.MenuRole.NoRole)
+        self.preferences_action.triggered.connect(self._open_preferences)
+        self.settings_menu.addAction(self.preferences_action)
 
-    @Slot(str, bool)
-    def _select_theme(self, mode: str, checked: bool = True) -> None:
-        if not checked:
+    def _scheduled_timeout_minutes(self) -> int:
+        value = self.settings.value(
+            SCHEDULE_TIMEOUT_KEY, DEFAULT_SCHEDULE_TIMEOUT_MINUTES
+        )
+        try:
+            minutes = int(value)
+        except (TypeError, ValueError):
+            return DEFAULT_SCHEDULE_TIMEOUT_MINUTES
+        return (
+            minutes
+            if minutes in SCHEDULE_TIMEOUT_OPTIONS
+            else DEFAULT_SCHEDULE_TIMEOUT_MINUTES
+        )
+
+    def _stop_on_first_failure(self) -> bool:
+        return self.settings.value(STOP_ON_FIRST_FAILURE_KEY, False, type=bool)
+
+    @Slot()
+    def _open_preferences(self) -> None:
+        if self.preferences_dialog is None:
+            self.preferences_dialog = PreferencesDialog(
+                self._theme_mode,
+                self._scheduled_timeout_minutes(),
+                self._stop_on_first_failure(),
+                self._live_output_mode,
+                self,
+            )
+            self.preferences_dialog.accepted.connect(self._save_preferences)
+        self.preferences_dialog.set_values(
+            self._theme_mode,
+            self._scheduled_timeout_minutes(),
+            self._stop_on_first_failure(),
+            self._live_output_mode,
+        )
+        self.preferences_dialog.show()
+        self.preferences_dialog.raise_()
+        self.preferences_dialog.activateWindow()
+
+    @Slot()
+    def _save_preferences(self) -> None:
+        if self.preferences_dialog is None:
             return
+        self.settings.setValue(
+            SCHEDULE_TIMEOUT_KEY, self.preferences_dialog.timeout_minutes()
+        )
+        self.settings.setValue(
+            STOP_ON_FIRST_FAILURE_KEY,
+            self.preferences_dialog.stop_on_first_failure(),
+        )
+        mode = self.preferences_dialog.live_output_mode()
+        self.settings.setValue(LIVE_OUTPUT_MODE_KEY, mode)
+        if mode != self._live_output_mode:
+            self._live_output_mode = mode
+            if mode == LIVE_OUTPUT_BY_BATCH:
+                self.live_output_batch_label.setText(
+                    self._live_output_batch_name or "No live batch has run in this session"
+                )
+            else:
+                self._live_output_device_address = None
+        self._select_theme(self.preferences_dialog.theme_mode())
+
+    @Slot(str)
+    def _select_theme(self, mode: str) -> None:
         app = QApplication.instance()
         if app is None:
             return
@@ -1229,6 +1507,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("appearance/theme", self._theme_mode)
         self.settings.sync()
         self._update_destructive_button_styles()
+        self._refresh_failed_status_colors()
         self._refresh_results_attention_color()
         if self._history_ui_built and hasattr(self, "history_table"):
             self._refresh_history()
@@ -1880,6 +2159,7 @@ class MainWindow(QMainWindow):
         self.username_edit.textChanged.connect(self._credentials_edited)
         self.password_edit.textChanged.connect(self._credentials_edited)
         self.output_edit.textChanged.connect(self.invalidate_validation)
+        self.output_mode_combo.currentIndexChanged.connect(self.invalidate_validation)
         self.inventory_text_edit.textChanged.connect(self.invalidate_validation)
         self.inventory_text_edit.textChanged.connect(self._update_clear_devices_button)
         self.exec_commands_edit.textChanged.connect(self.invalidate_validation)
@@ -1917,6 +2197,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("paths/credential_import", self._last_credential_import)
         self.settings.setValue("paths/output", self.output_edit.text().strip())
         self.settings.setValue("run/device_type", self.device_type_combo.currentText().strip())
+        if self.terminal_pane is not None:
+            terminal_device_type = self.terminal_pane.device_type_combo.currentText().strip()
+            if terminal_device_type:
+                self.settings.setValue(TERMINAL_DEVICE_TYPE_KEY, terminal_device_type)
         self.settings.setValue("window/main_splitter", self.main_splitter.saveState())
         self.settings.remove("run/failure_patterns")
         self.settings.sync()
@@ -2037,6 +2321,8 @@ class MainWindow(QMainWindow):
             self._switch_to_manual(clear_credentials=True)
             self.validation_label.setText("Select a profile or enter credentials manually.")
         self._save_settings()
+        if self.terminal_pane is not None:
+            self.terminal_pane.refresh_profiles()
 
     @Slot()
     def invalidate_validation(self) -> None:
@@ -2103,6 +2389,8 @@ class MainWindow(QMainWindow):
             config_commands_text=(
                 self.config_commands_edit.toPlainText() if include_commands else None
             ),
+            stop_on_first_failure=self._stop_on_first_failure(),
+            output_mode=str(self.output_mode_combo.currentData()),
         )
 
     def _credential_environment(self) -> dict[str, str]:
@@ -2262,10 +2550,29 @@ class MainWindow(QMainWindow):
             item = QTableWidgetItem()
             self.device_table.setItem(row, column, item)
         item.setText(value)
-        if column == 4:
+        if column == 1:
+            self._style_device_status(item)
+        elif column == 4:
             item.setToolTip("Double-click to view the full result" if value else "")
         elif column == 5:
             item.setToolTip("Double-click to open this output file" if value else "")
+
+    def _style_device_status(self, item: QTableWidgetItem) -> None:
+        if item.text().casefold() == "failed":
+            app = QApplication.instance()
+            palette = app.palette() if app is not None else self.palette()
+            dark = palette.color(QPalette.ColorRole.Window).lightness() < 128
+            item.setForeground(QBrush(QColor("#ff6b6b" if dark else "#c62828")))
+        else:
+            item.setData(Qt.ItemDataRole.ForegroundRole, None)
+
+    def _refresh_failed_status_colors(self) -> None:
+        if not hasattr(self, "device_table"):
+            return
+        for row in range(self.device_table.rowCount()):
+            item = self.device_table.item(row, 1)
+            if item is not None and item.text().casefold() == "failed":
+                self._style_device_status(item)
 
     @Slot(int, int)
     def handle_table_double_click(self, row: int, column: int) -> None:
@@ -2347,7 +2654,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def schedule_batch(self) -> None:
-        dialog = ScheduleDialog(parent=self)
+        dialog = ScheduleDialog(
+            timeout_minutes=self._scheduled_timeout_minutes(), parent=self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._submit_batch(
@@ -2371,7 +2680,7 @@ class MainWindow(QMainWindow):
             schedule_text = (
                 "\nScheduled for "
                 f"{scheduled_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
-                "Must start by "
+                "Expires if not started by "
                 f"{latest_start_utc.astimezone().strftime('%Y-%m-%d %H:%M')}.\n"
             )
         answer = QMessageBox.warning(
@@ -2452,6 +2761,7 @@ class MainWindow(QMainWindow):
         self.queue_controller.mark_running(job.job_id)
         self._start_audit_record(job, payload, prepared)
         self._active_job_id = job.job_id
+        self._begin_live_output(job.job_id, job.name)
         self._selected_job_id = job.job_id
         self._refresh_queue_table(select_job_id=job.job_id)
         self._show_job_results(job.job_id)
@@ -2561,7 +2871,11 @@ class MainWindow(QMainWindow):
             self._batch_result = None
         self._token = CancellationToken()
         self._thread = QThread(self)
-        self._worker = BatchWorker(prepared, self._token, operation=operation)
+        job = self.queue_controller.job(job_id) if job_id else None
+        self._worker = BatchWorker(
+            prepared, self._token, operation=operation,
+            batch_name=job.name if job else "",
+        )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.event.connect(self.handle_progress)
@@ -2625,18 +2939,102 @@ class MainWindow(QMainWindow):
             self._set_cell(row, 5, event.transcript_file)
             self.progress_bar.setValue(event.index)
 
+    def _begin_live_output(self, job_id: str, batch_name: str) -> None:
+        self._live_output_job_id = job_id
+        self._live_output_batch_name = batch_name
+        self._live_output_device_address = None
+        self._live_output_text = ""
+        self.live_output_batch_label.setText(batch_name)
+        self.live_output_edit.clear()
+
+    def _focus_live_output_device(self, address: str) -> None:
+        if (
+            self._live_output_mode != LIVE_OUTPUT_BY_DEVICE
+            or not address
+            or self._live_output_device_address == address
+        ):
+            return
+        self._live_output_device_address = address
+        self._live_output_text = ""
+        self.live_output_edit.clear()
+        self.live_output_batch_label.setText(
+            f"{self._live_output_batch_name} — {address}"
+        )
+
+    def _apply_live_output_font_size(self) -> None:
+        font = QFont(self._live_output_base_font)
+        scale = LIVE_OUTPUT_FONT_BASE_SCALE * self._live_output_font_percent / 100
+        if font.pointSizeF() > 0:
+            font.setPointSizeF(font.pointSizeF() * scale)
+        else:
+            font.setPixelSize(max(1, round(font.pixelSize() * scale)))
+        self.live_output_edit.setFont(font)
+        self.live_output_font_percent_label.setText(f"{self._live_output_font_percent}%")
+        self.live_output_smaller_button.setEnabled(
+            self._live_output_font_percent > LIVE_OUTPUT_FONT_MIN
+        )
+        self.live_output_larger_button.setEnabled(
+            self._live_output_font_percent < LIVE_OUTPUT_FONT_MAX
+        )
+
+    def _change_live_output_font_size(self, amount: int) -> None:
+        percent = min(
+            LIVE_OUTPUT_FONT_MAX,
+            max(LIVE_OUTPUT_FONT_MIN, self._live_output_font_percent + amount),
+        )
+        if percent == self._live_output_font_percent:
+            return
+        self._live_output_font_percent = percent
+        self._apply_live_output_font_size()
+        self.settings.setValue(LIVE_OUTPUT_FONT_PERCENT_KEY, percent)
+        self.settings.setValue(
+            LIVE_OUTPUT_FONT_BASE_VERSION_KEY, LIVE_OUTPUT_FONT_BASE_VERSION
+        )
+
+    def _append_live_output(self, text: str) -> None:
+        if not text:
+            return
+        scrollbar = self.live_output_edit.verticalScrollBar()
+        follow = scrollbar.value() >= scrollbar.maximum() - 2
+        previous_position = scrollbar.value()
+        updated = self._live_output_text + text
+        if len(updated) > LIVE_OUTPUT_LIMIT:
+            # Leave room so each subsequent small chunk does not rebuild the view.
+            retained = max(1, int(LIVE_OUTPUT_LIMIT * 0.9))
+            self._live_output_text = updated[-retained:]
+            self.live_output_edit.setPlainText(
+                LIVE_OUTPUT_TRUNCATED + self._live_output_text
+            )
+        else:
+            self._live_output_text = updated
+            cursor = self.live_output_edit.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertText(text)
+        scrollbar.setValue(scrollbar.maximum() if follow else previous_position)
+
     def _handle_job_progress(self, job_id: str, event: ProgressEvent) -> None:
+        if self._live_output_job_id == job_id and event.address:
+            self._focus_live_output_device(event.address)
+        if event.kind == "output_chunk":
+            if self._live_output_job_id == job_id:
+                self._append_live_output(event.transcript_chunk)
+            return
         value, maximum, status_text, totals = self._job_progress.get(
             job_id, (0, max(1, event.total), "Queued", "")
         )
         if event.kind == "run_started":
+            if self._live_output_job_id != job_id:
+                job = self.queue_controller.job(job_id)
+                self._begin_live_output(job_id, job.name if job else "Batch")
             value, maximum, status_text = 0, max(1, event.total), "Running"
         elif event.kind == "run_finished":
             status_text, totals = event.message, event.message
+            self._append_live_output(f"\nBatch finished: {event.message}\n")
         elif event.kind == "device_started":
             self._set_job_cell(job_id, event.address, 1, "Starting")
         elif event.kind == "device_status":
             self._set_job_cell(job_id, event.address, 1, event.status.title())
+            self._append_live_output(f"[{event.address}] {event.status.title()}\n")
             if event.section:
                 self._set_job_cell(job_id, event.address, 3, event.section)
         elif event.kind == "command_started":
@@ -2667,6 +3065,10 @@ class MainWindow(QMainWindow):
                 self._set_job_cell(job_id, event.address, 3, event.section)
             self._set_job_cell(job_id, event.address, 4, event.message or shown_status)
             self._set_job_cell(job_id, event.address, 5, event.transcript_file)
+            outcome = f"\n[{event.address}] {event.status.upper()}"
+            if not event.transcript_file and event.message:
+                outcome += f": {event.message}"
+            self._append_live_output(outcome + "\n\n")
             value = event.index
         self._job_progress[job_id] = (value, maximum, status_text, totals)
         if self._selected_job_id == job_id:
@@ -2743,6 +3145,8 @@ class MainWindow(QMainWindow):
     def _run_failed(self, message: str) -> None:
         if self._operation == "run" and self._active_job_id:
             job_id = self._active_job_id
+            if self._live_output_job_id == job_id:
+                self._append_live_output(f"\nBatch failed: {message}\n")
             safe_message = self._safe_history_message(job_id, message)
             self._finalize_audit_record(job_id, "failed", safe_message)
             warning = self.queue_controller.mark_terminal(job_id, "failed", message)
@@ -2780,8 +3184,11 @@ class MainWindow(QMainWindow):
             thread.deleteLater()
         if self._close_after_run:
             self._close_after_run = False
-            self._closing = True
-            QTimer.singleShot(0, self.close)
+            if not (
+                self.terminal_pane is not None and self.terminal_pane.is_active()
+            ):
+                self._closing = True
+                QTimer.singleShot(0, self.close)
         elif finished_operation == "run":
             QTimer.singleShot(0, self._queue_tick)
 
@@ -2810,7 +3217,7 @@ class MainWindow(QMainWindow):
                     if job.scheduled_utc
                     else "Ready now"
                 )
-                latest_start = (
+                expires_at = (
                     job.latest_start_utc.astimezone().strftime("%Y-%m-%d %H:%M")
                     if job.latest_start_utc
                     else "No expiry (legacy)" if job.scheduled_utc else "—"
@@ -2826,7 +3233,7 @@ class MainWindow(QMainWindow):
                     ),
                     QTableWidgetItem(str(job.command_count)),
                     QTableWidgetItem(scheduled),
-                    QTableWidgetItem(latest_start),
+                    QTableWidgetItem(expires_at),
                     QTableWidgetItem(status),
                     QTableWidgetItem(job.result),
                 )
@@ -2870,7 +3277,7 @@ class MainWindow(QMainWindow):
         self.retry_button.setEnabled(bool(job and job.status in {"blocked", "interrupted"}))
         result = self._job_results.get(job.job_id) if job else None
         self.retry_failed_button.setEnabled(
-            bool(result and any(item.status == "failed" for item in result.results))
+            bool(result and any(item.status in {"failed", "skipped"} for item in result.results))
         )
         self.remove_batch_button.setEnabled(bool(job and job.status != "running"))
         self.clear_completed_button.setEnabled(
@@ -2945,6 +3352,9 @@ class MainWindow(QMainWindow):
             self.exec_commands_edit.setPlainText(payload.exec_commands_text)
             self.config_commands_edit.setPlainText(payload.config_commands_text)
             self.output_edit.setText(payload.output_dir)
+            self.output_mode_combo.setCurrentIndex(
+                self.output_mode_combo.findData(payload.output_mode)
+            )
         finally:
             self._loading_settings = False
         self._credential_file = None
@@ -2976,20 +3386,29 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Apply:
             return
         try:
-            payload = BatchPayload.from_prepared(
+            original = self.queue_controller.payload(job_id)
+            prepared = replace(
                 self._prepared,
+                request=replace(
+                    self._prepared.request,
+                    stop_on_first_failure=original.stop_on_first_failure,
+                ),
+            )
+            payload = BatchPayload.from_prepared(
+                prepared,
                 self.profile_combo.currentText() or MANUAL_PROFILE_TEXT,
             )
             self.queue_controller.replace_payload(
                 job_id,
                 payload,
-                self._prepared,
+                prepared,
             )
         except QueueStorageError as exc:
             QMessageBox.critical(self, "Could not save batch", str(exc))
             return
-        self._job_prepared[job_id] = self._prepared
-        self._initialize_job_rows(job_id, self._prepared)
+        self._prepared = prepared
+        self._job_prepared[job_id] = prepared
+        self._initialize_job_rows(job_id, prepared)
         self._finish_batch_edit()
         self._refresh_queue_table(select_job_id=job_id)
         self._show_job_results(job_id)
@@ -3014,9 +3433,9 @@ class MainWindow(QMainWindow):
         if job is None:
             return
         dialog = ScheduleDialog(
-            job.scheduled_utc,
-            job.latest_start_utc,
-            self,
+            initial_utc=job.scheduled_utc,
+            timeout_minutes=self._scheduled_timeout_minutes(),
+            parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3114,12 +3533,14 @@ class MainWindow(QMainWindow):
         commands: Sequence[Command],
         results: Sequence[DeviceResult],
     ) -> None:
-        failed = tuple(result for result in results if result.status == "failed")
-        if not failed:
+        unfinished = tuple(
+            result for result in results if result.status in {"failed", "skipped"}
+        )
+        if not unfinished:
             QMessageBox.critical(
                 self,
                 "Retry unavailable",
-                "This batch has no failed devices to retry.",
+                "This batch has no failed or skipped devices to retry.",
             )
             return
         has_form_content = any(
@@ -3156,12 +3577,15 @@ class MainWindow(QMainWindow):
         self._loading_settings = True
         try:
             self.inventory_text_edit.setPlainText(
-                "\n".join(result.address for result in failed)
+                "\n".join(result.address for result in unfinished)
             )
             self.exec_commands_edit.setPlainText(exec_text)
             self.config_commands_edit.setPlainText(config_text)
             self.device_type_combo.setCurrentText(device_type)
             self.output_edit.setText(str(output_dir))
+            self.output_mode_combo.setCurrentIndex(
+                self.output_mode_combo.findData(OUTPUT_PER_DEVICE)
+            )
         finally:
             self._loading_settings = False
 
@@ -3178,8 +3602,12 @@ class MainWindow(QMainWindow):
         self._selected_job_id = None
         self._prepared = None
         self._set_validated(False)
+        retry_label = (
+            "failed or skipped" if any(item.status == "skipped" for item in unfinished)
+            else "failed"
+        )
         self.validation_label.setText(
-            f"Retry draft created for {len(failed)} failed device(s). "
+            f"Retry draft created for {len(unfinished)} {retry_label} device(s). "
             "Review and validate before running."
         )
         self.main_tabs.setCurrentWidget(self.ssh_tab)
@@ -3261,9 +3689,35 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _main_tab_changed(self, index: int) -> None:
+        if index == self.main_tabs.indexOf(self.terminal_tab):
+            self._ensure_terminal_ui()
         if index == self.main_tabs.indexOf(self.history_tab):
             self._ensure_history_ui()
         self._acknowledge_results_attention_if_visible()
+
+    def _ensure_terminal_ui(self) -> None:
+        if self.terminal_pane is not None:
+            return
+        from terminal_ui import TerminalPane
+
+        pane = TerminalPane(
+            self.profile_store,
+            read_credential_profile,
+            lambda: self.output_edit.text(),
+            initial_profile_id=self.profile_combo.currentData(),
+            initial_username=self.username_edit.text(),
+            initial_password=self.password_edit.text(),
+            initial_device_type=(
+                self.settings.value(TERMINAL_DEVICE_TYPE_KEY, "", str).strip()
+                or self.device_type_combo.currentText()
+            ),
+            manage_profiles=self.manage_profiles,
+            parent=self.terminal_tab,
+        )
+        self.terminal_layout.removeWidget(self.terminal_placeholder)
+        self.terminal_placeholder.deleteLater()
+        self.terminal_layout.addWidget(pane)
+        self.terminal_pane = pane
 
     def _device_results_visible(self) -> bool:
         return (
@@ -3307,7 +3761,7 @@ class MainWindow(QMainWindow):
 
     def _set_results_attention_labels(self, pending: bool) -> None:
         self.main_tabs.setTabText(
-            self.main_tabs.indexOf(self.ssh_tab), "SSH •" if pending else "SSH"
+            self.main_tabs.indexOf(self.ssh_tab), "Batch •" if pending else "Batch"
         )
         self.results_tabs.setTabText(
             1, "Device Results •" if pending else "Device Results"
@@ -3877,7 +4331,7 @@ class MainWindow(QMainWindow):
         actions = QGridLayout()
         self.history_results_button = QPushButton("View Device Results")
         self.history_commands_button = QPushButton("View Commands")
-        self.history_retry_failed_button = QPushButton("Retry Failed Devices…")
+        self.history_retry_failed_button = QPushButton("Retry Failed/Skipped Devices…")
         self.history_output_button = QPushButton("Open Output Folder")
         self.history_summary_button = QPushButton("Open Summary")
         self.history_remove_button = QPushButton("Remove from History")
@@ -4027,7 +4481,7 @@ class MainWindow(QMainWindow):
             result_devices = (
                 record.success_count + record.failure_count + record.cancelled_count
             )
-            devices = result_devices or record.valid_devices + record.invalid_devices
+            devices = max(result_devices, record.valid_devices + record.invalid_devices)
             result_text = record.result_text
             if record.summary_path and not Path(record.summary_path).is_file():
                 result_text = (result_text + " — Output unavailable").strip(" —")
@@ -4484,6 +4938,7 @@ class MainWindow(QMainWindow):
         }:
             if hasattr(self, "cancel_button"):
                 self._update_destructive_button_styles()
+                self._refresh_failed_status_colors()
             if hasattr(self, "results_attention_timer"):
                 self._refresh_results_attention_color()
             if self._history_ui_built and hasattr(self, "history_table"):
@@ -4721,6 +5176,8 @@ class MainWindow(QMainWindow):
             self._save_settings()
             if self.dictionary_dialog is not None:
                 self.dictionary_dialog.hide()
+            if self.preferences_dialog is not None:
+                self.preferences_dialog.hide()
             if self.converter_dialog is not None:
                 self.converter_dialog.hide()
             if hasattr(self, "scheduler_timer"):
@@ -4731,21 +5188,31 @@ class MainWindow(QMainWindow):
                 self.sleep_inhibitor.set_required(False)
             event.accept()
             return
-        if self._running:
+        terminal_active = (
+            self.terminal_pane is not None and self.terminal_pane.is_active()
+        )
+        if self._running or terminal_active:
+            if self._close_after_run or self._terminal_close_requested:
+                event.ignore()
+                return
             answer = QMessageBox.question(
                 self,
                 "Stop active operation?",
-                "The app will stop at the next safe checkpoint and then close. "
+                "The app will stop active work and disconnect terminal sessions before closing. "
                 "Any remaining queued batches will be restored paused next time.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
             if answer == QMessageBox.StandardButton.Yes:
-                self._close_after_run = True
-                self.cancel_run()
+                if self._running:
+                    self._close_after_run = True
+                    self.cancel_run()
+                if terminal_active:
+                    self._terminal_close_requested = True
+                    self.terminal_pane.stop_for_close()
             event.ignore()
             return
-        if self.queue_controller.pending_jobs():
+        if self.queue_controller.pending_jobs() and not self._terminal_close_requested:
             answer = QMessageBox.question(
                 self,
                 "Close with queued batches?",
@@ -4761,6 +5228,8 @@ class MainWindow(QMainWindow):
         self._closing = True
         if self.dictionary_dialog is not None:
             self.dictionary_dialog.hide()
+        if self.preferences_dialog is not None:
+            self.preferences_dialog.hide()
         if self.converter_dialog is not None:
             self.converter_dialog.hide()
         if hasattr(self, "scheduler_timer"):
@@ -4922,7 +5391,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                 history_command_store=MemoryHistoryCommandStore(),
             )
             window.show()
-            app.processEvents()
+            QTimer.singleShot(0, window._ensure_terminal_ui)
+            for _ in range(100):
+                app.processEvents()
+                if window.terminal_pane is not None and window.terminal_pane._ready:
+                    break
+                QThread.msleep(50)
+            else:
+                raise RuntimeError("Bundled Terminal view did not load")
+            if window.main_tabs.currentWidget() is not window.ssh_tab:
+                raise RuntimeError("Terminal preload changed the active tab")
+            window.main_tabs.setCurrentWidget(window.terminal_tab)
+            window.terminal_pane.connection_tabs.setCurrentIndex(1)
+            if not window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("Visible Console did not start port scanning")
+            window.main_tabs.setCurrentWidget(window.ssh_tab)
+            if window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("Hidden Console kept scanning ports")
+            window.main_tabs.setCurrentWidget(window.terminal_tab)
+            if not window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("Console did not resume port scanning")
+            window.terminal_pane.connection_tabs.setCurrentIndex(0)
+            if window.terminal_pane.serial_scan_timer.isActive():
+                raise RuntimeError("SSH mode kept scanning serial ports")
             window._ensure_history_ui()
             window._open_command_dictionary()
             window.dictionary_search_edit.setText("interface")
@@ -4940,6 +5431,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     window = MainWindow(settings)
     window.show()
+    QTimer.singleShot(0, window._ensure_terminal_ui)
     return app.exec()
 
 

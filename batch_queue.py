@@ -11,13 +11,20 @@ from uuid import uuid4
 
 from PySide6.QtCore import QSettings
 
-from run_commands import PreparedRun, RunRequest, prepare_run
+from run_commands import (
+    OUTPUT_MODES,
+    OUTPUT_PER_DEVICE,
+    PreparedRun,
+    RunRequest,
+    prepare_run,
+)
 
 
 KEYCHAIN_SERVICE = "com.sg4291.sshbatchupdate.queue"
 QUEUE_GROUP = "batch_queue/jobs"
 QUEUE_ORDER_KEY = "batch_queue/order"
-PAYLOAD_VERSION = 2
+PENDING_CLEANUP_KEY = "batch_queue/pending_keychain_cleanup"
+PAYLOAD_VERSION = 4
 EDITABLE_STATUSES = {"ready", "scheduled", "blocked", "interrupted"}
 TERMINAL_STATUSES = {
     "succeeded",
@@ -116,6 +123,8 @@ class BatchPayload:
     timeout: int
     failure_patterns: tuple[str, ...] = ()
     profile_label: str = "Manual"
+    stop_on_first_failure: bool = False
+    output_mode: str = OUTPUT_PER_DEVICE
 
     @classmethod
     def from_prepared(
@@ -140,6 +149,8 @@ class BatchPayload:
             timeout=settings.timeout,
             failure_patterns=tuple(request.failure_patterns),
             profile_label=profile_label or "Manual",
+            stop_on_first_failure=request.stop_on_first_failure,
+            output_mode=request.output_mode,
         )
 
     def to_json(self) -> str:
@@ -158,6 +169,8 @@ class BatchPayload:
                 "timeout": self.timeout,
                 "failure_patterns": list(self.failure_patterns),
                 "profile_label": self.profile_label,
+                "stop_on_first_failure": self.stop_on_first_failure,
+                "output_mode": self.output_mode,
             },
             separators=(",", ":"),
         )
@@ -167,8 +180,14 @@ class BatchPayload:
         try:
             data = json.loads(value)
             version = int(data.get("version", 0))
-            if version not in {1, PAYLOAD_VERSION}:
+            if version not in {1, 2, 3, PAYLOAD_VERSION}:
                 raise ValueError("unsupported payload version")
+            stop_on_first_failure = data.get("stop_on_first_failure", False)
+            if not isinstance(stop_on_first_failure, bool):
+                raise ValueError("invalid stop_on_first_failure value")
+            output_mode = data.get("output_mode", OUTPUT_PER_DEVICE)
+            if output_mode not in OUTPUT_MODES:
+                raise ValueError("invalid output_mode value")
             return cls(
                 inventory_text=str(data["inventory_text"]),
                 exec_commands_text=str(data["exec_commands_text"]),
@@ -185,9 +204,11 @@ class BatchPayload:
                 failure_patterns=tuple(str(item) for item in data.get("failure_patterns", [])),
                 profile_label=(
                     str(data.get("profile_label") or "Manual")
-                    if version == PAYLOAD_VERSION
+                    if version >= 2
                     else "Unknown (legacy)"
                 ),
+                stop_on_first_failure=stop_on_first_failure,
+                output_mode=output_mode,
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise QueueStorageError(f"The stored batch payload is invalid: {exc}") from exc
@@ -204,6 +225,8 @@ class BatchPayload:
             inventory_text=self.inventory_text,
             exec_commands_text=self.exec_commands_text,
             config_commands_text=self.config_commands_text,
+            stop_on_first_failure=self.stop_on_first_failure,
+            output_mode=self.output_mode,
         )
         return prepare_run(
             request,
@@ -313,6 +336,29 @@ class QueueMetadataStore:
             self._save_job(job)
         self.settings.sync()
 
+    def pending_cleanup_ids(self) -> list[str]:
+        raw = self.settings.value(PENDING_CLEANUP_KEY, [])
+        if isinstance(raw, str):
+            return [raw] if raw else []
+        return list(dict.fromkeys(str(job_id) for job_id in (raw or []) if job_id))
+
+    def add_pending_cleanup(self, job_id: str) -> None:
+        pending = self.pending_cleanup_ids()
+        if job_id not in pending:
+            self.settings.setValue(PENDING_CLEANUP_KEY, pending + [job_id])
+            self.settings.sync()
+
+    def remove_pending_cleanup(self, job_id: str) -> None:
+        pending = self.pending_cleanup_ids()
+        if job_id not in pending:
+            return
+        remaining = [item for item in pending if item != job_id]
+        if remaining:
+            self.settings.setValue(PENDING_CLEANUP_KEY, remaining)
+        else:
+            self.settings.remove(PENDING_CLEANUP_KEY)
+        self.settings.sync()
+
     def _save_job(self, job: QueuedBatch) -> None:
         base = f"{QUEUE_GROUP}/{job.job_id}"
         self.settings.setValue(f"{base}/name", job.name)
@@ -350,7 +396,33 @@ class QueueController:
         self.restored = bool(self.jobs)
         self.paused = self.restored
         self.active_job_id: Optional[str] = None
-        self.cleanup_warnings = self.refresh_due()
+        self._deleted_payload_ids: set[str] = set()
+        self.cleanup_warnings = self._retry_pending_cleanup() + self.refresh_due()
+
+    def _delete_payload(self, job_id: str, *, persist_failure: bool) -> None:
+        if job_id in self._deleted_payload_ids:
+            return
+        try:
+            self.secret_store.delete(job_id)
+        except QueueStorageError:
+            if persist_failure:
+                self.metadata_store.add_pending_cleanup(job_id)
+            raise
+        self._deleted_payload_ids.add(job_id)
+        self.metadata_store.remove_pending_cleanup(job_id)
+
+    def _retry_pending_cleanup(self) -> list[str]:
+        warnings: list[str] = []
+        for job_id in self.metadata_store.pending_cleanup_ids():
+            if self.job(job_id) is not None:
+                # A crash can leave a live queue row alongside a cleanup record.
+                # The row still owns its payload until it becomes terminal.
+                continue
+            try:
+                self._delete_payload(job_id, persist_failure=True)
+            except QueueStorageError as exc:
+                warnings.append(str(exc))
+        return warnings
 
     def add(
         self,
@@ -364,11 +436,11 @@ class QueueController:
         latest_start = _as_utc(latest_start_utc) if latest_start_utc else None
         if scheduled is not None:
             if latest_start is None:
-                raise QueueStorageError("A scheduled batch requires a latest-start time.")
+                raise QueueStorageError("A scheduled batch requires an expiry time.")
             if latest_start <= scheduled:
-                raise QueueStorageError("Latest start must be later than the scheduled time.")
+                raise QueueStorageError("Expiry must be later than the scheduled time.")
         elif latest_start is not None:
-            raise QueueStorageError("A Run Live batch cannot have a latest-start time.")
+            raise QueueStorageError("A Run Live batch cannot have an expiry time.")
         job_id = uuid4().hex
         job = QueuedBatch(
             job_id=job_id,
@@ -441,10 +513,10 @@ class QueueController:
                 job = replace(
                     job,
                     status="expired",
-                    result=f"Not started: latest start passed at {local_deadline}",
+                    result=f"Not started: scheduled batch timeout reached at {local_deadline}",
                 )
                 try:
-                    self.secret_store.delete(job.job_id)
+                    self._delete_payload(job.job_id, persist_failure=True)
                 except QueueStorageError as exc:
                     warnings.append(str(exc))
                 changed = True
@@ -485,10 +557,10 @@ class QueueController:
         updated = replace(self._required(job_id), status=status, result=result)
         if self.active_job_id == job_id:
             self.active_job_id = None
-        self._replace(updated)
+        self.jobs = [updated if job.job_id == job_id else job for job in self.jobs]
         warning = None
         try:
-            self.secret_store.delete(job_id)
+            self._delete_payload(job_id, persist_failure=True)
         except QueueStorageError as exc:
             warning = str(exc)
         self.metadata_store.save_all(self.jobs)
@@ -517,7 +589,7 @@ class QueueController:
         scheduled = _as_utc(scheduled_utc)
         latest_start = _as_utc(latest_start_utc)
         if latest_start <= scheduled:
-            raise QueueStorageError("Latest start must be later than the scheduled time.")
+            raise QueueStorageError("Expiry must be later than the scheduled time.")
         now = _as_utc(self.clock())
         updated = replace(
             job,
@@ -546,9 +618,11 @@ class QueueController:
         job = self._required(job_id)
         if job.status == "running":
             raise QueueStorageError("A running batch cannot be removed.")
-        # Terminal jobs normally have no payload, but retry deletion so a prior
-        # Keychain cleanup failure cannot leave sensitive data behind.
-        self.secret_store.delete(job_id)
+        # A successful terminal cleanup is known for this session; failed
+        # cleanup remains retryable without losing a live batch payload.
+        self._delete_payload(
+            job_id, persist_failure=job.status in TERMINAL_STATUSES
+        )
         self.jobs = [job for job in self.jobs if job.job_id != job_id]
         self.metadata_store.save_all(self.jobs)
 
@@ -561,9 +635,7 @@ class QueueController:
         completed = self.completed_jobs()
         completed_ids = [job.job_id for job in completed]
         for job_id in completed_ids:
-            # Usually already deleted by mark_terminal; retrying also resolves a
-            # previous Keychain cleanup failure before hiding the history entry.
-            self.secret_store.delete(job_id)
+            self._delete_payload(job_id, persist_failure=True)
         completed_set = set(completed_ids)
         self.jobs = [job for job in self.jobs if job.job_id not in completed_set]
         self.metadata_store.save_all(self.jobs)

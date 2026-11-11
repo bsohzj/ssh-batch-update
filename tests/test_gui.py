@@ -4,13 +4,13 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
     from PySide6.QtCore import QEvent, QPointF, Qt, QSettings, QTime
-    from PySide6.QtGui import QCloseEvent, QColor, QPalette
+    from PySide6.QtGui import QCloseEvent, QColor, QEnterEvent, QPalette
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
 
@@ -65,6 +65,12 @@ class MainWindowTests(unittest.TestCase):
         self.window.password_edit.setText("secret")
         self.window.output_edit.setText(str(self.base / "outputs"))
         self.window.device_type_combo.setCurrentText("cisco_ios")
+
+    def select_theme(self, mode):
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData(mode))
+        dialog.accept()
 
     def add_history_record(
         self,
@@ -234,23 +240,29 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(splitter.widget(1).isAncestorOf(self.window.device_table))
 
     def test_queue_and_device_results_tabs_and_controls_are_available(self):
-        self.assertEqual(self.window.main_tabs.count(), 2)
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
-        self.assertEqual(self.window.main_tabs.tabText(1), "History")
+        self.assertEqual(self.window.main_tabs.count(), 3)
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch")
+        self.assertEqual(self.window.main_tabs.tabText(1), "Terminal")
+        self.assertEqual(self.window.main_tabs.tabText(2), "History")
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
         self.assertTrue(self.window.main_tabs.tabBar().expanding())
         self.assertGreaterEqual(self.window.main_tabs.tabBar().minimumHeight(), 44)
-        self.assertEqual(self.window.results_tabs.count(), 2)
+        self.assertEqual(self.window.results_tabs.count(), 3)
         self.assertEqual(self.window.results_tabs.tabText(0), "Queue")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
+        self.assertEqual(self.window.results_tabs.tabText(2), "Live Output")
         self.assertEqual(self.window.queue_table.columnCount(), 9)
         self.assertEqual(self.window.device_table.columnCount(), 6)
         self.assertEqual(self.window.schedule_button.text(), "Schedule Run")
+        self.assertFalse(hasattr(self.window, "top_toolbar"))
+        self.assertEqual(self.window.queue_table.horizontalHeaderItem(5).text(), "Run")
+        self.assertEqual(self.window.queue_table.horizontalHeaderItem(6).text(), "Expires")
         self.assertEqual(self.window.pause_queue_button.text(), "Pause Queue")
         self.assertFalse(hasattr(self.window, "queue_button"))
         self.assertEqual(self.window.clear_completed_button.text(), "Clear Completed")
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertFalse(self.window.clear_completed_button.isEnabled())
+
         self.assertEqual(
             self.window.command_dictionary_button.text(), "Command Dictionary"
         )
@@ -320,26 +332,67 @@ class MainWindowTests(unittest.TestCase):
             self.assertEqual(len({editor.geometry().left() for editor in editors}), 1)
             self.assertEqual(len({editor.geometry().right() for editor in editors}), 1)
 
-    def test_theme_menu_defaults_to_system_and_actions_are_exclusive(self):
-        self.assertEqual(self.window.view_menu.title().replace("&", ""), "View")
-        self.assertEqual(self.window.theme_menu.title().replace("&", ""), "Theme")
-        self.assertTrue(self.window.theme_action_group.isExclusive())
-        self.assertTrue(self.window.theme_system_action.isChecked())
-        self.assertFalse(self.window.theme_light_action.isChecked())
-        self.assertFalse(self.window.theme_dark_action.isChecked())
+    def test_terminal_tab_reuses_preloaded_pane(self):
+        self.assertIsNone(self.window.terminal_pane)
+        self.window._ensure_terminal_ui()
+        self.assertIs(self.window.main_tabs.currentWidget(), self.window.ssh_tab)
+        self.window.main_tabs.setCurrentWidget(self.window.terminal_tab)
+        self.app.processEvents()
+        pane = self.window.terminal_pane
+        self.assertIsNotNone(pane)
+        self.assertFalse(pane.save_transcript_check.isChecked())
+        self.window.main_tabs.setCurrentWidget(self.window.ssh_tab)
+        self.window.main_tabs.setCurrentWidget(self.window.terminal_tab)
+        self.assertIs(self.window.terminal_pane, pane)
 
-        self.window.theme_dark_action.trigger()
+    def test_terminal_device_type_is_saved_independently(self):
+        self.window._ensure_terminal_ui()
+        self.window.device_type_combo.setCurrentText("huawei")
+        self.window.terminal_pane.device_type_combo.setCurrentText("cisco_ios")
 
-        self.assertFalse(self.window.theme_system_action.isChecked())
-        self.assertFalse(self.window.theme_light_action.isChecked())
-        self.assertTrue(self.window.theme_dark_action.isChecked())
+        self.window._save_settings()
+
+        self.assertEqual(
+            self.settings.value(gui.TERMINAL_DEVICE_TYPE_KEY), "cisco_ios"
+        )
+        self.assertEqual(self.settings.value("run/device_type"), "huawei")
+
+    def test_terminal_restores_its_saved_device_type(self):
+        self.settings.setValue(gui.TERMINAL_DEVICE_TYPE_KEY, "cisco_ios")
+        self.window.device_type_combo.setCurrentText("huawei")
+
+        self.window._ensure_terminal_ui()
+
+        self.assertEqual(
+            self.window.terminal_pane.device_type_combo.currentText(), "cisco_ios"
+        )
+        self.assertEqual(self.window.device_type_combo.currentText(), "huawei")
+
+    def test_settings_menu_opens_preferences_and_saves_theme(self):
+        self.assertEqual(self.window.settings_menu.title().replace("&", ""), "Settings")
+        self.assertEqual(self.window.settings_menu.actions(), [self.window.preferences_action])
+        self.assertEqual(self.window.preferences_action.text(), "Preferences…")
+        self.assertEqual(self.window.preferences_action.menuRole(), gui.QAction.MenuRole.NoRole)
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.windowTitle(), "Preferences")
+        self.assertEqual(
+            [dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())],
+            [gui.THEME_SYSTEM, gui.THEME_LIGHT, gui.THEME_DARK],
+        )
+        self.assertEqual(dialog.theme_mode(), gui.THEME_SYSTEM)
+        dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData(gui.THEME_DARK))
+        dialog.accept()
+
+        self.assertEqual(self.window._theme_mode, gui.THEME_DARK)
         self.assertEqual(self.settings.value("appearance/theme"), "dark")
         self.settings.beginGroup("appearance")
         self.assertEqual(self.settings.childKeys(), ["theme"])
         self.settings.endGroup()
 
     def test_runtime_theme_is_application_wide_and_system_restores_native_palette(self):
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         app_palette = self.app.palette()
@@ -355,20 +408,19 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertGreater(self.app.palette().resolveMask(), 0)
 
-        self.window.theme_light_action.trigger()
+        self.select_theme(gui.THEME_LIGHT)
         self.app.processEvents()
 
-        self.assertTrue(self.window.theme_light_action.isChecked())
+        self.assertEqual(self.window._theme_mode, gui.THEME_LIGHT)
         self.assertEqual(
             self.app.palette().color(QPalette.ColorRole.Window), QColor("#f5f5f5")
         )
         self.assertEqual(self.settings.value("appearance/theme"), "light")
 
-        self.window.theme_system_action.trigger()
+        self.select_theme(gui.THEME_SYSTEM)
         self.app.processEvents()
 
         self.assertEqual(self.window._theme_mode, gui.THEME_SYSTEM)
-        self.assertTrue(self.window.theme_system_action.isChecked())
         self.assertEqual(self.settings.value("appearance/theme"), "system")
         self.assertEqual(self.app.palette().resolveMask(), 0)
 
@@ -387,14 +439,14 @@ class MainWindowTests(unittest.TestCase):
             "_repolish_application_widgets",
             wraps=gui._repolish_application_widgets,
         ) as repolish:
-            self.window.theme_dark_action.trigger()
+            self.select_theme(gui.THEME_DARK)
             self.app.processEvents()
 
             self.assertGreaterEqual(repolish.call_count, 2)
             for widget, role in widgets_and_roles:
                 self.assertEqual(widget.palette().color(role), QColor("#f1f3f4"))
 
-            self.window.theme_light_action.trigger()
+            self.select_theme(gui.THEME_LIGHT)
             self.app.processEvents()
 
             self.assertGreaterEqual(repolish.call_count, 4)
@@ -402,7 +454,7 @@ class MainWindowTests(unittest.TestCase):
                 self.assertEqual(widget.palette().color(role), QColor("#202124"))
 
     def test_stored_theme_is_applied_when_a_window_is_reopened(self):
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.settings.sync()
         self.window.close()
         self.app.processEvents()
@@ -419,7 +471,6 @@ class MainWindowTests(unittest.TestCase):
         )
 
         self.assertEqual(self.window._theme_mode, gui.THEME_DARK)
-        self.assertTrue(self.window.theme_dark_action.isChecked())
         self.assertEqual(
             self.app.palette().color(QPalette.ColorRole.Window), QColor("#202124")
         )
@@ -427,7 +478,7 @@ class MainWindowTests(unittest.TestCase):
     def test_theme_switch_preserves_lazy_history_and_styles_it_when_created(self):
         self.assertFalse(self.window._history_ui_built)
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
 
         self.assertFalse(self.window._history_ui_built)
         self.add_history_record("lazy-dark")
@@ -448,7 +499,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("#c62828", self.window.clear_completed_button.styleSheet())
         self.assertIn("#c62828", self.window.history_clear_button.styleSheet())
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         line_chart = self.window.history_line_view.chart()
@@ -829,7 +880,7 @@ class MainWindowTests(unittest.TestCase):
     def test_config_converter_switches_with_application_theme(self):
         self.window._ensure_converter_ui()
 
-        self.window.theme_light_action.trigger()
+        self.select_theme(gui.THEME_LIGHT)
         self.app.processEvents()
         self.assertEqual(
             self.window.converter_source_edit.palette().color(QPalette.ColorRole.Base),
@@ -840,7 +891,7 @@ class MainWindowTests(unittest.TestCase):
             QColor("#202124"),
         )
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         self.assertEqual(
             self.window.converter_source_edit.palette().color(QPalette.ColorRole.Base),
@@ -1218,7 +1269,7 @@ class MainWindowTests(unittest.TestCase):
             self.assertFalse(button.isCheckable())
             self.assertFalse(button.isChecked())
 
-        self.window.theme_light_action.trigger()
+        self.select_theme(gui.THEME_LIGHT)
         self.app.processEvents()
         self.assertEqual(
             self.window.dictionary_table.palette().color(QPalette.ColorRole.Base),
@@ -1238,7 +1289,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertTrue(self.window._dictionary_additional_info_expanded)
         assert_matches_copy_button()
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         self.assertEqual(
@@ -1288,12 +1339,12 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window._selected_job_id, selected_job_id)
         self.assertTrue(self.window._results_attention_pending)
         self.assertTrue(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch •")
         self.assertEqual(
             self.window.results_tabs.tabText(1), "Device Results •"
         )
 
-    def test_reopened_window_defaults_to_ssh_instead_of_last_main_tab(self):
+    def test_reopened_window_defaults_to_batch_instead_of_last_main_tab(self):
         self.window.main_tabs.setCurrentWidget(self.window.history_tab)
         self.window._save_settings()
         self.window.close()
@@ -1409,7 +1460,7 @@ class MainWindowTests(unittest.TestCase):
         )
         self.assertIsNone(self.settings.value("history/trend"))
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         self.assertEqual(
             self.window.history_trend_combo.currentData(),
@@ -1565,7 +1616,7 @@ class MainWindowTests(unittest.TestCase):
             "Command Rejected: 1 device (100.0%)",
         )
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         self.assertEqual(
             self.window.history_breakdown_combo.currentData(),
@@ -1662,7 +1713,7 @@ class MainWindowTests(unittest.TestCase):
             filtered_series.clicked.emit(QPointF(0, 1))
             self.assertEqual(show.call_args.args[1].splitlines()[1], "Succeeded: 1 device")
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
         themed_series = self.window.history_line_view.chart().series()[1]
         self.assertIsNot(themed_series, filtered_series)
@@ -1871,23 +1922,23 @@ class MainWindowTests(unittest.TestCase):
         self.assertIn("[redacted]", result)
         self.assertIn("[device]", result)
 
-    def test_schedule_dialog_displays_separate_date_and_time_fields(self):
-        dialog = gui.ScheduleDialog()
+    def test_schedule_dialog_uses_configured_timeout_without_deadline_fields(self):
+        dialog = gui.ScheduleDialog(timeout_minutes=30)
         dialog.show()
         self.app.processEvents()
 
         self.assertTrue(dialog.date_edit.isVisible())
         self.assertTrue(dialog.time_edit.isVisible())
-        self.assertTrue(dialog.latest_date_edit.isVisible())
-        self.assertTrue(dialog.latest_time_edit.isVisible())
+        self.assertFalse(hasattr(dialog, "latest_date_edit"))
+        self.assertFalse(hasattr(dialog, "latest_time_edit"))
         self.assertTrue(dialog.date_edit.calendarPopup())
         self.assertEqual(dialog.date_edit.displayFormat(), "ddd, d MMM yyyy")
         self.assertEqual(dialog.time_edit.displayFormat(), "h:mm AP")
         self.assertTrue(dialog.preview_label.text().startswith("Scheduled for "))
-        self.assertIn("Must start by", dialog.preview_label.text())
+        self.assertIn("Expires if not started by", dialog.preview_label.text())
         self.assertEqual(
             int((dialog.latest_start_utc() - dialog.selected_utc()).total_seconds()),
-            3600,
+            1800,
         )
 
         dialog.date_edit.setDate(dialog.date_edit.date().addDays(1))
@@ -1898,10 +1949,254 @@ class MainWindowTests(unittest.TestCase):
         self.assertGreater(dialog.selected_utc(), datetime.now(timezone.utc))
         self.assertEqual(
             int((dialog.latest_start_utc() - dialog.selected_utc()).total_seconds()),
-            3600,
+            1800,
         )
 
         dialog.close()
+
+    def test_settings_timeout_is_saved_only_after_save(self):
+        self.assertEqual(self.window._scheduled_timeout_minutes(), 60)
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertIsNotNone(dialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(
+            [dialog.timeout_combo.itemData(i) for i in range(dialog.timeout_combo.count())],
+            [30, 60, 120],
+        )
+        self.assertEqual(dialog.timeout_help_button.text(), "?")
+        self.assertIn("expires if it has not started", dialog.timeout_help_button.toolTip())
+        self.assertIn("font-size: 12pt", dialog.timeout_help_button.toolTip())
+        self.assertEqual(dialog.timeout_help_button.accessibleName(), "Scheduled batch timeout help")
+        self.assertEqual(dialog.timeout_help_button.width(), dialog.timeout_help_button.height())
+        self.app.processEvents()
+        self.assertIs(
+            dialog.timeout_help_button.parentWidget(), dialog.timeout_combo.parentWidget()
+        )
+        self.assertGreater(
+            dialog.timeout_help_button.geometry().left(),
+            dialog.timeout_combo.geometry().right(),
+        )
+        with patch.object(gui.QToolTip, "showText") as show_tooltip, patch.object(
+            gui.QToolTip, "hideText"
+        ) as hide_tooltip:
+            dialog.timeout_help_button.enterEvent(
+                QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5))
+            )
+            show_tooltip.assert_called_once()
+            self.assertEqual(
+                show_tooltip.call_args.args[1], dialog.timeout_help_button.toolTip()
+            )
+            dialog.timeout_help_button.leaveEvent(QEvent(QEvent.Type.Leave))
+            hide_tooltip.assert_called_once()
+
+        dialog.timeout_combo.setCurrentIndex(dialog.timeout_combo.findData(30))
+        dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData(gui.THEME_DARK))
+        dialog.reject()
+        self.assertIsNone(self.settings.value(gui.SCHEDULE_TIMEOUT_KEY))
+        self.assertIsNone(self.settings.value("appearance/theme"))
+        self.assertEqual(self.window._theme_mode, gui.THEME_SYSTEM)
+
+        self.window.preferences_action.trigger()
+        self.assertEqual(dialog.timeout_minutes(), 60)
+        self.assertEqual(dialog.theme_mode(), gui.THEME_SYSTEM)
+        dialog.timeout_combo.setCurrentIndex(dialog.timeout_combo.findData(120))
+        dialog.accept()
+        self.assertEqual(self.settings.value(gui.SCHEDULE_TIMEOUT_KEY), 120)
+        self.assertEqual(self.window._scheduled_timeout_minutes(), 120)
+        reloaded = QSettings(
+            str(self.base / "settings.ini"), QSettings.Format.IniFormat
+        )
+        self.assertEqual(reloaded.value(gui.SCHEDULE_TIMEOUT_KEY, type=int), 120)
+
+    def test_failure_policy_is_saved_only_after_save_and_snapshotted(self):
+        self.assertFalse(self.window._stop_on_first_failure())
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertEqual(
+            [dialog.failure_combo.itemData(i) for i in range(dialog.failure_combo.count())],
+            [False, True],
+        )
+        dialog.failure_combo.setCurrentIndex(dialog.failure_combo.findData(True))
+        dialog.reject()
+        self.assertIsNone(self.settings.value(gui.STOP_ON_FIRST_FAILURE_KEY))
+
+        self.window.preferences_action.trigger()
+        self.assertFalse(dialog.stop_on_first_failure())
+        dialog.failure_combo.setCurrentIndex(dialog.failure_combo.findData(True))
+        dialog.accept()
+        self.assertTrue(self.window._stop_on_first_failure())
+        reloaded = QSettings(str(self.base / "settings.ini"), QSettings.Format.IniFormat)
+        self.assertTrue(reloaded.value(gui.STOP_ON_FIRST_FAILURE_KEY, type=bool))
+
+        self.populate_valid_inputs()
+        with patch.object(
+            gui.QMessageBox,
+            "warning",
+            return_value=QMessageBox.StandardButton.Apply,
+        ):
+            self.window.start_run()
+        job_id = self.window.queue_controller.jobs[0].job_id
+        self.assertTrue(self.window.queue_controller.payload(job_id).stop_on_first_failure)
+        self.assertTrue(self.window._job_prepared[job_id].request.stop_on_first_failure)
+
+        self.window.preferences_action.trigger()
+        dialog.failure_combo.setCurrentIndex(dialog.failure_combo.findData(False))
+        dialog.accept()
+        self.assertFalse(self.window._stop_on_first_failure())
+        self.assertTrue(self.window.queue_controller.payload(job_id).stop_on_first_failure)
+
+        with patch.object(
+            gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
+        ):
+            self.window.edit_selected_batch()
+        with patch.object(
+            gui.QMessageBox, "warning", return_value=QMessageBox.StandardButton.Apply
+        ):
+            self.window.save_batch_edit()
+        self.assertTrue(self.window.queue_controller.payload(job_id).stop_on_first_failure)
+        self.assertTrue(self.window._job_prepared[job_id].request.stop_on_first_failure)
+
+    def test_live_output_mode_is_saved_only_after_save(self):
+        self.assertEqual(self.window._live_output_mode, gui.LIVE_OUTPUT_BY_BATCH)
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        self.assertEqual(
+            [dialog.live_output_mode_combo.itemData(i) for i in range(2)],
+            [gui.LIVE_OUTPUT_BY_BATCH, gui.LIVE_OUTPUT_BY_DEVICE],
+        )
+        self.assertEqual(dialog.live_output_help_button.text(), "?")
+        self.assertIn("By batch keeps output", dialog.live_output_help_button.toolTip())
+        self.assertIn("By device clears Live Output", dialog.live_output_help_button.toolTip())
+        self.assertIn("font-size: 12pt", dialog.live_output_help_button.toolTip())
+        self.assertEqual(dialog.live_output_help_button.accessibleName(), "Live Output help")
+        self.app.processEvents()
+        self.assertIs(
+            dialog.live_output_help_button.parentWidget(),
+            dialog.live_output_mode_combo.parentWidget(),
+        )
+        self.assertGreater(
+            dialog.live_output_help_button.geometry().left(),
+            dialog.live_output_mode_combo.geometry().right(),
+        )
+        with patch.object(gui.QToolTip, "showText") as show_tooltip:
+            dialog.live_output_help_button.enterEvent(
+                QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5))
+            )
+            show_tooltip.assert_called_once()
+            self.assertEqual(
+                show_tooltip.call_args.args[1], dialog.live_output_help_button.toolTip()
+            )
+        dialog.live_output_mode_combo.setCurrentIndex(
+            dialog.live_output_mode_combo.findData(gui.LIVE_OUTPUT_BY_DEVICE)
+        )
+        dialog.reject()
+        self.assertIsNone(self.settings.value(gui.LIVE_OUTPUT_MODE_KEY))
+        self.assertEqual(self.window._live_output_mode, gui.LIVE_OUTPUT_BY_BATCH)
+
+        self.window.preferences_action.trigger()
+        self.assertEqual(dialog.live_output_mode(), gui.LIVE_OUTPUT_BY_BATCH)
+        dialog.live_output_mode_combo.setCurrentIndex(
+            dialog.live_output_mode_combo.findData(gui.LIVE_OUTPUT_BY_DEVICE)
+        )
+        dialog.accept()
+        self.assertEqual(self.window._live_output_mode, gui.LIVE_OUTPUT_BY_DEVICE)
+        reloaded = QSettings(str(self.base / "settings.ini"), QSettings.Format.IniFormat)
+        self.assertEqual(reloaded.value(gui.LIVE_OUTPUT_MODE_KEY), gui.LIVE_OUTPUT_BY_DEVICE)
+
+    def test_live_output_by_device_clears_at_each_device_boundary(self):
+        self.window.preferences_action.trigger()
+        dialog = self.window.preferences_dialog
+        dialog.live_output_mode_combo.setCurrentIndex(
+            dialog.live_output_mode_combo.findData(gui.LIVE_OUTPUT_BY_DEVICE)
+        )
+        dialog.accept()
+        self.window._begin_live_output("job", "Maintenance batch")
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent("device_started", address="192.0.2.1", total=3)
+        )
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent("output_chunk", address="192.0.2.1", transcript_chunk="first reply\n")
+        )
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent("device_finished", address="192.0.2.1", status="success", index=1, total=3)
+        )
+        self.assertIn("first reply", self.window.live_output_edit.toPlainText())
+        self.assertIn("192.0.2.1", self.window.live_output_batch_label.text())
+
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent("device_started", address="192.0.2.2", total=3)
+        )
+        self.assertEqual(self.window.live_output_edit.toPlainText(), "")
+        self.assertEqual(
+            self.window.live_output_batch_label.text(), "Maintenance batch — 192.0.2.2"
+        )
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent("output_chunk", address="192.0.2.2", transcript_chunk="second reply\n")
+        )
+        self.assertNotIn("first reply", self.window.live_output_edit.toPlainText())
+        self.assertIn("second reply", self.window.live_output_edit.toPlainText())
+
+        # A batch stopped after failure can emit skipped results without device_started.
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent(
+                "device_finished", address="192.0.2.3", status="skipped",
+                message="stopped after failure", index=3, total=3,
+            )
+        )
+        self.assertNotIn("second reply", self.window.live_output_edit.toPlainText())
+        self.assertIn("SKIPPED: stopped after failure", self.window.live_output_edit.toPlainText())
+        self.window._handle_job_progress(
+            "job", runner.ProgressEvent("run_finished", total=3, message="Batch complete")
+        )
+        self.assertIn("Batch finished: Batch complete", self.window.live_output_edit.toPlainText())
+        self.window._begin_live_output("next-job", "Next batch")
+        self.assertEqual(self.window.live_output_edit.toPlainText(), "")
+        self.assertEqual(self.window.live_output_batch_label.text(), "Next batch")
+
+    def test_scheduling_and_rescheduling_snapshot_settings_timeout(self):
+        self.populate_valid_inputs()
+        self.window.preferences_action.trigger()
+        settings_dialog = self.window.preferences_dialog
+        settings_dialog.timeout_combo.setCurrentIndex(
+            settings_dialog.timeout_combo.findData(30)
+        )
+        settings_dialog.accept()
+
+        with patch.object(
+            gui.ScheduleDialog, "exec", return_value=QDialog.DialogCode.Accepted
+        ), patch.object(
+            gui.QMessageBox, "warning", return_value=QMessageBox.StandardButton.Apply
+        ):
+            self.window.schedule_batch()
+
+        job = self.window.queue_controller.jobs[0]
+        self.assertEqual(job.latest_start_utc - job.scheduled_utc, timedelta(minutes=30))
+        self.assertEqual(
+            self.window.queue_table.item(0, 6).text(),
+            job.latest_start_utc.astimezone().strftime("%Y-%m-%d %H:%M"),
+        )
+
+        self.window.preferences_action.trigger()
+        settings_dialog.timeout_combo.setCurrentIndex(
+            settings_dialog.timeout_combo.findData(120)
+        )
+        settings_dialog.accept()
+        self.assertEqual(
+            self.window.queue_controller.job(job.job_id).latest_start_utc,
+            job.latest_start_utc,
+        )
+
+        with patch.object(
+            gui.ScheduleDialog, "exec", return_value=QDialog.DialogCode.Accepted
+        ):
+            self.window.reschedule_selected_batch()
+
+        rescheduled = self.window.queue_controller.job(job.job_id)
+        self.assertEqual(
+            rescheduled.latest_start_utc - rescheduled.scheduled_utc,
+            timedelta(hours=2),
+        )
 
     def test_queue_submission_snapshots_sensitive_inputs_outside_qsettings(self):
         self.populate_valid_inputs()
@@ -1925,6 +2220,55 @@ class MainWindowTests(unittest.TestCase):
         self.assertNotIn("192.0.2.1", stored)
         self.assertNotIn("show version", stored)
         self.assertNotIn("secret", stored)
+
+    def test_batch_output_mode_is_selected_per_job_and_editable(self):
+        self.assertEqual(
+            [
+                self.window.output_mode_combo.itemText(index)
+                for index in range(self.window.output_mode_combo.count())
+            ],
+            ["One file per device", "One file per batch"],
+        )
+        self.assertEqual(
+            self.window.output_mode_combo.currentData(), runner.OUTPUT_PER_DEVICE
+        )
+        self.populate_valid_inputs()
+        self.window.output_mode_combo.setCurrentIndex(
+            self.window.output_mode_combo.findData(runner.OUTPUT_SINGLE_FILE)
+        )
+        with patch.object(
+            gui.QMessageBox, "warning", return_value=QMessageBox.StandardButton.Apply
+        ):
+            self.window.start_run()
+        job_id = self.window.queue_controller.jobs[0].job_id
+        self.assertEqual(
+            self.window.queue_controller.payload(job_id).output_mode,
+            runner.OUTPUT_SINGLE_FILE,
+        )
+        self.assertEqual(
+            self.window._job_prepared[job_id].request.output_mode,
+            runner.OUTPUT_SINGLE_FILE,
+        )
+        self.assertIsNone(self.settings.value("run/output_mode"))
+
+        with patch.object(
+            gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
+        ):
+            self.window.edit_selected_batch()
+        self.assertEqual(
+            self.window.output_mode_combo.currentData(), runner.OUTPUT_SINGLE_FILE
+        )
+        self.window.output_mode_combo.setCurrentIndex(
+            self.window.output_mode_combo.findData(runner.OUTPUT_PER_DEVICE)
+        )
+        with patch.object(
+            gui.QMessageBox, "warning", return_value=QMessageBox.StandardButton.Apply
+        ):
+            self.window.save_batch_edit()
+        self.assertEqual(
+            self.window.queue_controller.payload(job_id).output_mode,
+            runner.OUTPUT_PER_DEVICE,
+        )
 
     def test_queued_batch_can_be_fully_edited_without_changing_active_snapshot(self):
         self.populate_valid_inputs()
@@ -2013,7 +2357,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIs(self.window.main_tabs.currentWidget(), self.window.history_tab)
         self.assertTrue(self.window._results_attention_pending)
         self.assertTrue(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch •")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
 
         self.window.main_tabs.setCurrentWidget(self.window.ssh_tab)
@@ -2025,7 +2369,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(self.window._results_attention_pending)
         self.assertFalse(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
 
     def test_results_attention_pulses_three_times_then_leaves_dots(self):
@@ -2052,7 +2396,7 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(timer.isActive())
         self.assertTrue(self.window._results_attention_pending)
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH •")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch •")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results •")
         self.assertFalse(
             self.window.main_tabs.tabBar().tabTextColor(0).isValid()
@@ -2068,13 +2412,14 @@ class MainWindowTests(unittest.TestCase):
 
         self.assertFalse(self.window._results_attention_pending)
         self.assertFalse(self.window.results_attention_timer.isActive())
-        self.assertEqual(self.window.main_tabs.tabText(0), "SSH")
+        self.assertEqual(self.window.main_tabs.tabText(0), "Batch")
         self.assertEqual(self.window.results_tabs.tabText(1), "Device Results")
 
     def test_theme_change_updates_active_results_attention_color(self):
         self.window._request_results_attention()
+        self.window.results_attention_timer.stop()
 
-        self.window.theme_dark_action.trigger()
+        self.select_theme(gui.THEME_DARK)
         self.app.processEvents()
 
         highlight = QColor("#0a84ff")
@@ -2147,6 +2492,16 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNone(self.history_store.get(job.job_id))
         start_worker.assert_not_called()
 
+        self.window._refresh_queue_table(select_job_id=job.job_id)
+        with patch.object(
+            gui.QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes
+        ), patch.object(gui.QMessageBox, "critical") as error_dialog:
+            self.window.remove_selected_batch()
+
+        error_dialog.assert_not_called()
+        self.assertIsNone(self.window.queue_controller.job(job.job_id))
+        self.assertEqual(self.window.queue_table.rowCount(), 0)
+
     def test_queued_completion_updates_status_and_deletes_secret(self):
         prepared = runner.prepare_run(
             self._valid_request("huawei", "192.0.2.1"),
@@ -2172,7 +2527,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertNotIn(job.job_id, self.secret_store.values)
         self.assertEqual(self.window._job_results[job.job_id].summary_path, summary)
 
-    def test_retry_failed_queue_batch_creates_unvalidated_failed_only_draft(self):
+    def test_retry_failed_queue_batch_includes_skipped_devices(self):
         prepared = runner.prepare_run(
             self._valid_request("huawei", "192.0.2.1\nbad-address\n192.0.2.2"),
             require_credentials=True,
@@ -2194,9 +2549,8 @@ class MainWindowTests(unittest.TestCase):
                 ),
                 runner.DeviceResult(
                     "192.0.2.2",
-                    "failed",
+                    "skipped",
                     "",
-                    failure_category=runner.FailureCategory.CONNECTIVITY,
                 ),
                 runner.DeviceResult("192.0.2.3", "cancelled", ""),
             ),
@@ -2224,6 +2578,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window.run_button.isEnabled())
         self.assertEqual(len(self.window.queue_controller.jobs), 1)
         self.assertIn("Review and validate", self.window.validation_label.text())
+        self.assertIn("failed or skipped", self.window.validation_label.text())
 
     def test_retry_draft_cancel_preserves_current_form(self):
         self.populate_valid_inputs()
@@ -2266,12 +2621,17 @@ class MainWindowTests(unittest.TestCase):
         self.window.queue_controller.mark_running(job.job_id)
         self.window._active_job_id = job.job_id
         self.window._operation = "run"
+        self.window._begin_live_output(job.job_id, job.name)
 
         with patch.object(gui.QMessageBox, "critical") as critical:
             self.window._run_failed("Unexpected worker failure")
 
         critical.assert_not_called()
         self.assertEqual(self.window.queue_controller.job(job.job_id).status, "failed")
+        self.assertIn(
+            "Batch failed: Unexpected worker failure",
+            self.window.live_output_edit.toPlainText(),
+        )
 
     def test_configuration_remains_editable_while_live_worker_runs(self):
         self.populate_valid_inputs()
@@ -2403,6 +2763,7 @@ class MainWindowTests(unittest.TestCase):
         self.assertIsNotNone(self.history_store.get(job.job_id))
 
     def test_history_device_results_load_from_summary_on_demand(self):
+        self.select_theme(gui.THEME_LIGHT)
         run_directory = self.base / "outputs" / "run_results"
         run_directory.mkdir(parents=True)
         transcript = run_directory / "192.0.2.5.txt"
@@ -2438,6 +2799,11 @@ class MainWindowTests(unittest.TestCase):
         self.assertFalse(self.window._results_attention_pending)
         self.assertEqual(self.window.device_table.rowCount(), 1)
         self.assertEqual(self.window.device_table.item(0, 0).text(), "192.0.2.5")
+        self.assertEqual(self.window.device_table.item(0, 1).text(), "Failed")
+        self.assertEqual(
+            self.window.device_table.item(0, 1).foreground().color(),
+            QColor("#c62828"),
+        )
         self.assertEqual(self.window.device_table.item(0, 2).text(), "Command Rejected")
         self.assertEqual(self.window.device_table.item(0, 3).text(), "config / 2")
         self.assertEqual(
@@ -3064,6 +3430,179 @@ class MainWindowTests(unittest.TestCase):
         self.assertEqual(self.window.device_table.item(row, 1).text(), "Running")
         self.assertEqual(self.window.device_table.item(row, 3).text(), "exec / 2")
 
+    def test_live_output_follows_active_batch_and_survives_queue_selection(self):
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        prepared = self.window._prepared
+        payload = batch_queue.BatchPayload.from_prepared(prepared)
+        first = self.window.queue_controller.add(payload, prepared)
+        self.window.queue_controller.clock = lambda: datetime.now(timezone.utc) + timedelta(minutes=1)
+        second = self.window.queue_controller.add(payload, prepared)
+        self.window._initialize_job_rows(first.job_id, prepared)
+        self.window._initialize_job_rows(second.job_id, prepared)
+        self.window._refresh_queue_table(select_job_id=first.job_id)
+        self.assertEqual(self.window.results_tabs.tabText(2), "Live Output")
+        self.assertTrue(self.window.live_output_edit.isReadOnly())
+
+        self.window._operation = "run"
+        self.window._active_job_id = first.job_id
+        self.window.handle_progress(runner.ProgressEvent("run_started", total=2))
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "output_chunk", address="192.0.2.1", transcript_chunk="> set password literal-secret\n"
+            )
+        )
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "output_chunk", address="192.0.2.1", transcript_chunk="switch reply\n"
+            )
+        )
+        self.assertEqual(self.window.live_output_batch_label.text(), first.name)
+        self.assertIn("literal-secret", self.window.live_output_edit.toPlainText())
+        self.assertIn("switch reply", self.window.live_output_edit.toPlainText())
+
+        self.window.queue_table.selectRow(1)
+        self.assertEqual(self.window._selected_job_id, second.job_id)
+        self.assertEqual(self.window.live_output_batch_label.text(), first.name)
+        self.window.handle_progress(
+            runner.ProgressEvent("device_status", address="192.0.2.1", status="connecting")
+        )
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_finished", address="192.0.2.1", status="skipped",
+                message="stopped after failure", index=1, total=2,
+            )
+        )
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_finished", address="192.0.2.2", status="cancelled",
+                message="cancelled before device started", index=2, total=2,
+            )
+        )
+        self.window.handle_progress(
+            runner.ProgressEvent("run_finished", total=2, message="Batch complete")
+        )
+        self.assertIn("Connecting", self.window.live_output_edit.toPlainText())
+        self.assertIn("SKIPPED: stopped after failure", self.window.live_output_edit.toPlainText())
+        self.assertIn("CANCELLED: cancelled before device started", self.window.live_output_edit.toPlainText())
+        self.assertIn("Batch finished: Batch complete", self.window.live_output_edit.toPlainText())
+        self.assertIn("literal-secret", self.window.live_output_edit.toPlainText())
+
+        self.window._operation = "connection_test"
+        self.window._active_job_id = None
+        self.window.handle_progress(
+            runner.ProgressEvent("output_chunk", transcript_chunk="connection test output")
+        )
+        self.assertNotIn("connection test output", self.window.live_output_edit.toPlainText())
+
+        self.window._operation = "run"
+        self.window._active_job_id = second.job_id
+        self.window.handle_progress(runner.ProgressEvent("run_started", total=2))
+        self.assertEqual(self.window.live_output_batch_label.text(), second.name)
+        self.assertEqual(self.window.live_output_edit.toPlainText(), "")
+        stored = "\n".join(str(self.settings.value(key)) for key in self.settings.allKeys())
+        self.assertNotIn("literal-secret", stored)
+
+    def test_live_output_trims_old_text_with_notice(self):
+        self.window._begin_live_output("job", "Batch")
+        with patch.object(gui, "LIVE_OUTPUT_LIMIT", 120):
+            self.window._append_live_output("first line\n" + "x" * 150)
+            self.window._append_live_output("\nlatest reply\n")
+
+        shown = self.window.live_output_edit.toPlainText()
+        self.assertTrue(shown.startswith(gui.LIVE_OUTPUT_TRUNCATED.strip()))
+        self.assertIn("latest reply", shown)
+        self.assertNotIn("first line", shown)
+        self.assertLessEqual(len(self.window._live_output_text), 120)
+
+    def test_live_output_font_controls_resize_text_and_persist(self):
+        self.window._append_live_output("switch reply\n")
+        base_size = self.window.live_output_edit.font().pointSizeF()
+        self.assertEqual(self.window.live_output_font_percent_label.text(), "100%")
+        self.assertAlmostEqual(
+            base_size,
+            self.window._live_output_base_font.pointSizeF() * 1.2,
+            places=1,
+        )
+
+        self.window.live_output_larger_button.click()
+        self.assertEqual(self.window.live_output_font_percent_label.text(), "110%")
+        self.assertAlmostEqual(
+            self.window.live_output_edit.font().pointSizeF(), base_size * 1.1, places=1
+        )
+        self.assertEqual(self.window.live_output_edit.toPlainText(), "switch reply\n")
+
+        for _ in range(6):
+            self.window.live_output_smaller_button.click()
+        self.assertEqual(self.window.live_output_font_percent_label.text(), "50%")
+        self.assertFalse(self.window.live_output_smaller_button.isEnabled())
+        self.window.live_output_larger_button.click()
+        self.assertEqual(self.window.live_output_font_percent_label.text(), "60%")
+        self.assertEqual(self.settings.value(gui.LIVE_OUTPUT_FONT_PERCENT_KEY, type=int), 60)
+
+        reopened = gui.MainWindow(
+            self.settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
+        try:
+            self.assertEqual(reopened.live_output_font_percent_label.text(), "60%")
+            self.assertEqual(reopened.live_output_edit.toPlainText(), "")
+        finally:
+            reopened.close()
+
+    def test_live_output_old_120_percent_becomes_new_100_percent(self):
+        self.settings.setValue(gui.LIVE_OUTPUT_FONT_PERCENT_KEY, 120)
+        migrated = gui.MainWindow(
+            self.settings,
+            secret_store=batch_queue.MemorySecretStore(),
+            history_store=self.history_store,
+            history_command_store=self.history_commands,
+        )
+        try:
+            self.assertEqual(migrated.live_output_font_percent_label.text(), "100%")
+            self.assertEqual(self.settings.value(gui.LIVE_OUTPUT_FONT_PERCENT_KEY, type=int), 100)
+            self.assertEqual(
+                self.settings.value(gui.LIVE_OUTPUT_FONT_BASE_VERSION_KEY, type=int),
+                gui.LIVE_OUTPUT_FONT_BASE_VERSION,
+            )
+            self.assertAlmostEqual(
+                migrated.live_output_edit.font().pointSizeF(),
+                migrated._live_output_base_font.pointSizeF() * 1.2,
+                places=1,
+            )
+        finally:
+            migrated.close()
+
+    def test_failed_device_status_is_red_and_updates_with_theme(self):
+        self.select_theme(gui.THEME_LIGHT)
+        self.populate_valid_inputs()
+        self.assertTrue(self.window.validate_inputs(show_success=False))
+        row = self.window._rows["192.0.2.1"]
+        status_item = self.window.device_table.item(row, 1)
+        self.assertIsNone(status_item.data(Qt.ItemDataRole.ForegroundRole))
+
+        self.window.handle_progress(
+            runner.ProgressEvent(
+                "device_finished",
+                address="192.0.2.1",
+                index=1,
+                total=1,
+                status="failed",
+                message="Connection failed",
+            )
+        )
+        self.assertEqual(status_item.text(), "Failed")
+        self.assertEqual(status_item.foreground().color(), QColor("#c62828"))
+
+        self.select_theme(gui.THEME_DARK)
+        self.app.processEvents()
+        self.assertEqual(status_item.foreground().color(), QColor("#ff6b6b"))
+
+        self.window._set_cell(row, 1, "Succeeded")
+        self.assertIsNone(status_item.data(Qt.ItemDataRole.ForegroundRole))
+
     def test_cancel_requests_cooperative_stop(self):
         self.assertEqual(self.window.cancel_button.text(), "Stop Run")
         self.assertIn("#c62828", self.window.cancel_button.styleSheet())
@@ -3098,6 +3637,23 @@ class MainWindowTests(unittest.TestCase):
         self.window._running = False
         self.window._token = None
         self.window._close_after_run = False
+
+    def test_closing_with_terminal_requests_disconnect(self):
+        pane = Mock()
+        pane.is_active.return_value = True
+        self.window.terminal_pane = pane
+        event = QCloseEvent()
+        with patch.object(
+            gui.QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            self.window.closeEvent(event)
+        self.assertFalse(event.isAccepted())
+        pane.stop_for_close.assert_called_once_with()
+        self.assertTrue(self.window._terminal_close_requested)
+        self.window.terminal_pane = None
+        self.window._terminal_close_requested = False
 
     def test_completed_run_enables_existing_result_actions(self):
         run_directory = self.base / "outputs" / "run_test"
