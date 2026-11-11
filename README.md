@@ -265,16 +265,43 @@ does not stop an already confirmed live batch.
 ### Command dictionary
 
 The reusable, non-modal **Command Dictionary** window opens from **Tools >
-Command Dictionary** in the menu bar, from any main tab, and contains 96
-entries organized as 48 cross-vendor pairs for Cisco Catalyst 9300L and Huawei
-CloudEngine S5755-S. Seventy entries are read-only operational commands. The
+Command Dictionary** in the menu bar, from any main tab. It contains 118 entries
+for Cisco Catalyst 9300L and Huawei CloudEngine S5755-S: 58 cross-vendor pairs
+plus two Huawei-only references. Seventy entries are read-only operational commands. The
 remaining entries are explicitly marked as configuration changes, service-
 impacting actions, active diagnostics, or interactive saves and show their
 required context. Its scope is deliberately exact:
 
 - Catalyst 9300L documented for IOS XE 17.3.x, with deployed target 17.3.3
-- CloudEngine S5755-S documented for V600R024C10, with deployed target
-  V600R024C10SPC500 / YunShan OS 1.24.1.1
+- CloudEngine S5755-S: the original entries retain V600R024C10 documentation scope,
+  with deployed target V600R024C10SPC500 / YunShan OS 1.24.1.1. The 12 added Huawei
+  references are labelled **Generic VRP (V600R024C10 unverified)**. Their platform
+  and deployed target identify the intended context; they do not establish command
+  availability on that image. Verify syntax and feature support before use.
+
+The additional references cover device names, global LLDP, DNS domain and server,
+NTP and syslog destinations, STP edge ports, interface IPv4 addresses, static IPv4
+routes, and link-aggregation members. Huawei `mode lacp-static` and `vlan batch`
+have separate vendor-only entries. SVI and bundle interface identifiers are
+described on the existing interface-context entries. Interface enable commands
+remain the `no shutdown` / `undo shutdown` rollback of the disable entries.
+These additions do not create automatic converter template mappings; existing
+custom conversion rules still handle these families, including context checks
+and DNS address validation. LACP active/passive semantics need review: the reverse conversion
+selects Cisco active rather than preserving passive. VLAN batch conversion accepts
+explicit valid IDs; ranges and invalid declarations are blocking review items.
+
+The added Cisco syntax is drawn from the official IOS XE 17.3 guides for
+[device services](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-3/configuration_guide/sys_mgmt/b_173_sys_mgmt_9300_cg/administering_the_device.html),
+[LLDP](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-3/configuration_guide/int_hw/b_173_int_and_hw_9300_cg/configuring_lldp__lldp_med__and_wired_location_service.html),
+[PortFast](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-3/configuration_guide/lyr2/b_173_lyr2_9300_cg/configuring_optional_spanning_tree_features.html),
+[system logging](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-3/configuration_guide/sys_mgmt/b_173_sys_mgmt_9300_cg/configuring_system_message_logs.html),
+[IPv4 routing](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-3/configuration_guide/rtng/b_173_rtng_9300_cg/configuring_ip_unicast_routing.html), and
+[EtherChannel](https://www.cisco.com/c/en/us/td/docs/switches/lan/catalyst9300/software/release/17-3/configuration_guide/lyr2/b_173_lyr2_9300_cg/configuring_etherchannels.html).
+Huawei's general [NTP](https://info.support.huawei.com/network/ptmngsys/Web/tsrev_s/en/content/s/37_edesk_ntp_clock_synchronization_fails/edesk_ntp_clock_synchronization_fails_edesk003.html)
+and [LACP](https://info.support.huawei.com/network/ptmngsys/Web/tsrev_ce/en/content/ce/02_edesk_dc_trunk_down/edesk_dc_trunk_down_edesk004.html)
+references support generic syntax only; they do not verify the added commands
+for the stated S5755-S release. No new physical-device verification is claimed.
 
 Search uses command text, purpose, aliases, keywords, and related metadata.
 Platform and category filters can be combined with it. Selecting a row shows

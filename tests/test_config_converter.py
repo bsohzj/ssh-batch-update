@@ -1,4 +1,8 @@
 import unittest
+from unittest.mock import patch
+
+import config_converter
+from command_dictionary import COMMAND_ENTRIES, CONCEPT_IDS
 
 from config_converter import (
     VENDOR_CISCO,
@@ -23,6 +27,83 @@ class VendorDetectionTests(unittest.TestCase):
 
 
 class ConversionTests(unittest.TestCase):
+    def test_dictionary_growth_keeps_original_template_inventory(self) -> None:
+        expected = frozenset(CONCEPT_IDS[:48])
+        self.assertIsInstance(config_converter.CONVERTER_TEMPLATE_CONCEPT_IDS, frozenset)
+        self.assertEqual(config_converter.CONVERTER_TEMPLATE_CONCEPT_IDS, expected)
+        for vendor in (VENDOR_CISCO, VENDOR_HUAWEI):
+            pairs = config_converter._TEMPLATE_PAIRS[vendor]
+            self.assertEqual(len(pairs), 48)
+            self.assertEqual({pair.source.concept_id for pair in pairs}, expected)
+            self.assertTrue(all(pair.source in COMMAND_ENTRIES[:96] and pair.target in COMMAND_ENTRIES[:96] for pair in pairs))
+            with patch.object(config_converter, "COMMAND_ENTRIES", COMMAND_ENTRIES[:96]):
+                self.assertEqual(config_converter._build_template_pairs(vendor), pairs)
+
+    def test_added_reference_templates_do_not_bypass_custom_guards(self) -> None:
+        cases = (
+            (VENDOR_CISCO, "ip name-server invalid"),
+            (VENDOR_HUAWEI, "dns server invalid"),
+            (VENDOR_CISCO, "ip address 192.0.2.1 255.255.255.0"),
+            (VENDOR_HUAWEI, "ip address 192.0.2.1 255.255.255.0"),
+            (VENDOR_CISCO, "spanning-tree portfast"),
+            (VENDOR_HUAWEI, "stp edged-port enable"),
+            (VENDOR_CISCO, "channel-group 1 mode active"),
+            (VENDOR_HUAWEI, "eth-trunk 1"),
+            (VENDOR_HUAWEI, "mode lacp-static"),
+            (VENDOR_CISCO, "interface GigabitEthernet1/0/1\n channel-group 1 mode invalid"),
+            (VENDOR_HUAWEI, "interface GE1/0/1\n eth-trunk invalid"),
+        )
+        for vendor, text in cases:
+            with self.subTest(vendor=vendor, text=text):
+                result = convert_text(text, vendor)
+                self.assertTrue(result.blocking_issues)
+                self.assertEqual(result.config_commands, () if "\n" not in text else ("interface GE1/0/1" if vendor == VENDOR_CISCO else "interface GigabitEthernet1/0/1",))
+
+    def test_custom_vlan_expansion_preserves_global_context(self) -> None:
+        result = convert_text("vlan batch 10 20\nname VOICE", VENDOR_HUAWEI)
+        self.assertEqual(result.config_commands, ("vlan 10", "vlan 20"))
+        self.assertTrue(result.blocking_issues)
+
+    def test_invalid_vlan_batch_cannot_fall_through_generic_vlan_template(self) -> None:
+        for values in ("4095", "0", "10 to 20", "10,20", "invalid", ""):
+            text = f"vlan batch {values}".strip()
+            with self.subTest(text=text):
+                result = convert_text(text, VENDOR_HUAWEI)
+                self.assertTrue(result.blocking_issues)
+                self.assertEqual(result.config_commands, ())
+                self.assertIn("REVIEW", result.output_text)
+                rechecked = analyze_target_text(result.output_text, VENDOR_CISCO)
+                self.assertTrue(rechecked.blocking_issues)
+                with self.assertRaises(ValueError):
+                    render_sectioned_commands(rechecked)
+
+    def test_cisco_source_rejects_huawei_only_vlan_batch(self) -> None:
+        for text in ("vlan batch 10 20", "vlan batch", "vlan batch invalid"):
+            with self.subTest(text=text):
+                result = convert_text(text, VENDOR_CISCO)
+                self.assertEqual(result.commands, ())
+                self.assertTrue(result.blocking_issues)
+                self.assertIn("Huawei-only", result.issues[0].message)
+                self.assertIn("REVIEW", result.output_text)
+                rechecked = analyze_target_text(result.output_text, VENDOR_HUAWEI)
+                self.assertEqual(rechecked.commands, ())
+                self.assertTrue(rechecked.blocking_issues)
+                with self.assertRaises(ValueError):
+                    render_sectioned_commands(rechecked)
+
+    def test_lacp_bundle_mode_is_ignored_and_members_use_complete_context(self) -> None:
+        for mode_line, expected_mode in ((" mode lacp-static\n", "active"), ("", "on")):
+            result = convert_text(
+                f"interface Eth-Trunk1\n{mode_line}interface GE1/0/1\n eth-trunk 1\n",
+                VENDOR_HUAWEI,
+            )
+            self.assertFalse(result.blocking_issues)
+            self.assertEqual(result.config_commands, (
+                "interface Port-channel1", "interface GigabitEthernet1/0/1",
+                f"channel-group 1 mode {expected_mode}",
+            ))
+            self.assertEqual(sum(issue.disposition == "ignored" for issue in result.issues), bool(mode_line))
+
     def test_operational_dictionary_pair_converts_both_directions(self) -> None:
         cisco = convert_text("show interfaces GigabitEthernet1/0/1\n", VENDOR_CISCO)
         self.assertEqual(cisco.exec_commands, ("display interface GE1/0/1",))
@@ -152,6 +233,36 @@ class ConversionTests(unittest.TestCase):
 
 
 class TargetAnalysisTests(unittest.TestCase):
+    def test_vlan_batch_target_validation_is_vendor_specific_and_keeps_global_context(self) -> None:
+        valid = analyze_target_text("vlan batch 10 20", VENDOR_HUAWEI)
+        self.assertFalse(valid.blocking_issues)
+        self.assertEqual(valid.config_commands, ("vlan batch 10 20",))
+        with_name = analyze_target_text("vlan batch 10 20\nname VOICE", VENDOR_HUAWEI)
+        self.assertEqual(with_name.config_commands, ("vlan batch 10 20",))
+        self.assertTrue(with_name.blocking_issues)
+        for vendor in (VENDOR_CISCO, VENDOR_HUAWEI):
+            for values in ("4095", "0", "10 to 20", "10,20", "invalid", ""):
+                with self.subTest(vendor=vendor, values=values):
+                    result = analyze_target_text(f"vlan batch {values}".strip(), vendor)
+                    self.assertEqual(result.config_commands, ())
+                    self.assertTrue(result.blocking_issues)
+                    with self.assertRaises(ValueError):
+                        render_sectioned_commands(result)
+        cisco = analyze_target_text("vlan batch 10 20", VENDOR_CISCO)
+        self.assertTrue(cisco.blocking_issues)
+        self.assertEqual(cisco.config_commands, ())
+
+    def test_new_reference_templates_do_not_relax_target_context_guards(self) -> None:
+        for vendor, lines in (
+            (VENDOR_CISCO, ("ip address 192.0.2.1 255.255.255.0", "spanning-tree portfast", "channel-group 1 mode active")),
+            (VENDOR_HUAWEI, ("ip address 192.0.2.1 255.255.255.0", "stp edged-port enable", "eth-trunk 1", "mode lacp-static")),
+        ):
+            for text in lines:
+                with self.subTest(vendor=vendor, text=text):
+                    result = analyze_target_text(text, vendor)
+                    self.assertTrue(result.blocking_issues)
+                    self.assertEqual(result.config_commands, ())
+
     def test_rechecks_and_classifies_edited_output(self) -> None:
         result = analyze_target_text(
             "display version\nsysname EDGE-01\ninterface GE1/0/1\n description Desk\n",

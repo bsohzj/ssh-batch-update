@@ -1,9 +1,11 @@
 from dataclasses import FrozenInstanceError, replace
+import re
 import unittest
 
 from command_dictionary import (
     COMMAND_ENTRIES,
     CONCEPT_IDS,
+    HUAWEI_REFERENCE_RELEASE,
     CommandEntry,
     search_commands,
     validate_dictionary,
@@ -12,13 +14,16 @@ from command_dictionary import (
 
 class CommandDictionaryCorpusTests(unittest.TestCase):
     def test_exact_size_vendor_counts_and_concept_pairs(self) -> None:
-        self.assertEqual(len(COMMAND_ENTRIES), 96)
-        self.assertEqual(sum(e.vendor == "Cisco" for e in COMMAND_ENTRIES), 48)
-        self.assertEqual(sum(e.vendor == "Huawei" for e in COMMAND_ENTRIES), 48)
-        self.assertEqual(len(CONCEPT_IDS), 48)
+        self.assertEqual(len(COMMAND_ENTRIES), 118)
+        self.assertEqual(sum(e.vendor == "Cisco" for e in COMMAND_ENTRIES), 58)
+        self.assertEqual(sum(e.vendor == "Huawei" for e in COMMAND_ENTRIES), 60)
+        self.assertEqual(len(CONCEPT_IDS), 60)
         for concept_id in CONCEPT_IDS:
             paired = [e for e in COMMAND_ENTRIES if e.concept_id == concept_id]
-            self.assertEqual([e.vendor for e in paired], ["Cisco", "Huawei"])
+            expected = ["Huawei"] if concept_id in {"lacp-static-mode", "vlan-batch"} else ["Cisco", "Huawei"]
+            self.assertEqual([e.vendor for e in paired], expected)
+        syntaxes = [(entry.vendor, entry.syntax) for entry in COMMAND_ENTRIES]
+        self.assertEqual(len(set(syntaxes)), len(syntaxes))
 
     def test_entries_are_frozen_and_child_collections_are_tuples(self) -> None:
         entry = COMMAND_ENTRIES[0]
@@ -38,7 +43,10 @@ class CommandDictionaryCorpusTests(unittest.TestCase):
                 self.assertEqual(entry.deployed_target, "17.3.3")
             else:
                 self.assertEqual(entry.platform, "CloudEngine S5755-S")
-                self.assertEqual(entry.documented_release, "V600R024C10")
+                self.assertEqual(
+                    entry.documented_release,
+                    "V600R024C10" if entry in COMMAND_ENTRIES[:96] else HUAWEI_REFERENCE_RELEASE,
+                )
                 self.assertEqual(
                     entry.deployed_target,
                     "V600R024C10SPC500 / YunShan OS 1.24.1.1",
@@ -138,9 +146,46 @@ class CommandDictionaryCorpusTests(unittest.TestCase):
         )
         actual = tuple(
             tuple(entry.syntax for entry in COMMAND_ENTRIES if entry.concept_id == concept)
-            for concept in CONCEPT_IDS
+            for concept in CONCEPT_IDS[:48]
         )
         self.assertEqual(actual, expected)
+        self.assertEqual(
+            [(entry.vendor, entry.concept_id) for entry in COMMAND_ENTRIES[:96]],
+            [(vendor, concept) for concept in CONCEPT_IDS[:48] for vendor in ("Cisco", "Huawei")],
+        )
+
+    def test_added_reference_templates_have_context_risks_and_honest_scope(self) -> None:
+        expected = (
+            ("hostname <HOSTNAME>", "sysname <HOSTNAME>"),
+            ("lldp run", "lldp enable"),
+            ("ip domain name <DOMAIN_NAME>", "dns domain <DOMAIN_NAME>"),
+            ("ip name-server <IP_ADDRESS>", "dns server <IP_ADDRESS>"),
+            ("ntp server <IP_ADDRESS>", "ntp-service unicast-server <IP_ADDRESS>"),
+            ("logging host <IP_ADDRESS>", "info-center loghost <IP_ADDRESS>"),
+            ("spanning-tree portfast", "stp edged-port enable"),
+            ("ip address <IP_ADDRESS> <SUBNET_MASK>", "ip address <IP_ADDRESS> <SUBNET_MASK>"),
+            ("ip route <NETWORK> <SUBNET_MASK> <NEXT_HOP>", "ip route-static <NETWORK> <SUBNET_MASK> <NEXT_HOP>"),
+            ("channel-group <GROUP_ID> mode <MODE>", "eth-trunk <GROUP_ID>"),
+            ("mode lacp-static",),
+            ("vlan batch <VLAN_LIST>",),
+        )
+        self.assertEqual(
+            tuple(tuple(entry.syntax for entry in COMMAND_ENTRIES if entry.concept_id == concept)
+                  for concept in CONCEPT_IDS[48:]), expected,
+        )
+        for entry in COMMAND_ENTRIES[96:]:
+            self.assertIn(entry.risk, {"changes-state", "service-impacting"})
+            self.assertFalse(entry.rollback_syntax)
+            if entry.vendor == "Huawei":
+                self.assertIn("unverified", entry.applicability_notes)
+                self.assertIn("Generic VRP", entry.applicability_notes)
+        entries = {entry.id: entry for entry in COMMAND_ENTRIES}
+        for concept in ("stp-edge-port", "interface-ipv4-address", "lag-member"):
+            self.assertEqual(entries[f"cisco.{concept}"].mode, "interface configuration")
+            self.assertEqual(entries[f"huawei.{concept}"].mode, "interface view")
+            self.assertEqual(entries[f"huawei.{concept}"].risk, "service-impacting")
+        self.assertIn("physical-member", entries["huawei.lacp-static-mode"].applicability_notes)
+        self.assertIn("ranges", entries["huawei.vlan-batch"].applicability_notes)
 
     def test_modes_risks_placeholders_and_rollbacks_are_reviewed(self) -> None:
         self.assertEqual(
@@ -155,24 +200,7 @@ class CommandDictionaryCorpusTests(unittest.TestCase):
         )
         template_entries = [entry for entry in COMMAND_ENTRIES if "<" in entry.syntax]
         self.assertEqual(
-            {
-                placeholder
-                for entry in template_entries
-                for placeholder in (
-                    "<INTERFACE>",
-                    "<DESCRIPTION>",
-                    "<MODE>",
-                    "<VLAN_ID>",
-                    "<VLAN_NAME>",
-                    "<VLAN_LIST>",
-                    "<IP_ADDRESS>",
-                    "<MAC_ADDRESS>",
-                    "<PREFIX>",
-                    "<TEXT>",
-                    "<BYTES>",
-                )
-                if placeholder in entry.syntax
-            },
+            {placeholder for entry in template_entries for placeholder in re.findall(r"<[A-Z_]+>", entry.syntax)},
             {
                 "<INTERFACE>",
                 "<DESCRIPTION>",
@@ -185,6 +213,8 @@ class CommandDictionaryCorpusTests(unittest.TestCase):
                 "<PREFIX>",
                 "<TEXT>",
                 "<BYTES>",
+                "<HOSTNAME>", "<DOMAIN_NAME>", "<SUBNET_MASK>",
+                "<NETWORK>", "<NEXT_HOP>", "<GROUP_ID>",
             },
         )
         for entry in template_entries:
@@ -247,7 +277,7 @@ class CommandDictionaryValidationTests(unittest.TestCase):
         self.assertEqual(validate_dictionary(iter(COMMAND_ENTRIES)), COMMAND_ENTRIES)
 
     def test_rejects_wrong_corpus_size(self) -> None:
-        self.assert_invalid(COMMAND_ENTRIES[:-1], "expected 96 entries")
+        self.assert_invalid(COMMAND_ENTRIES[:-1], "expected 118 entries")
 
     def test_rejects_duplicate_id_and_missing_pair(self) -> None:
         replacement = replace(
@@ -262,6 +292,27 @@ class CommandDictionaryValidationTests(unittest.TestCase):
         entries = self.with_replacement(1, replacement)
         self.assert_invalid(entries, "duplicate id")
         self.assert_invalid(entries, "expected one Huawei entry for version")
+
+    def test_reference_manifest_rejects_vendor_pairs_wrong_scope_and_metadata(self) -> None:
+        reference = next(entry for entry in COMMAND_ENTRIES if entry.id == "huawei.vlan-batch")
+        index = COMMAND_ENTRIES.index(reference)
+        replacement = replace(
+            reference, id="cisco.vlan-batch", vendor="Cisco", platform="Catalyst 9300L",
+            documented_release="IOS XE 17.3.x", deployed_target="17.3.3",
+            mode="global configuration",
+        )
+        self.assert_invalid(self.with_replacement(index, replacement), "expected no Cisco entry for vlan-batch")
+        for changes, error in (
+            ({"documented_release": "V600R024C10"}, "scope metadata mismatch"),
+            ({"syntax": "vlan batch <VLAN_LIST> extra"}, "unreviewed reference syntax"),
+            ({"mode": "interface view"}, "unreviewed reference mode/risk"),
+            ({"risk": "read-only"}, "unreviewed reference mode/risk"),
+            ({"rollback_syntax": "undo name"}, "rollback is not reviewed"),
+        ):
+            with self.subTest(changes=changes):
+                self.assert_invalid(self.with_replacement(index, replace(reference, **changes)), error)
+        duplicate = replace(reference, id="huawei.lacp-static-mode", concept_id="lacp-static-mode")
+        self.assert_invalid(self.with_replacement(index, duplicate), "duplicate id")
 
     def test_rejects_bad_id_scope_mode_risk_and_category(self) -> None:
         base = COMMAND_ENTRIES[0]
@@ -534,7 +585,7 @@ class CommandDictionarySearchTests(unittest.TestCase):
         )
         self.assertEqual(
             [entry.id for entry in search_commands("neigh disc")],
-            ["cisco.lldp-neighbors", "huawei.lldp-neighbors"],
+            ["cisco.lldp-neighbors", "huawei.lldp-neighbors", "cisco.lldp-enable", "huawei.lldp-enable"],
         )
         self.assertEqual(
             [entry.id for entry in search_commands("colli")],
@@ -585,8 +636,25 @@ class CommandDictionarySearchTests(unittest.TestCase):
         results = search_commands("neighbor discovery")
         self.assertEqual(
             [entry.id for entry in results],
-            ["cisco.lldp-neighbors", "huawei.lldp-neighbors"],
+            ["cisco.lldp-neighbors", "huawei.lldp-neighbors", "cisco.lldp-enable", "huawei.lldp-enable"],
         )
+
+    def test_added_families_are_searchable_and_vendor_only_commands_stay_unpaired(self) -> None:
+        for query, expected in (
+            ("hostname", "cisco.system-name"), ("sysname", "huawei.system-name"),
+            ("lldp run", "cisco.lldp-enable"), ("dns domain", "huawei.dns-domain"),
+            ("ip name-server", "cisco.dns-server"), ("ntp-service unicast-server", "huawei.ntp-server"),
+            ("logging host", "cisco.syslog-server"), ("stp edged-port enable", "huawei.stp-edge-port"),
+            ("ip address", "cisco.interface-ipv4-address"), ("ip route-static", "huawei.static-ipv4-route"),
+            ("channel-group", "cisco.lag-member"), ("eth-trunk", "huawei.lag-member"),
+            ("mode lacp-static", "huawei.lacp-static-mode"), ("vlan batch", "huawei.vlan-batch"),
+        ):
+            with self.subTest(query=query):
+                self.assertIn(expected, [entry.id for entry in search_commands(query)])
+        self.assertEqual(search_commands("vlan batch", platform="Cisco"), ())
+        for query, expected in (("no shutdown", "cisco.interface-admin-state"),
+                                ("undo shutdown", "huawei.interface-admin-state")):
+            self.assertEqual(search_commands(query)[0].id, expected)
 
     def test_configuration_search_terms_find_the_new_pairs(self) -> None:
         expected = {
@@ -637,9 +705,9 @@ class CommandDictionarySearchTests(unittest.TestCase):
         )
 
     def test_platform_and_category_filters_are_independent(self) -> None:
-        self.assertEqual(len(search_commands(platform="Cisco")), 48)
-        self.assertEqual(len(search_commands(platform="Catalyst-9300L")), 48)
-        self.assertEqual(len(search_commands(category="Layer 2")), 32)
+        self.assertEqual(len(search_commands(platform="Cisco")), 58)
+        self.assertEqual(len(search_commands(platform="Catalyst-9300L")), 58)
+        self.assertEqual(len(search_commands(category="Layer 2")), 40)
         combined = search_commands(platform="HUAWEI", category="layer-3")
         self.assertEqual(
             [entry.concept_id for entry in combined],
@@ -649,6 +717,8 @@ class CommandDictionarySearchTests(unittest.TestCase):
                 "ip-interface-state",
                 "arp-lookup",
                 "route-lookup",
+                "interface-ipv4-address",
+                "static-ipv4-route",
             ],
         )
         self.assertEqual(search_commands(platform="unknown"), ())

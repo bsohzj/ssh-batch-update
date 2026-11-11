@@ -19,6 +19,7 @@ CISCO_TARGET = "17.3.3"
 HUAWEI_PLATFORM = "CloudEngine S5755-S"
 HUAWEI_RELEASE = "V600R024C10"
 HUAWEI_TARGET = "V600R024C10SPC500 / YunShan OS 1.24.1.1"
+HUAWEI_REFERENCE_RELEASE = "Generic VRP (V600R024C10 unverified)"
 
 CONCEPT_IDS = (
     "version",
@@ -70,6 +71,24 @@ CONCEPT_IDS = (
     "ntp-status",
     "save-configuration",
 )
+
+_REFERENCE_CONCEPT_IDS = (
+    "system-name",
+    "lldp-enable",
+    "dns-domain",
+    "dns-server",
+    "ntp-server",
+    "syslog-server",
+    "stp-edge-port",
+    "interface-ipv4-address",
+    "static-ipv4-route",
+    "lag-member",
+    "lacp-static-mode",
+    "vlan-batch",
+)
+CONCEPT_IDS += _REFERENCE_CONCEPT_IDS
+
+_HUAWEI_ONLY_CONCEPTS = frozenset({"lacp-static-mode", "vlan-batch"})
 
 ALLOWED_CATEGORIES = frozenset(
     {"system", "hardware", "interfaces", "layer-2", "layer-3", "diagnostics"}
@@ -148,6 +167,12 @@ def _command(
             HUAWEI_TARGET,
             "huawei",
         )
+        if concept_id in _REFERENCE_CONCEPT_IDS:
+            release = HUAWEI_REFERENCE_RELEASE
+            applicability_notes += (
+                " Generic VRP converter reference; exact command availability on the stated"
+                " deployed target is unverified. Check its command reference and feature support before use."
+            )
     return CommandEntry(
         id=f"{slug}.{concept_id}",
         vendor=vendor,
@@ -437,7 +462,7 @@ COMMAND_ENTRIES: tuple[CommandEntry, ...] = (
         "Enters configuration context for the selected interface.",
         ("interface", "interface context", "interface configuration"),
         ("configure port", "select interface", "global configuration"),
-        "Replace <INTERFACE> with a valid identifier. Run from global configuration mode.",
+        "Replace <INTERFACE> with a valid identifier. Run from global configuration mode. Physical ports, Vlan<VLAN_ID> SVIs and Port-channel<GROUP_ID> bundles use different interface types; substitute the complete identifier, verify support, and create the required VLAN or bundle deliberately.",
         mode="global configuration",
         risk="changes-state",
     ),
@@ -446,7 +471,7 @@ COMMAND_ENTRIES: tuple[CommandEntry, ...] = (
         "Enters the view for the selected interface.",
         ("interface", "interface context", "interface configuration"),
         ("configure port", "select interface", "system view"),
-        "Replace <INTERFACE> with a valid identifier. Run from system view.",
+        "Replace <INTERFACE> with a valid identifier. Run from system view. Physical ports, Vlanif<VLAN_ID> interfaces and Eth-Trunk<GROUP_ID> bundles use different interface types; substitute the complete identifier, verify support, and create the required VLAN or bundle deliberately.",
         mode="system view",
         risk="changes-state",
     ),
@@ -895,6 +920,160 @@ COMMAND_ENTRIES: tuple[CommandEntry, ...] = (
         mode="user view",
         risk="interactive",
     ),
+    _command(
+        "Cisco", "system-name", "Set system name", "hostname <HOSTNAME>", "system",
+        "Sets the device name used in its CLI prompt and management identity.",
+        ("system name", "hostname", "sysname"), ("device name", "identity", "prompt"),
+        "Replace <HOSTNAME> with the approved device name. Run from global configuration mode; coordinate monitoring and naming dependencies.",
+        mode="global configuration", risk="changes-state",
+    ),
+    _command(
+        "Huawei", "system-name", "Set system name", "sysname <HOSTNAME>", "system",
+        "Sets the device name used in its CLI prompt and management identity.",
+        ("system name", "hostname", "sysname"), ("device name", "identity", "prompt"),
+        "Replace <HOSTNAME> with the approved device name. Run from system view; coordinate monitoring and naming dependencies.",
+        mode="system view", risk="changes-state",
+    ),
+    _command(
+        "Cisco", "lldp-enable", "Enable global LLDP", "lldp run", "layer-2",
+        "Enables the LLDP process globally; interface transmit and receive settings still apply.",
+        ("enable lldp", "global lldp"), ("discovery", "neighbors", "advertisements"),
+        "Run from global configuration mode. Review interface LLDP policy and information advertised to adjacent devices.",
+        mode="global configuration", risk="changes-state",
+    ),
+    _command(
+        "Huawei", "lldp-enable", "Enable global LLDP", "lldp enable", "layer-2",
+        "Enables LLDP globally; interface LLDP settings still apply.",
+        ("enable lldp", "global lldp"), ("discovery", "neighbors", "advertisements"),
+        "Run from system view, rather than interface view. Review interface LLDP policy and information advertised to adjacent devices.",
+        mode="system view", risk="changes-state",
+    ),
+    _command(
+        "Cisco", "dns-domain", "Set DNS domain", "ip domain name <DOMAIN_NAME>", "system",
+        "Sets the default domain suffix used by the device resolver.",
+        ("dns domain", "domain name"), ("resolver", "suffix", "name resolution"),
+        "Replace <DOMAIN_NAME> with the approved DNS domain. Run from global configuration mode; review existing name resolution dependencies.",
+        mode="global configuration", risk="changes-state",
+    ),
+    _command(
+        "Huawei", "dns-domain", "Set DNS domain", "dns domain <DOMAIN_NAME>", "system",
+        "Adds a domain suffix used by the device resolver.",
+        ("dns domain", "domain name"), ("resolver", "suffix", "name resolution"),
+        "Replace <DOMAIN_NAME> with the approved DNS domain. Run from system view. Resolver activation and existing domain ordering require separate review.",
+        mode="system view", risk="changes-state",
+    ),
+    _command(
+        "Cisco", "dns-server", "Configure DNS server", "ip name-server <IP_ADDRESS>", "system",
+        "Adds a DNS resolver address for device name lookups.",
+        ("dns server", "name server"), ("resolver", "lookup", "name resolution"),
+        "Replace <IP_ADDRESS> with the approved resolver address. Run from global configuration mode. This template shows one server; the converter accepts multiple valid addresses and expands them separately. Review resolver activation, routing and VRF scope.",
+        mode="global configuration", risk="changes-state",
+    ),
+    _command(
+        "Huawei", "dns-server", "Configure DNS server", "dns server <IP_ADDRESS>", "system",
+        "Adds a DNS resolver address for device name lookups.",
+        ("dns server", "name server"), ("resolver", "lookup", "name resolution"),
+        "Replace <IP_ADDRESS> with the approved resolver address. Run from system view. Resolver activation, routing and VPN-instance scope require separate review.",
+        mode="system view", risk="changes-state",
+    ),
+    _command(
+        "Cisco", "ntp-server", "Configure NTP server", "ntp server <IP_ADDRESS>", "system",
+        "Configures a unicast NTP time source.",
+        ("ntp server", "time server"), ("clock", "synchronization", "unicast"),
+        "Replace <IP_ADDRESS> with the approved time-source address. Run from global configuration mode. Verify reachability and existing time policy before changing the source.",
+        mode="global configuration", risk="changes-state",
+    ),
+    _command(
+        "Huawei", "ntp-server", "Configure NTP server", "ntp-service unicast-server <IP_ADDRESS>", "system",
+        "Configures a unicast NTP time source.",
+        ("ntp server", "time server"), ("clock", "synchronization", "unicast"),
+        "Replace <IP_ADDRESS> with the approved time-source address. Run from system view. Verify command availability, NTP activation, reachability and existing time policy on the deployed image.",
+        mode="system view", risk="changes-state",
+    ),
+    _command(
+        "Cisco", "syslog-server", "Configure remote syslog", "logging host <IP_ADDRESS>", "diagnostics",
+        "Adds a destination for remote system-log messages.",
+        ("syslog server", "logging host", "remote logging"), ("loghost", "events", "collector"),
+        "Replace <IP_ADDRESS> with the approved collector address. Run from global configuration mode. Review logging activation, severity, transport and source-interface policy separately.",
+        mode="global configuration", risk="changes-state",
+    ),
+    _command(
+        "Huawei", "syslog-server", "Configure remote syslog", "info-center loghost <IP_ADDRESS>", "diagnostics",
+        "Adds a destination for remote information-center log messages.",
+        ("syslog server", "logging host", "remote logging"), ("loghost", "events", "collector"),
+        "Replace <IP_ADDRESS> with the approved collector address. Run from system view. Review information-center activation, channel, severity, transport and source-interface policy separately.",
+        mode="system view", risk="changes-state",
+    ),
+    _command(
+        "Cisco", "stp-edge-port", "Enable STP edge behavior", "spanning-tree portfast", "layer-2",
+        "Enables PortFast edge behavior on the selected access interface.",
+        ("stp edge port", "portfast", "edge port"), ("spanning tree", "endpoint", "loop risk"),
+        "Run inside interface configuration context on an approved endpoint-facing access port. Do not use on switch links; incorrect edge settings can create loops. Trunk, guard and topology policy require separate review.",
+        mode="interface configuration", risk="service-impacting",
+    ),
+    _command(
+        "Huawei", "stp-edge-port", "Enable STP edge behavior", "stp edged-port enable", "layer-2",
+        "Enables spanning-tree edge behavior on the selected interface.",
+        ("stp edge port", "portfast", "edge port"), ("spanning tree", "endpoint", "loop risk"),
+        "Run inside interface view on an approved endpoint-facing port. Do not use on switch links; incorrect edge settings can create loops. Guard and topology policy require separate review.",
+        mode="interface view", risk="service-impacting",
+    ),
+    _command(
+        "Cisco", "interface-ipv4-address", "Set interface IPv4 address", "ip address <IP_ADDRESS> <SUBNET_MASK>", "layer-3",
+        "Sets the primary IPv4 address and mask on the selected Layer 3 interface.",
+        ("interface ip address", "svi address", "ipv4 address"), ("subnet", "netmask", "routed interface"),
+        "Replace <IP_ADDRESS> and <SUBNET_MASK> with the approved IPv4 address and dotted-decimal mask. Run inside an SVI or supported routed-interface configuration context; VLAN existence, routing support and Layer 2 conversion must be reviewed separately. Changing a live address can interrupt management and traffic.",
+        mode="interface configuration", risk="service-impacting",
+    ),
+    _command(
+        "Huawei", "interface-ipv4-address", "Set interface IPv4 address", "ip address <IP_ADDRESS> <SUBNET_MASK>", "layer-3",
+        "Sets the primary IPv4 address and mask on the selected Layer 3 interface.",
+        ("interface ip address", "svi address", "ipv4 address"), ("subnet", "netmask", "vlanif"),
+        "Replace <IP_ADDRESS> and <SUBNET_MASK> with the approved IPv4 address and dotted-decimal mask. Run inside Vlanif or another supported Layer 3 interface view; VLAN existence and routing support require separate review. Changing a live address can interrupt management and traffic.",
+        mode="interface view", risk="service-impacting",
+    ),
+    _command(
+        "Cisco", "static-ipv4-route", "Configure static IPv4 route", "ip route <NETWORK> <SUBNET_MASK> <NEXT_HOP>", "layer-3",
+        "Adds a static IPv4 route using a next-hop address.",
+        ("static route", "ipv4 route", "next hop route"), ("network", "netmask", "routing"),
+        "Replace <NETWORK>, <SUBNET_MASK> and <NEXT_HOP> with the approved IPv4 destination network, dotted-decimal mask and next-hop address. Run from global configuration mode. Verify next-hop reachability, route preference, VRF and loop risk; an incorrect route can interrupt traffic.",
+        mode="global configuration", risk="service-impacting",
+    ),
+    _command(
+        "Huawei", "static-ipv4-route", "Configure static IPv4 route", "ip route-static <NETWORK> <SUBNET_MASK> <NEXT_HOP>", "layer-3",
+        "Adds a static IPv4 route using a next-hop address.",
+        ("static route", "ipv4 route", "next hop route"), ("network", "netmask", "routing"),
+        "Replace <NETWORK>, <SUBNET_MASK> and <NEXT_HOP> with the approved IPv4 destination network, dotted-decimal mask and next-hop address. Run from system view. Verify next-hop reachability, route preference, VPN-instance and loop risk; an incorrect route can interrupt traffic.",
+        mode="system view", risk="service-impacting",
+    ),
+    _command(
+        "Cisco", "lag-member", "Add physical link to aggregation", "channel-group <GROUP_ID> mode <MODE>", "layer-2",
+        "Assigns a physical member interface to a Port-channel with the chosen negotiation mode.",
+        ("link aggregation member", "channel group", "eth trunk member"), ("lacp", "port-channel", "bundle"),
+        "Replace <GROUP_ID> with the approved bundle number and <MODE> with active, passive or on. Run inside physical-member interface configuration context. Active and passive use LACP; on is static. Verify peer compatibility and matching member settings. The converter needs the complete bundle/member configuration to infer Huawei LACP mode; these commands are not a standalone one-to-one replacement. Changes can interrupt traffic.",
+        mode="interface configuration", risk="service-impacting",
+    ),
+    _command(
+        "Huawei", "lag-member", "Add physical link to aggregation", "eth-trunk <GROUP_ID>", "layer-2",
+        "Assigns a physical member interface to an Eth-Trunk bundle.",
+        ("link aggregation member", "channel group", "eth trunk member"), ("lacp", "port-channel", "bundle"),
+        "Replace <GROUP_ID> with the approved existing Eth-Trunk number. Run inside physical-member interface view. Configure LACP mode on the Eth-Trunk itself and match peer/member settings; the converter uses that bundle context when choosing Cisco active versus on. Cisco passive is not preserved on a round trip. These commands are not a standalone one-to-one replacement. Changes can interrupt traffic.",
+        mode="interface view", risk="service-impacting",
+    ),
+    _command(
+        "Huawei", "lacp-static-mode", "Enable static LACP negotiation", "mode lacp-static", "layer-2",
+        "Selects LACP negotiation for the Eth-Trunk; this differs from manual load-balancing without LACP.",
+        ("lacp static", "eth trunk lacp mode"), ("aggregation", "bundle", "active", "passive"),
+        "Run inside the approved Eth-Trunk interface view, not a physical-member view. Check release support, existing members and peer LACP settings before changing mode; member removal or service interruption may be required. Cisco represents LACP on member channel-group commands, so there is no standalone equivalent here.",
+        mode="interface view", risk="service-impacting",
+    ),
+    _command(
+        "Huawei", "vlan-batch", "Create multiple VLANs", "vlan batch <VLAN_LIST>", "layer-2",
+        "Creates multiple VLANs without entering each VLAN view.",
+        ("vlan batch", "create vlans", "multiple vlans"), ("bulk", "vlan declaration", "layer 2"),
+        "Replace <VLAN_LIST> with approved VLAN IDs separated by spaces. Run from system view and verify reserved IDs and platform limits. Vendor syntax also supports ranges, but the converter accepts only explicit IDs and expands them to separate Cisco VLAN contexts. This does not configure member ports or Layer 3 interfaces.",
+        mode="system view", risk="changes-state",
+    ),
 )
 
 
@@ -939,8 +1118,34 @@ _ALLOWED_PLACEHOLDERS = frozenset(
         "<PREFIX>",
         "<TEXT>",
         "<BYTES>",
+        "<HOSTNAME>",
+        "<DOMAIN_NAME>",
+        "<SUBNET_MASK>",
+        "<NETWORK>",
+        "<NEXT_HOP>",
+        "<GROUP_ID>",
     }
 )
+# New reference templates are approved by concept and vendor, not as prefixes
+# accepted on unrelated existing entries.
+_REFERENCE_CONFIG_SYNTAX = {
+    "system-name": ("hostname <HOSTNAME>", "sysname <HOSTNAME>"),
+    "lldp-enable": ("lldp run", "lldp enable"),
+    "dns-domain": ("ip domain name <DOMAIN_NAME>", "dns domain <DOMAIN_NAME>"),
+    "dns-server": ("ip name-server <IP_ADDRESS>", "dns server <IP_ADDRESS>"),
+    "ntp-server": ("ntp server <IP_ADDRESS>", "ntp-service unicast-server <IP_ADDRESS>"),
+    "syslog-server": ("logging host <IP_ADDRESS>", "info-center loghost <IP_ADDRESS>"),
+    "stp-edge-port": ("spanning-tree portfast", "stp edged-port enable"),
+    "interface-ipv4-address": ("ip address <IP_ADDRESS> <SUBNET_MASK>", "ip address <IP_ADDRESS> <SUBNET_MASK>"),
+    "static-ipv4-route": ("ip route <NETWORK> <SUBNET_MASK> <NEXT_HOP>", "ip route-static <NETWORK> <SUBNET_MASK> <NEXT_HOP>"),
+    "lag-member": ("channel-group <GROUP_ID> mode <MODE>", "eth-trunk <GROUP_ID>"),
+    "lacp-static-mode": (None, "mode lacp-static"),
+    "vlan-batch": (None, "vlan batch <VLAN_LIST>"),
+}
+_REFERENCE_INTERFACE_CONCEPTS = frozenset({
+    "stp-edge-port", "interface-ipv4-address", "lag-member", "lacp-static-mode",
+})
+_REFERENCE_SERVICE_IMPACTING = _REFERENCE_INTERFACE_CONCEPTS | {"static-ipv4-route"}
 _ALLOWED_CONFIG_PREFIXES = {
     "Cisco": (
         "interface ",
@@ -1054,7 +1259,7 @@ def validate_dictionary(
     With no argument, validate :data:`COMMAND_ENTRIES`.  Any iterable is
     materialized as a tuple.  Success returns that tuple (the original object
     when a tuple was supplied); failure raises ``ValueError`` containing all
-    detected violations.  The checks enforce the exact 96-entry, 48-pair scope,
+    detected violations.  The checks enforce the reviewed 118-entry manifest,
     fixed platform/release metadata, identifiers, required fields, immutable
     tuple collections, reviewed mode/risk combinations, safe placeholders,
     control-char exclusion, and absence of credential/address-like sample data.
@@ -1063,8 +1268,8 @@ def validate_dictionary(
         entries if isinstance(entries, tuple) else tuple(entries)
     )
     errors: list[str] = []
-    if len(corpus) != 96:
-        errors.append(f"expected 96 entries, found {len(corpus)}")
+    if len(corpus) != 118:
+        errors.append(f"expected 118 entries, found {len(corpus)}")
 
     ids: set[str] = set()
     pair_counts: dict[tuple[str, str], int] = {}
@@ -1128,6 +1333,8 @@ def validate_dictionary(
             errors.append(f"unsupported vendor for {label}: {entry.vendor!r}")
         else:
             platform, release, target = expected_scope[entry.vendor]
+            if entry.vendor == "Huawei" and entry.concept_id in _REFERENCE_CONCEPT_IDS:
+                release = HUAWEI_REFERENCE_RELEASE
             vendor_counts[entry.vendor] += 1
             if (entry.platform, entry.documented_release, entry.deployed_target) != (
                 platform,
@@ -1145,6 +1352,21 @@ def validate_dictionary(
             errors.append(f"unsupported mode for {label}: {entry.mode!r}")
         if entry.risk not in ALLOWED_RISKS:
             errors.append(f"unsupported risk for {label}: {entry.risk!r}")
+        reference_syntax = None
+        if entry.concept_id in _REFERENCE_CONFIG_SYNTAX and entry.vendor in expected_scope:
+            reference_syntax = _REFERENCE_CONFIG_SYNTAX[entry.concept_id][0 if entry.vendor == "Cisco" else 1]
+            if entry.syntax != reference_syntax:
+                errors.append(f"unreviewed reference syntax for {label}")
+            interface = entry.concept_id in _REFERENCE_INTERFACE_CONCEPTS
+            reference_mode = (
+                ("interface configuration" if interface else "global configuration")
+                if entry.vendor == "Cisco" else ("interface view" if interface else "system view")
+            )
+            reference_risk = "service-impacting" if entry.concept_id in _REFERENCE_SERVICE_IMPACTING else "changes-state"
+            if entry.mode != reference_mode or entry.risk != reference_risk:
+                errors.append(f"unreviewed reference mode/risk for {label}")
+            if entry.rollback_syntax:
+                errors.append(f"rollback is not reviewed for reference entry {label}")
         if entry.risk == "read-only":
             read_only_prefix = "show " if entry.vendor == "Cisco" else "display "
             if entry.mode not in {"exec", "privileged exec", "user view"}:
@@ -1155,7 +1377,7 @@ def validate_dictionary(
             if entry.mode in {"exec", "privileged exec", "user view"}:
                 errors.append(f"state-changing entry must use configuration mode for {label}")
             config_prefixes = _ALLOWED_CONFIG_PREFIXES.get(entry.vendor, ())
-            if not entry.syntax.casefold().startswith(config_prefixes):
+            if not entry.syntax.casefold().startswith(config_prefixes) and entry.syntax != reference_syntax:
                 errors.append(f"unreviewed configuration command prefix for {label}")
         elif entry.risk == "active-diagnostic":
             if not entry.syntax.casefold().startswith(
@@ -1235,13 +1457,15 @@ def validate_dictionary(
         ) or any(_contains_ipv6(value) for value in sample_fields):
             errors.append(f"literal address-like sample found in {label}")
 
-    if vendor_counts != {"Cisco": 48, "Huawei": 48}:
-        errors.append(f"expected 48 entries per vendor, found {vendor_counts}")
+    if vendor_counts != {"Cisco": 58, "Huawei": 60}:
+        errors.append(f"expected 58 Cisco and 60 Huawei entries, found {vendor_counts}")
     for concept_id in CONCEPT_IDS:
         for vendor in ("Cisco", "Huawei"):
             count = pair_counts.get((concept_id, vendor), 0)
-            if count != 1:
-                errors.append(f"expected one {vendor} entry for {concept_id}, found {count}")
+            expected_count = 0 if vendor == "Cisco" and concept_id in _HUAWEI_ONLY_CONCEPTS else 1
+            if count != expected_count:
+                expected_label = "one" if expected_count else "no"
+                errors.append(f"expected {expected_label} {vendor} entry for {concept_id}, found {count}")
         paired = [entry for entry in corpus if isinstance(entry, CommandEntry) and entry.concept_id == concept_id]
         if len(paired) == 2 and all(
             isinstance(entry.aliases, tuple)

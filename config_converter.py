@@ -189,6 +189,23 @@ _INTERFACE_CONFIG_CONCEPTS = frozenset(
     }
 )
 
+# Dictionary growth must not create new executable mappings or bypass the
+# dedicated IP, VLAN, context and LACP handling below. Add templates only after
+# reviewing their conversion and edited-target validation behavior separately.
+CONVERTER_TEMPLATE_CONCEPT_IDS = frozenset({
+    "version", "inventory", "uptime", "cpu", "memory", "environmental-health",
+    "power", "fans-temperature", "interface-summary", "interface-details",
+    "errors-counters", "optics", "vlans", "mac-table", "spanning-tree",
+    "link-aggregation", "lldp-neighbors", "routing-table", "arp-neighbor-table",
+    "logs", "running-configuration", "interface-context", "interface-description",
+    "port-link-type", "vlan-context", "vlan-name", "access-vlan", "trunk-vlan-list",
+    "interface-admin-state", "ip-interface-state", "ping", "traceroute",
+    "vlan-details", "mac-lookup", "arp-lookup", "stp-vlan", "lldp-interface",
+    "trunk-native-vlan", "interface-mtu", "interface-description-summary",
+    "trunk-membership", "interface-counters", "interface-current-configuration",
+    "route-lookup", "filtered-logs", "clock", "ntp-status", "save-configuration",
+})
+
 
 @dataclass(frozen=True)
 class _TemplatePair:
@@ -216,7 +233,8 @@ def _build_template_pairs(source_vendor: str) -> tuple[_TemplatePair, ...]:
     target_name = "Huawei" if source_vendor == VENDOR_CISCO else "Cisco"
     by_concept: dict[str, dict[str, CommandEntry]] = {}
     for entry in COMMAND_ENTRIES:
-        by_concept.setdefault(entry.concept_id, {})[entry.vendor] = entry
+        if entry.concept_id in CONVERTER_TEMPLATE_CONCEPT_IDS:
+            by_concept.setdefault(entry.concept_id, {})[entry.vendor] = entry
     pairs: list[_TemplatePair] = []
     for entries in by_concept.values():
         source = entries[source_name]
@@ -590,22 +608,31 @@ def convert_text(
                 continue
 
         # Huawei's compact VLAN declaration expands to target VLAN contexts.
-        if source_vendor == VENDOR_HUAWEI:
-            match = re.fullmatch(r"vlan batch\s+(.+)", line, re.IGNORECASE)
-            if match:
-                vlan_ids = match.group(1).split()
-                if vlan_ids and all(_valid_vlan_id(value) for value in vlan_ids):
-                    for vlan_id in vlan_ids:
-                        _append_command(
-                            commands,
-                            output_lines,
-                            line_number,
-                            line,
-                            f"vlan {vlan_id}",
-                            SECTION_CONFIG,
-                        )
-                    context = "global"
-                    continue
+        match = re.fullmatch(r"vlan\s+batch(?:\s+(.*))?", line, re.IGNORECASE)
+        if match:
+            vlan_ids = (match.group(1) or "").split()
+            if source_vendor == VENDOR_HUAWEI and vlan_ids and all(_valid_vlan_id(value) for value in vlan_ids):
+                for vlan_id in vlan_ids:
+                    _append_command(
+                        commands,
+                        output_lines,
+                        line_number,
+                        line,
+                        f"vlan {vlan_id}",
+                        SECTION_CONFIG,
+                    )
+                context = "global"
+                continue
+            message = (
+                "VLAN batch is Huawei-only; Cisco input requires separate VLAN declarations."
+                if source_vendor == VENDOR_CISCO else
+                "VLAN batch requires explicit valid VLAN IDs; ranges and other formats need review."
+            )
+            output_lines.append(_review_comment(target_vendor, line_number, message))
+            issues.append(ConversionIssue(
+                line_number, DISPOSITION_UNMAPPED, SECTION_CONFIG, message, line, True,
+            ))
+            continue
 
         # Link aggregation needs context from the whole source configuration.
         if source_vendor == VENDOR_CISCO:
@@ -780,6 +807,14 @@ def _recognize_target_line(
     lowered = line.casefold()
     if lowered in _MODE_TRANSITIONS[vendor]:
         return None, context, "Configuration-mode transition is managed by the SSH runner."
+    # Do not interpret Huawei's declaration as a generic `vlan <VLAN_ID>`
+    # template, which would accept invalid IDs and enter the wrong context.
+    batch_match = re.fullmatch(r"vlan\s+batch(?:\s+(.*))?", line, re.IGNORECASE)
+    if batch_match:
+        vlan_ids = (batch_match.group(1) or "").split()
+        if vendor == VENDOR_HUAWEI and vlan_ids and all(_valid_vlan_id(value) for value in vlan_ids):
+            return SECTION_CONFIG, "global", None
+        return None, context, None
     for pair in _TEMPLATE_PAIRS[vendor]:
         match = pair.regex.fullmatch(line)
         if not match:
@@ -823,7 +858,6 @@ def _recognize_target_line(
             r"ip route-static\s+\S+\s+\S+\s+\S+",
             r"eth-trunk\s+\d+",
             r"mode lacp-static",
-            r"vlan batch\s+.+",
         ),
     }
     if any(re.fullmatch(pattern, line, re.IGNORECASE) for pattern in config_patterns[vendor]):

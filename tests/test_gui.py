@@ -1158,6 +1158,26 @@ class MainWindowTests(unittest.TestCase):
                     Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
                 )
 
+    def test_added_dictionary_entries_show_scope_and_copy_without_handoff(self):
+        self.window._ensure_dictionary_ui()
+        self.window.dictionary_platform_combo.setCurrentText("CloudEngine S5755-S")
+        self.window.exec_commands_edit.setPlainText("show version")
+        self.window.config_commands_edit.setPlainText("description existing")
+        for entry_id in ("huawei.dns-server", "huawei.lacp-static-mode", "huawei.vlan-batch"):
+            entry = next(item for item in gui.COMMAND_ENTRIES if item.id == entry_id)
+            with self.subTest(entry=entry_id):
+                self.window.dictionary_search_edit.setText(entry.syntax)
+                self.app.processEvents()
+                self.assertEqual(self.window.dictionary_syntax_edit.toPlainText(), entry.syntax)
+                self.assertIn("Generic VRP (V600R024C10 unverified)", self.window.dictionary_applicability_label.text())
+                self.assertEqual(self.window.dictionary_placeholder_warning.isHidden(), "<" not in entry.syntax)
+                self.assertTrue(self.window.dictionary_copy_rollback_button.isHidden())
+                self.window.dictionary_copy_button.click()
+                self.assertEqual(self.app.clipboard().text(), entry.syntax)
+                self.assertEqual(self.window.exec_commands_edit.toPlainText(), "show version")
+                self.assertEqual(self.window.config_commands_edit.toPlainText(), "description existing")
+        self.assertFalse(self.window.queue_controller.jobs)
+
     def test_command_dictionary_copy_is_exact_and_warns_for_templates(self):
         self.window._ensure_dictionary_ui()
         template = next(
